@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+/build/
+/dist/
+# working notes (Greek), kept out of the repository
+ΣΧΕΔΙΟ.md
+ΣΗΜΕΙΩΣΕΙΣ-GITHUB.md
+docs/*.pdf

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Starts Proxmox Controller with the project's own Python environment (.venv).
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+exec "$ROOT/.venv/bin/python" -I "$ROOT/bin/launch.py" "$@"

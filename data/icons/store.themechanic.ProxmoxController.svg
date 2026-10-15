@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b4a5e"/>
+      <stop offset="1" stop-color="#1f2733"/>
+    </linearGradient>
+    <linearGradient id="box" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5d6f86"/>
+      <stop offset="1" stop-color="#46566b"/>
+    </linearGradient>
+    <linearGradient id="wake" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#e8590c"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#bg)"/>
+  <!-- a host holding containers: a 2 x 2 grid of guests -->
+  <rect x="20" y="22" width="88" height="70" rx="8" fill="#2b3544"/>
+  <rect x="27" y="29" width="35" height="25" rx="5" fill="url(#box)"/>
+  <rect x="66" y="29" width="35" height="25" rx="5" fill="url(#box)"/>
+  <rect x="27" y="59" width="35" height="25" rx="5" fill="url(#box)"/>
+  <rect x="66" y="59" width="35" height="25" rx="5" fill="#3a4757"/>
+  <circle cx="35" cy="37" r="3.5" fill="#57e389"/>
+  <circle cx="74" cy="37" r="3.5" fill="#57e389"/>
+  <circle cx="35" cy="67" r="3.5" fill="#57e389"/>
+  <circle cx="74" cy="67" r="3.5" fill="#77818f"/>
+  <rect x="42" y="35" width="14" height="4" rx="2" fill="#2b3544"/>
+  <rect x="81" y="35" width="14" height="4" rx="2" fill="#2b3544"/>
+  <rect x="42" y="65" width="14" height="4" rx="2" fill="#2b3544"/>
+  <rect x="81" y="65" width="14" height="4" rx="2" fill="#2b3544"/>
+  <!-- Wake-on-LAN: power button -->
+  <circle cx="92" cy="92" r="20" fill="#1f2733"/>
+  <circle cx="92" cy="92" r="17" fill="url(#wake)"/>
+  <path d="M92 81 v10" stroke="#fff" stroke-width="4" stroke-linecap="round" fill="none"/>
+  <path d="M85.2 85.6 a9.5 9.5 0 1 0 13.6 0" stroke="#fff" stroke-width="4" stroke-linecap="round" fill="none"/>
+</svg>

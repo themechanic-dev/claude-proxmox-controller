@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Proxmox Controller
+Comment=Containers, virtual machines and Wake-on-LAN for your Proxmox VE hosts
+Exec="@ROOT@/bin/proxmox-controller"
+Icon=store.themechanic.ProxmoxController
+Terminal=false
+Categories=System;Monitor;
+Keywords=proxmox;pve;container;lxc;vm;virtual;wake;lan;wol;server;homelab;
+StartupNotify=true
+StartupWMClass=Proxmox Controller
