@@ -136,6 +136,72 @@ class UiCase(unittest.TestCase):
 
 
 class HostViewTest(UiCase):
+    def test_storage_cards_like_the_cards_above(self):
+        """Each storage a card with a bar, as CPU and Memory (15/10, the user's local, local-lvm and nas): the same
+        width each, side by side — and the same cards on the next refresh (no flicker)."""
+        DemoPve(DEMO_HOSTS[0]).cluster.network_share = True
+        view = self.loaded_view()
+        view.show()
+        sc = view.storage_cards
+        self.assertEqual(list(sc.cards), ["pve/local", "pve/local-lvm", "nas"])  # by name; the NAS is shared
+        nas = sc.cards["nas"]
+        self.assertEqual((nas.title.text(), nas.value.text(), nas.caption.text()),
+                         ("nas (cifs)", "415 GiB", "of 7233 GiB · 6 % used"))
+        self.assertTrue(nas.bar.isVisibleTo(nas))
+        self.assertIn("holds ISO images", nas.toolTip())
+        self.assertIn("6818 GiB free", nas.toolTip())
+        QApplication.processEvents()
+        self.assertEqual(sc.columns, 3)
+        widths = [c.width() for c in sc.cards.values()]
+        self.assertLessEqual(max(widths) - min(widths), 1, widths)  # (a pixel left over goes to one of them)
+        self.assertGreater(nas.width(), 250)  # a third of the page each
+        view.refresh()
+        self.assertTrue(wait_until(lambda: not view.inflight))
+        self.assertIs(sc.cards["nas"], nas)
+        view.close()
+
+    def test_many_storages_four_a_row_all_the_same_width(self):
+        """Someone else's host with more storages (the user's question, 15/10): every one shows, four a row."""
+        found = [{"storage": f"disk{i}", "type": "zfspool", "used": i << 30, "total": 100 << 30, "shared": 0}
+                 for i in range(1, 8)]
+        found[6]["storage"] = "disk7-backup-nas-in-the-garage-for-the-old-photos"  # a long name takes no more room
+        sc = host_view.StorageCards()
+        sc.resize(1000, 400)
+        sc.show_entries(host_view.storage_entries({"pve": found}))
+        sc.show()
+        QApplication.processEvents()
+        where = [sc.grid.getItemPosition(sc.grid.indexOf(c))[:2] for c in sc.cards.values()]
+        self.assertEqual(where, [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2)])
+        widths = [c.width() for c in sc.cards.values()]
+        self.assertLessEqual(max(widths) - min(widths), 1, widths)  # (a pixel left over goes to one of them)
+        long = sc.cards["pve/disk7-backup-nas-in-the-garage-for-the-old-photos"]
+        self.assertTrue(long.title.text().endswith("…"))  # (all of it in the tooltip)
+        sc.show_entries(host_view.storage_entries({"pve": found[:2]}))  # storages gone: the cards follow
+        QApplication.processEvents()
+        self.assertEqual((list(sc.cards), sc.columns), (["pve/disk1", "pve/disk2"], 2))
+        self.assertGreater(sc.cards["pve/disk1"].width(), 400)  # two halves now
+        sc.show_entries([])
+        self.assertTrue(sc.empty.isVisibleTo(sc))
+        sc.close()
+
+    def test_storage_entries_for_a_cluster(self):
+        """A cluster's shared storage (Ceph, a NAS) once, each node's own with its name; a storage that does not
+        answer or is disabled still shows, saying so."""
+        e = host_view.storage_entries({
+            "pve1": [{"storage": "local", "type": "dir", "used": 1 << 30, "total": 4 << 30, "shared": 0},
+                     {"storage": "ceph", "type": "rbd", "used": 2 << 30, "total": 8 << 30, "shared": 1,
+                      "content": "images,rootdir"}],
+            "pve2": [{"storage": "local", "type": "dir", "used": 3 << 30, "total": 4 << 30, "shared": 0},
+                     {"storage": "ceph", "type": "rbd", "used": 2 << 30, "total": 8 << 30, "shared": 1},
+                     {"storage": "nas", "type": "nfs", "shared": 1, "active": 0, "total": 0},
+                     {"storage": "old", "type": "dir", "enabled": 0, "total": 0}]})
+        self.assertEqual([(x["title"], x["caption"]) for x in e], [
+            ("ceph (rbd)", "of 8.0 GiB · 25 % used"), ("pve1 · local (dir)", "of 4.0 GiB · 25 % used"),
+            ("pve2 · local (dir)", "of 4.0 GiB · 75 % used"), ("nas (nfs)", "Not available"),
+            ("pve2 · old (dir)", "Disabled")])
+        self.assertIsNone(e[3]["fraction"])  # no bar for what does not answer
+        self.assertIn("VM disks, container disks", e[0]["tip"])
+
     def test_overview_and_table(self):
         view = self.loaded_view()
         self.assertTrue(view.online)
@@ -144,7 +210,7 @@ class HostViewTest(UiCase):
         self.assertEqual(view.table.rowCount(), 5)
         self.assertEqual([view.table.item(r, 1).text() for r in range(5)], ["100", "101", "102", "200", "201"])
         self.assertIn("threads", view.cpu_card.caption.text())
-        self.assertIn("local-lvm", view.storage_label.text())
+        self.assertIn("pve/local-lvm", view.storage_cards.cards)
         self.assertFalse(view.wake_btn.isVisibleTo(view))  # online: no Wake button
         # the guests' addresses arrive a moment later
         self.assertTrue(wait_until(lambda: view.table.item(0, host_view.COL_IP).text() == "192.0.2.10"))

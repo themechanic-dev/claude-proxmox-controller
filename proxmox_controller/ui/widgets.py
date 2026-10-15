@@ -154,13 +154,14 @@ class Pill(QLabel):
 class StatCard(QFrame):
     """A number with a bar under it: CPU, memory, disk."""
 
-    def __init__(self, title: str):
+    def __init__(self, title: str, elide: bool = False):
         super().__init__()
         self.setObjectName("card")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(4)
-        lay.addWidget(label(title, "dim"))
+        self.title = ElidedLabel(title, "dim") if elide else label(title, "dim")  # elide: a long name ends in …
+        lay.addWidget(self.title)
         self.value = label("—", "big")
         lay.addWidget(self.value)
         self.bar = QProgressBar()

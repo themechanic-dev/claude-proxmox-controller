@@ -28,6 +28,13 @@ SECTIONS = [
      "The window shows one host at a time, so a single server gets all the room. With two or more hosts the "
      "<b>☰</b> menu lists them: pick one, or press <b>Ctrl+1</b> … <b>Ctrl+9</b>. Adding, editing and removing "
      "hosts is in <b>Hosts and Settings…</b>; removing one only forgets it here — nothing changes on the host."),
+    ("Storage",
+     "Under CPU, Memory, System disk and Uptime, every storage of the host has a card of its own: how much is "
+     "used, of how much, and the percentage, with a bar that turns yellow from 75 % and red from 90 %. Up to four "
+     "sit side by side, all the same width; more go on to the next row. Point at one to see what it holds and how "
+     "much is free. A storage that does not answer (a NAS that is off) says <i>Not available</i>, one switched off "
+     "in Proxmox <i>Disabled</i>. In a cluster, storage the nodes share (a NAS, Ceph) shows once, each node's own "
+     "with the node's name."),
     ("Containers and virtual machines",
      "Select one in the list (or right-click it):<br>"
      "• <b>Start</b> · <b>Shut Down</b> (clean, from inside) · <b>Stop</b> (at once, like pulling the plug — "

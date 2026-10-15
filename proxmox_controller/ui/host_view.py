@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
 
 from ..core import netinfo, spice, startup, tasks, wol  # noqa: F401 (netinfo: the tests replace its ARP table)
 from ..core.details import read_details
-from ..core.pve import Host, Pve, PveError
+from ..core.pve import Host, Pve, PveError, storage_order
 from . import theme
 from .tasks_panel import SHOWN as TASKS_SHOWN, TaskLogDialog, TasksPanel
 from .widgets import (ElidedLabel, Pill, StatCard, button, card, confirm, dot_icon, error, gib, label, mem_text,
@@ -58,6 +58,43 @@ def kind_label(g: dict) -> str:
 def split_tags(text: str) -> list[str]:
     """Proxmox keeps tags as one string: 'a;b' (older versions: commas or spaces)."""
     return [t for t in re.split(r"[;,\s]+", text or "") if t]
+
+
+STORAGE_COLUMNS = 4  # storage cards side by side at most, as the cards above them; more go on to another row
+CONTENT_WORDS = {"images": "VM disks", "rootdir": "container disks", "iso": "ISO images", "vztmpl": "container templates",
+                 "backup": "backups", "import": "disk images to import", "snippets": "snippets"}
+
+
+def storage_entries(by_node: dict[str, list[dict]]) -> list[dict]:
+    """One card for each storage of the host, every one of them: a storage the nodes of a cluster share (a NAS,
+    Ceph) once, a node's own with the node's name when there are several. One that is disabled or does not answer
+    (a NAS that is off) says so instead of disappearing."""
+    several = len(by_node) > 1
+    out, seen = [], set()
+    for node, items in by_node.items():
+        for st in sorted(items, key=storage_order):
+            name = st.get("storage", "")
+            shared = bool(st.get("shared"))
+            key = name if shared else f"{node}/{name}"
+            if key in seen:
+                continue
+            seen.add(key)
+            title = f"{node} · {name}" if several and not shared else name
+            kind = st.get("type", "")
+            used, total = st.get("used") or 0, st.get("total") or 0
+            holds = ", ".join(CONTENT_WORDS.get(c, c) for c in (st.get("content") or "").split(",") if c)
+            tip = f"{name} ({kind})" + (f" — holds {holds}" if holds else "")
+            if not st.get("enabled", 1):
+                value, fraction, caption = "—", None, "Disabled"
+            elif not total or not st.get("active", 1):
+                value, fraction, caption = "—", None, "Not available"
+            else:
+                fraction = used / total
+                value, caption = gib(used), f"of {gib(total)} · {fraction * 100:.0f} % used"
+                tip += f"\n{gib(max(total - used, 0))} free"
+            out.append({"key": key, "title": f"{title} ({kind})" if kind else title, "value": value,
+                        "fraction": fraction, "caption": caption, "tip": tip})
+    return out
 
 
 def ip_key(ips: list[str]) -> list[int]:
@@ -136,6 +173,52 @@ class NameDelegate(QStyledItemDelegate):
             sfm = QFontMetrics(self._small(opt.font))
             width += self.GAP + sum(sfm.horizontalAdvance(t) + 2 * self.TAG_PAD + self.TAG_SPACE for t in tags)
         return QSize(max(width, size.width()), size.height())
+
+
+class StorageCards(QWidget):
+    """The host's storages as cards like CPU and Memory above them: all the same width (a long name ends in "…"),
+    side by side up to STORAGE_COLUMNS, further ones on the next row. The cards stay while the storages do (no
+    flicker every refresh)."""
+
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        lay.addWidget(label("Storage", "heading"))
+        self.grid = QGridLayout()
+        self.grid.setSpacing(12)
+        lay.addLayout(self.grid)
+        self.empty = label("No storage reported.", "dim")
+        self.empty.hide()
+        lay.addWidget(self.empty)
+        self.cards: dict[str, StatCard] = {}
+        self.columns = 0
+
+    def show_entries(self, entries: list[dict]) -> None:
+        if [e["key"] for e in entries] != list(self.cards):
+            self._lay_out(entries)
+        for e in entries:
+            c = self.cards[e["key"]]
+            c.title.setText(e["title"])
+            c.show_fraction(e["value"], e["fraction"], e["caption"])
+            c.setToolTip(e["tip"])
+
+    def _lay_out(self, entries: list[dict]) -> None:
+        for c in self.cards.values():
+            self.grid.removeWidget(c)
+            c.deleteLater()
+        self.cards = {}
+        for col in range(self.grid.columnCount()):
+            self.grid.setColumnStretch(col, 0)
+        self.columns = min(len(entries), STORAGE_COLUMNS)
+        for i, e in enumerate(entries):
+            c = StatCard(e["title"], elide=True)
+            self.grid.addWidget(c, i // self.columns, i % self.columns)
+            self.cards[e["key"]] = c
+        for col in range(self.columns):
+            self.grid.setColumnStretch(col, 1)
+        self.empty.setVisible(not entries)
 
 
 class HostView(QWidget):
@@ -260,8 +343,8 @@ class HostView(QWidget):
             grid.addWidget(c, 0, i)
         cl.addLayout(grid)
 
-        self.storage_label = label("", "dim", wrap=True)
-        cl.addWidget(card(label("Storage", "heading"), self.storage_label))
+        self.storage_cards = StorageCards()
+        cl.addWidget(self.storage_cards)
 
         guests_head = QHBoxLayout()
         guests_head.setSpacing(10)
@@ -454,16 +537,7 @@ class HostView(QWidget):
         up = min(s.get("uptime", 0) for s in sts)
         load = " / ".join(str(x) for x in (sts[0].get("loadavg") or [])[:3])
         self.up_card.show_fraction(uptime_text(up), None, f"load {load}" if load else "")
-        lines = []
-        for node, items in data["storage"].items():
-            for st in items:
-                if not st.get("total"):
-                    continue
-                frac = st.get("used", 0) / st["total"]
-                prefix = f"{node} · " if len(data["storage"]) > 1 else ""
-                lines.append(f"{prefix}<b>{st['storage']}</b> ({st.get('type', '')}): {gib(st.get('used'))} of "
-                             f"{gib(st['total'])} used — {frac * 100:.0f} %")
-        self.storage_label.setText("<br>".join(lines) or "No storage reported.")
+        self.storage_cards.show_entries(storage_entries(data["storage"]))
 
     # -- the guests table --------------------------------------------------------------------------
 
