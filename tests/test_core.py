@@ -28,7 +28,7 @@ from proxmox_controller.core.websocket import WebSocket
 from proxmox_controller.core.demo import DEMO_HOSTS, DemoPve
 from proxmox_controller.core.pve import (CertificateMismatch, Host, Pve, PveError, agent_enabled, fetch_fingerprint,
                                          format_fingerprint, guest_macs, normalize_fingerprint, split_address,
-                                         upload_name)
+                                         storage_order, upload_name)
 
 try:
     from tests.fake_server import FakePveServer, openssl_available
@@ -914,6 +914,25 @@ class ConnectorToolsTest(unittest.TestCase):
             self.run_tool("restore_backup", host="demo-pve", vmid=101, volid=backup, replace=True, reason="r")
         new = self.run_tool("restore_backup", host="demo-pve", vmid=101, volid=backup, reason="r")
         self.assertIn(new["vmid"], self.cluster.guests)
+
+    def test_storages_in_a_set_order_disks_on_the_host_first(self):
+        """Proxmox lists storages in no set order (the user's New VM offered local-lvm, then nas, 15/10): sorted by
+        name — and for VM and container disks the host's own storage before a network share."""
+        self.cluster.network_share = True  # (listed first by the fake, as on the user's host)
+        names = lambda content=None: [s["storage"] for s in self.pve.storages("pve", content=content)]  # noqa: E731
+        self.assertEqual(names("images"), ["local-lvm", "nas"])
+        self.assertEqual(names("rootdir"), ["local-lvm", "nas"])
+        self.assertEqual(names("backup"), ["local", "nas"])  # by name: as before the NAS came
+        self.assertEqual(names("iso"), ["local", "nas"])
+        self.assertEqual(names(), ["local", "local-lvm", "nas"])
+        iso = self.pve.isos("pve")[0]["volid"]
+        template = self.pve.templates("pve")[0]["volid"]
+        self.assertIn("local-lvm:", " ".join(self.words("create_vm", host="demo-pve", name="web", iso=iso, reason="r")[1]))
+        self.assertIn("disk local-lvm:", " ".join(self.words("create_container", host="demo-pve", hostname="db",
+                                                             template=template, reason="r")[1]))
+        made = self.run_tool("create_vm", host="demo-pve", name="web", iso=iso, reason="r")  # (not on the NAS)
+        self.assertIn(made["vmid"], self.cluster.guests)
+        self.assertEqual(storage_order({"storage": "x", "type": "nfs"}, "images")[0], True)  # no "shared": by type
 
     def test_delete_takes_its_backups_but_not_the_protected(self):
         c = self.cluster

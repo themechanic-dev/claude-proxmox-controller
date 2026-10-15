@@ -37,6 +37,7 @@ class FakeCluster:
     def __init__(self, token: str = "root@pam!controller=secret", profile: str = "server"):
         self.token = token  # root's token: everything is allowed
         self.has_access_network = True  # False: a Proxmox release without Sys.AccessNetwork
+        self.network_share = False  # True: a NAS share with every content, listed first (as the user's 'nas', 15/10)
         self.users: dict[str, dict] = {"root@pam": {"userid": "root@pam", "comment": ""}}
         self.api_tokens: dict[str, dict] = {}  # "user@realm!name" → {"secret", "privsep", "comment"}
         self.roles: dict[str, list[str]] = {}
@@ -202,9 +203,12 @@ class FakeCluster:
 
     def storages(self, p, node):
         out = [{"storage": "local", "type": "dir", "content": "iso,vztmpl,backup,import", "used": 21 << 30,
-                "total": 94 << 30, "active": 1, "enabled": 1},
+                "total": 94 << 30, "active": 1, "enabled": 1, "shared": 0},
                {"storage": "local-lvm", "type": "lvmthin", "content": "rootdir,images", "used": 180 << 30,
-                "total": 800 << 30, "active": 1, "enabled": 1}]
+                "total": 800 << 30, "active": 1, "enabled": 1, "shared": 0}]
+        if self.network_share:  # Proxmox lists storages in no set order: on the user's host the NAS came first
+            out.insert(0, {"storage": "nas", "type": "cifs", "content": "iso,images,vztmpl,import,backup,snippets,rootdir",
+                           "used": 415 << 30, "total": 7233 << 30, "active": 1, "enabled": 1, "shared": 1})
         content = p.get("content")
         return [s for s in out if not content or content in s["content"].split(",")]
 

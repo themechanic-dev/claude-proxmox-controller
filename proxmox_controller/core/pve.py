@@ -24,6 +24,16 @@ from urllib.parse import quote, urlencode
 DEFAULT_PORT = 8006
 KINDS = ("lxc", "qemu")  # containers, virtual machines
 GUEST_ACTIONS = ("start", "shutdown", "stop", "reboot")
+DISK_CONTENT = ("images", "rootdir")  # VM disks, container disks
+NETWORK_STORAGE = ("cifs", "nfs", "cephfs", "rbd", "iscsi", "iscsidirect", "glusterfs", "pbs", "esxi")
+
+
+def storage_order(storage: dict, content: str | None = None) -> tuple:
+    """Proxmox lists a node's storages in no set order (the user's New VM offered local-lvm, and the next time the
+    NAS, 15/10): by name — and for disks the host's own storages first, a network share after, so a new guest's
+    disk lands on the host unless the user picks the share."""
+    remote = bool(storage.get("shared")) or storage.get("type") in NETWORK_STORAGE
+    return (remote if content in DISK_CONTENT else False, storage.get("storage", ""))
 
 
 class PveError(Exception):
@@ -276,7 +286,8 @@ class Pve:
                      {"path": path, "index": int(index), "enabled": bool(enabled)})
 
     def storages(self, node: str, content: str | None = None) -> list[dict]:
-        return self.get(f"/nodes/{q(node)}/storage", content=content, enabled=1 if content else None) or []
+        found = self.get(f"/nodes/{q(node)}/storage", content=content, enabled=1 if content else None) or []
+        return sorted(found, key=lambda s: storage_order(s, content))
 
     def node_command(self, node: str, command: str) -> None:
         """Shut down or reboot the host itself ("shutdown" | "reboot")."""

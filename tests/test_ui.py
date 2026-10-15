@@ -439,6 +439,21 @@ class GuestDialogsTest(UiCase):
         self.assertTrue(wait_until(lambda: vm.result() == vm.DialogCode.Accepted))
         self.assertEqual(self.cluster().guests[103]["cfg"]["startup"], "order=3,up=20")
 
+    def test_new_guests_default_to_the_hosts_own_disk(self):
+        """A NAS share that takes disks too, listed first by Proxmox: the windows still offer local-lvm first
+        (the user's New VM showed local-lvm once and nas the next time, 15/10) — and the NAS stays there to pick."""
+        DemoPve(DEMO_HOSTS[0]).cluster.network_share = True
+        for _ in range(2):  # the same each time it opens
+            vm = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"])
+            self.assertTrue(wait_until(lambda: vm.isEnabled() and vm.storage.count()))
+            self.assertEqual([vm.storage.itemData(i) for i in range(vm.storage.count())], ["local-lvm", "nas"])
+            self.assertEqual(vm.storage.currentData(), "local-lvm")
+            vm.close()
+        ct = guest_dialogs.CreateContainerDialog(None, self.client, self.runner, ["pve"])
+        self.assertTrue(wait_until(lambda: ct.isEnabled() and ct.storage.count()))
+        self.assertEqual(ct.storage.currentData(), "local-lvm")
+        ct.close()
+
     def test_container_edit_has_no_vm_hardware(self):
         dlg = guest_dialogs.EditGuestDialog(None, self.client, self.runner, self.guest(100))
         self.assertIsNone(dlg.hw)
