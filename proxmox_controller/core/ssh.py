@@ -215,6 +215,25 @@ def run_with_key(host: str, port: int, user: str, script: str, ssh: str = "ssh",
     return done.stdout
 
 
+def run_command(host: str, port: int, user: str, script: str, ssh: str = "ssh",
+                timeout: int = SSH_TIMEOUT_S) -> tuple[int, str, str]:
+    """A shell line on the host with the app's key: (exit code, output, errors) whatever the command's exit code —
+    only ssh's own failures raise (it exits 255: no answer, the key refused, the host key changed)."""
+    argv = ssh_argv(host, port, user, True, tty=False)
+    argv[0] = ssh
+    argv[1:1] = ["-o", "BatchMode=yes"]
+    argv.append(script)
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise SshError(f"The command did not finish within {timeout} s (it was stopped here; on {host} it may "
+                       "still be running).") from e
+    if done.returncode == 255:
+        raise SshError(_explain(done.stderr))
+    return done.returncode, done.stdout, done.stderr
+
+
 def _explain(stderr: str) -> str:
     text = stderr.strip()
     if "Permission denied" in text:

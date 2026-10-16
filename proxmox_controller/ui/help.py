@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import html
+
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QScrollArea, QVBoxLayout, QWidget
 
 from .. import APP_NAME
+from ..core import connector_tools
 from .widgets import card, label
+
+def switch_table_html() -> str:
+    """Every switch and every tool under it, made from the connector's own list (connector_tools.access_table), so
+    this page can never say something the code does not do."""
+    parts = ["Each switch, what it lets Claude do on a host, and every tool under it. A new host starts with the "
+             "switches shown as default; you change them for each host in <b>☰ → Claude Access…</b>"]
+    for row in connector_tools.access_table():
+        tools = "".join(
+            f"<br>&nbsp;&nbsp;• <tt>{html.escape(t['name'])}</tt> — {html.escape(t['does'])}"
+            + (f" <i>({html.escape('; '.join(t['notes']))})</i>" if t["notes"] else "") for t in row["tools"])
+        parts.append(f"<b>{html.escape(row['title'])}</b> (default: {row['default'].capitalize()}) — "
+                     f"{html.escape(row['covers'])}.<br>&nbsp;&nbsp;<i>{html.escape(row['enforced'])}</i>{tools}")
+    return "<br><br>".join(parts)
+
 
 SECTIONS = [
     ("What this app does",
@@ -140,15 +157,10 @@ SECTIONS = [
      "• <b>Set Up…</b> (for each host) makes, with your API token, Claude's own user on the host "
      "(<tt>claude-controller@pve</tt>, with no password: it cannot log in to the web interface), its role and its API "
      "token. <b>Remove…</b> takes all of it away again.<br>"
-     "• <b>Seven switches</b> for each host, each <b>Off</b> (refused — by this app and by Proxmox), <b>Ask</b> (a window "
-     "asks you: <i>Allow</i>, <i>Allow This Kind for 1 Hour</i> or <i>Deny</i>; no answer in two minutes is a No) or "
-     "<b>On</b> (done at once):<br>"
-     "&nbsp;&nbsp;<b>Read</b> — state, addresses, settings, notes, snapshots, backups, jobs, tasks and their logs, "
-     "graphs · <b>Power</b> — start, shut down, stop, reboot, Bulk Start and Shut Down, Wake-on-LAN · <b>Change</b> — "
-     "edit, notes, snapshots, Back Up Now, new VMs and containers, copies, ISO downloads, restoring a backup as a new "
-     "guest · <b>Destroy</b> — delete guests, roll back or delete snapshots, delete backups, restore a backup over a "
-     "guest, stop a task · <b>Host</b> — shut down or reboot the host itself · <b>Console</b> — see a guest's screen, "
-     "type into it and click on it (the window shows a red mark where a click will land) · <b>Commands</b> — run commands inside VMs that have the QEMU guest agent.<br>"
+     "• <b>Eight switches</b> for each host, each <b>Off</b> (refused), <b>Ask</b> (a window asks you: <i>Allow</i>, "
+     "<i>Allow This Kind for 1 Hour</i> or <i>Deny</i>; no answer in two minutes is a No) or <b>On</b> (done at "
+     "once): Read, Power, Change, Destroy, Host, Console, Commands and Host commands. <b>What each switch allows</b> "
+     "below lists every tool Claude has, under its switch.<br>"
      "• Between requests Claude's token can only read (with Read On); for each request the app allows, it lends the "
      "token that kind's privileges for just that request. Changing backup jobs needs privileges too broad to lend, "
      "so Claude can see the jobs but not change them.<br>"
@@ -167,6 +179,7 @@ SECTIONS = [
      "On: nobody is there to answer Ask.<br>"
      "• <b>Lock the API tokens with a password</b> first (Settings → Security): unlocked, programs running as you — "
      "Claude included — could read your own token and go around the switches."),
+    ("What each switch allows", switch_table_html()),
     ("Security",
      "<b>Settings → Security → Lock with a Password…</b> keeps your hosts' API tokens (and Claude's) encrypted on this "
      "computer (scrypt and AES-256-GCM); the app asks for the password each time it starts, before it reaches any "

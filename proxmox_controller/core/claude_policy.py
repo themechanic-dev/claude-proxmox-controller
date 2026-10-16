@@ -1,6 +1,7 @@
-"""What Claude may do through the connector: seven kinds of request, each Off, Ask or On, per host, under one
+"""What Claude may do through the connector: eight kinds of request, each Off, Ask or On, per host, under one
 switch for all. The Proxmox privileges of Claude's own token follow the same switches (core/claude_access.py), so a
-kind that is Off is refused by Proxmox too — not only by this app.
+kind that is Off is refused by Proxmox too — not only by this app. Host commands are the exception: they go over
+SSH with the app's key, not through the API, so only this app refuses them.
 
 Privileges are the ones each API call checks (read from Proxmox's API schema, PVE 9). Some are shared — deleting a
 guest needs VM.Allocate, as creating one does — so there only the app tells Change from Destroy."""
@@ -21,6 +22,7 @@ CATEGORIES = (  # (each description fits one line beside its switch; Help has th
     ("host", "Host", "Shut down or reboot the host itself", OFF),
     ("console", "Console", "See a guest's screen, type into it and click on it", OFF),
     ("commands", "Commands", "Run commands inside VMs that have the QEMU guest agent", OFF),
+    ("host_commands", "Host commands", "Run commands on the host itself, as root, over the app's SSH key", OFF),
 )
 KEYS = tuple(c[0] for c in CATEGORIES)
 TITLES = {c[0]: c[1] for c in CATEGORIES}
@@ -38,13 +40,15 @@ PRIVILEGES = {
     "host": ("Sys.PowerMgmt",),
     "console": ("VM.Console",),
     "commands": ("VM.GuestAgent.Unrestricted",),
+    "host_commands": (),  # over SSH with the app's key: no API privilege to lend (and none Proxmox could refuse)
 }
+NOT_HOUR = ("host_commands",)  # each one seen: no "Allow this kind for 1 hour" (the user's rule for the host)
 OPTIONAL_PRIVILEGES = ("Sys.AccessNetwork",)  # not in every Proxmox VE 9 release
 TEMP_ALLOW_S = 3600  # "Allow this kind for 1 hour"
 
 
 def host_switches(settings: dict, host_id: str) -> dict:
-    """The seven switches of one host: what was chosen, else the defaults."""
+    """The switches of one host: what was chosen, else the defaults (a switch added later starts at its default)."""
     saved = ((settings.get("claude") or {}).get("hosts") or {}).get(host_id) or {}
     return {k: saved.get(k) if saved.get(k) in STATES else DEFAULTS[k] for k in KEYS}
 

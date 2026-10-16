@@ -1,4 +1,4 @@
-"""Claude Access: the switch for all, Claude's access per host (Set Up / Remove), the seven switches of each host, the
+"""Claude Access: the switch for all, Claude's access per host (Set Up / Remove), the switches of each host, the
 connection to the Claude apps, and the log of every request."""
 
 from __future__ import annotations
@@ -132,7 +132,9 @@ class ClaudeWindow(QDialog):
         hb.addLayout(grid)
         hb.addWidget(label("Off: refused, by this app and by Proxmox. Ask: you approve each request in a window. "
                            "On: done at once. Claude's token can only read between requests; the app lends it a "
-                           "kind's privileges just for a request it allows.", "caption", wrap=True))
+                           "kind's privileges just for a request it allows. Host commands go over SSH with this "
+                           "app's key, not through Proxmox: only this app refuses them. Help lists every tool "
+                           "under its switch.", "caption", wrap=True))
         lay.addWidget(host_box)
 
         # the log

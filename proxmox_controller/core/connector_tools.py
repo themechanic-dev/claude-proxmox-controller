@@ -1,4 +1,4 @@
-"""The connector's tools: what Claude can ask the app to do. Each belongs to one of the seven kinds of claude_policy,
+"""The connector's tools: what Claude can ask the app to do. Each belongs to one of the kinds of claude_policy,
 says what it needs (JSON Schema, for Claude) and says in words what it would do (for the user's approval window and
 the log).
 
@@ -17,14 +17,15 @@ from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import quote
 
-from . import screen, startup, wol
+from . import claude_policy, screen, ssh, startup, wol
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
 from .vmspec import PROFILES, VMNAME, iso_name_from_url, vm_params
 
 WAIT_S = 60          # a request waits this long for its Proxmox task; longer ones are followed with task_log
 LOG_LINES = 200      # the most lines task_log returns at a time
-EXEC_WAIT_S = 120    # the longest a command inside a VM may run
+EXEC_WAIT_S = 120    # the longest a command inside a VM (or on the host) may run
+HOST_OUTPUT_MAX = 20000  # characters of a host command's output (and of its errors) given back: its start and end
 SNAPNAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,39}$")
 HOSTNAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 CIDR = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
@@ -53,6 +54,7 @@ class Tool:
     secret_repeat: bool | Callable[[dict], bool] = True  # asked twice (a new password) or once (an existing one)
     secret_min: int = 1                      # Proxmox's own minimum, where it has one (a container's root: 5)
     also: tuple | Callable[[dict], tuple] = ()  # other kinds a request may use in passing (a new VM's start: power)
+    doc_kinds: tuple = ()                    # where a tool whose kind comes from its arguments is listed (Help, docs)
 
     def also_of(self, args: dict) -> tuple:
         return self.also(args) if callable(self.also) else self.also
@@ -1095,6 +1097,48 @@ def _exec(ctx: Context, a: dict):
         time.sleep(0.5)
 
 
+def _host_ssh(ctx: Context) -> tuple[str, int, str]:
+    """(address, port, user) for a command on the host — when the user set up SSH with the app's key for it and the
+    host's key is still the one they confirmed. ToolError otherwise, before anything is asked or run."""
+    s = ctx.host.extra.get("ssh") if isinstance(ctx.host.extra.get("ssh"), dict) else {}
+    if not s or not s.get("key"):
+        raise ToolError(f"SSH with this app's key is not set up for {ctx.host.name}. The user sets it up in Proxmox "
+                        "Controller: Console → Connect by SSH, with 'Use a key'. Nothing was run.")
+    port = int(s.get("port", 22))
+    if not ssh.trusted_host_key(ctx.host.hostname, port):
+        raise ToolError(f"The SSH key of {ctx.host.name} is no longer the one the user confirmed: they confirm it again "
+                        "in Proxmox Controller (Console → Connect by SSH). Nothing was run.")
+    return ctx.host.hostname, port, str(s.get("user") or "root")
+
+
+def _clip(text: str) -> str:
+    if len(text) <= HOST_OUTPUT_MAX:
+        return text
+    half = HOST_OUTPUT_MAX // 2
+    return f"{text[:half]}\n… ({len(text) - 2 * half} characters left out) …\n{text[-half:]}"
+
+
+def _host_command_words(ctx: Context, a: dict):
+    address, _, user = _host_ssh(ctx)
+    if not a["command"].strip():
+        raise ToolError("command is empty.")
+    return f"Run a command on {ctx.host.name} itself, as {user}", [
+        a["command"], f"On {address} over SSH with this app's key. Claude gets what it prints."]
+
+
+def _host_command(ctx: Context, a: dict):
+    address, port, user = _host_ssh(ctx)
+    if not a["command"].strip():
+        raise ToolError("command is empty.")
+    try:
+        code, out, err = ssh.run_command(address, port, user, a["command"],
+                                         timeout=min(int(a.get("timeout_s", 60)), EXEC_WAIT_S))
+    except ssh.SshError as e:
+        raise ToolError(f"{e} Nothing more is known about the command.") from e
+    return {"host": ctx.host.name, "exit_code": code, "stdout": _clip(out), "stderr": _clip(err),
+            **({"output_shortened": True} if len(out) > HOST_OUTPUT_MAX or len(err) > HOST_OUTPUT_MAX else {})}
+
+
 # -- the registry ----------------------------------------------------------------------------------
 
 def _tools() -> list[Tool]:
@@ -1209,7 +1253,7 @@ def _tools() -> list[Tool]:
              {**vm, "volid": {"type": "string"}, "replace": {"type": "boolean"},
               "new_vmid": {"type": "integer", "minimum": 100}, "storage": {"type": "string"},
               "start": {"type": "boolean"}}, ("host", "vmid", "volid"), _restore, _restore_words,
-             also=_power_for_start),
+             also=_power_for_start, doc_kinds=("change", "destroy")),
         Tool("delete_guest", "destroy", "Delete a stopped guest with all its disks and snapshots — and its backups, "
              "which Proxmox would keep (protected ones always stay), unless keep_backups is true.",
              {**vm, "keep_backups": {"type": "boolean", "description": "Keep its backups."}}, ("host", "vmid"),
@@ -1263,14 +1307,85 @@ def _tools() -> list[Tool]:
               "input": {"type": "string", "description": "Text given to the program's standard input."},
               "timeout_s": {"type": "integer", "minimum": 1, "maximum": EXEC_WAIT_S}},
              ("host", "vmid", "command"), _exec, _exec_words),
+        Tool("host_command", "host_commands", "Run a shell command on the Proxmox host itself, as root, over the SSH "
+             "key the user set up in Proxmox Controller, and get its output and exit code — for what the API cannot "
+             "do (installed programs, services, logs, files). One command line a request: the user sees it as it is "
+             "in the approval window, every time. It runs on the host at the address the app connects to.",
+             {**host, "command": {"type": "string", "description": "A shell command line, run by the user's shell "
+                                  "on the host (pipes and ; work)."},
+              "timeout_s": {"type": "integer", "minimum": 1, "maximum": EXEC_WAIT_S}},
+             ("host", "command"), _host_command, _host_command_words),
     ]
 
 
 TOOLS: dict[str, Tool] = {t.name: t for t in _tools()}
 
+
+def _summary(text: str) -> str:
+    """A tool's description up to the end of its first sentence."""
+    m = re.match(r"(.+?[.!?])(\s|$)", text, re.S)
+    return (m.group(1) if m else text).strip()
+
+
+def access_table() -> list[dict]:
+    """Every switch with every tool under it, from the code itself — so Help and docs/claude-access.md always say
+    what the connector really does (the user's wish, 17/10: anyone who downloads the app sees which switch opens what)."""
+    out = []
+    for key, title, covers, default in claude_policy.CATEGORIES:
+        tools = []
+        for t in TOOLS.values():
+            kinds = t.doc_kinds or ((t.kind,) if isinstance(t.kind, str) else (t.kind_of({}),))
+            if key not in kinds:
+                continue
+            notes = []
+            if "power" in t.also_of({"start": True}):
+                notes.append("starting it also needs Power not Off")
+            if t.secret_prompt({}):
+                notes.append("asks you for a password")
+            if len(kinds) > 1:
+                notes.append(" or ".join(claude_policy.TITLES[k] for k in kinds) + ", by its arguments")
+            tools.append({"name": t.name, "does": _summary(t.description), "notes": notes})
+        privs = claude_policy.PRIVILEGES[key]
+        if key == "host_commands":
+            enforced = ("This app only: the commands go over SSH with the app's key, not through Proxmox's API, so "
+                        "Proxmox cannot refuse them on its own. Each one is shown in the approval window, every time "
+                        "(no 'Allow This Kind for 1 Hour'). The app's SSH key file itself is not encrypted: a program "
+                        "running as you on this computer (Claude Code with a shell, too) could read it and use it "
+                        "without asking — Off stops the connector, not that.")
+        elif key == "read":
+            enforced = "This app and Proxmox: Claude's token holds these privileges while Read is On: " + ", ".join(privs)
+        else:
+            enforced = ("This app and Proxmox: lent to Claude's token only for a request the app allows: " +
+                        ", ".join(privs))
+        out.append({"key": key, "title": title, "covers": covers, "default": default, "enforced": enforced,
+                    "tools": tools})
+    return out
+
+def access_markdown() -> str:
+    """docs/claude-access.md — what each switch lets Claude do, for anyone who downloads the app. Written by
+    tools/claude_access_doc.py from access_table(); a test fails if the file falls behind the code."""
+    lines = ["# What Claude may do — the switches", "",
+             "<!-- Made by tools/claude_access_doc.py from the code (connector_tools.access_table): do not edit. -->", "",
+             "Claude reaches your Proxmox hosts only through Proxmox Controller, and only as far as each host's switches "
+             "let it. Every switch is **Off** (refused), **Ask** (a window of the app asks you: *Allow*, *Allow This "
+             "Kind for 1 Hour* or *Deny*; no answer in two minutes is a No) or **On** (done at once). Above them, "
+             "*Let Claude use Proxmox Controller* turns all of it off. Passwords never go through Claude: where one is "
+             "needed, the app asks you for it in its own window. Every request is logged with the reason Claude gave.",
+             ""]
+    for row in access_table():
+        lines += [f"## {row['title']} — default: {row['default'].capitalize()}", "", f"{row['covers']}.", "",
+                  f"*{row['enforced']}*", "", "| Tool | What it does |", "|---|---|"]
+        for t in row["tools"]:
+            notes = f" *({'; '.join(t['notes'])})*" if t["notes"] else ""
+            lines.append(f"| `{t['name']}` | {t['does'].replace('|', '/')}{notes} |")
+        lines.append("")
+    return "\n".join(lines)
+
+
 INSTRUCTIONS = (
     "Proxmox Controller lets you manage the user's Proxmox VE hosts. Call list_hosts first: it gives each host's id "
-    "and, per kind of request (read, power, change, destroy, host, console, commands), whether it is off, ask or on. "
+    "and, per kind of request (read, power, change, destroy, host, console, commands, host_commands), whether it is "
+    "off, ask or on. "
     "'ask' means the user approves each request in a window of the app (it may take a while, and they may deny it); "
     "'off' means it will be refused — tell the user instead of trying another way. Every request other than reading "
     "needs a short reason, shown to the user. Long Proxmox tasks come back as running: follow them with task_log. "

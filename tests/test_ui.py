@@ -2012,6 +2012,32 @@ class ConnectorTest(UiCase):
         self.assertFalse(self.windows[-1].isVisible())
         self.assertEqual(self.admin.cluster.guests[102]["status"], "stopped")
 
+    def test_host_command_shown_each_time_nothing_lent(self):
+        """Host commands: Off for a new host (refused); on Ask the window shows the command, with a red Allow and no
+        'for 1 hour' — every command seen — and Claude's token is lent nothing: it goes over SSH."""
+        from proxmox_controller.core import connector_tools
+        answer = self.request("host_command", host="demo-pve", command="systemctl is-active cloudflared", reason="r")
+        self.assertIn("Host commands requests are Off", self.text(answer))
+        claude_policy.set_switch(self.win.settings, "demo-pve", "host_commands", "ask")
+        next(h for h in self.win.hosts if h.id == "demo-pve").extra["ssh"] = {"user": "root", "port": 22, "key": True}
+        with mock.patch.object(connector_tools.ssh, "trusted_host_key", return_value="ssh-ed25519 AAAA"), \
+                mock.patch.object(connector_tools.ssh, "run_command", return_value=(0, "active\n", "")) as run:
+            box = self.request("host_command", wait=False, host="demo-pve", command="systemctl is-active cloudflared",
+                               reason="see whether the tunnel's connector runs")
+            self.assertTrue(wait_until(lambda: self.windows))
+            dlg = self.windows[-1]
+            shown = " ".join(w.text() for w in dlg.findChildren(type(dlg.what)))
+            self.assertIn("systemctl is-active cloudflared", shown)
+            self.assertFalse(dlg.hour_btn.isVisibleTo(dlg))
+            self.assertEqual(dlg.allow_btn.property("kind"), "destructive")
+            self.assertEqual(self.role(), list(claude_policy.PRIVILEGES["read"]))
+            dlg.allow_btn.click()
+            self.assertTrue(wait_until(lambda: "answer" in box, 10))
+        self.assertFalse(box["answer"]["result"]["isError"], self.text(box))
+        self.assertEqual(json.loads(self.text(box))["stdout"], "active\n")
+        run.assert_called_once()
+        self.assertEqual(self.role(), list(claude_policy.PRIVILEGES["read"]))  # nothing was lent
+
     def test_refusal_says_what_proxmox_checked(self):
         """Approved, yet Proxmox says no: Claude is told which privilege on which path — the way to find why."""
         self.admin.cluster.forbidden.add(r"POST /nodes/pve/lxc/\d+/status/.*")

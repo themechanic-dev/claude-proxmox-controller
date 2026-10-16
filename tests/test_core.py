@@ -774,7 +774,8 @@ class ClaudeAccessTest(unittest.TestCase):
         self.assertEqual(claude_policy.decide(settings, "h", "read"), "off")  # the switch for all starts off
         settings["claude"] = {"enabled": True}
         self.assertEqual([claude_policy.decide(settings, "h", k) for k in claude_policy.KEYS],
-                         ["on", "ask", "ask", "off", "off", "off", "off"])  # the user's chosen defaults
+                         ["on", "ask", "ask", "off", "off", "off", "off", "off"])  # the user's chosen defaults
+        # (the eighth, Host commands, 17/10: Off for every new host — root on the host is the most there is)
         allow = claude_policy.Allowances()
         allow.grant("h", "power", 60)
         self.assertEqual(claude_policy.decide(settings, "h", "power", allow), "on")  # "for 1 hour"
@@ -933,6 +934,62 @@ class ConnectorToolsTest(unittest.TestCase):
         made = self.run_tool("create_vm", host="demo-pve", name="web", iso=iso, reason="r")  # (not on the NAS)
         self.assertIn(made["vmid"], self.cluster.guests)
         self.assertEqual(storage_order({"storage": "x", "type": "nfs"}, "images")[0], True)  # no "shared": by type
+
+    def test_host_command_over_the_apps_key(self):
+        """A command on the host itself, as root, over the SSH key the user set up in the app — none without it, and
+        none when the host's key is no longer the confirmed one; the window shows the command as it will run."""
+        import dataclasses
+        T = connector_tools
+        tool = T.TOOLS["host_command"]
+        self.assertEqual((tool.kind, claude_policy.DEFAULTS["host_commands"]), ("host_commands", "off"))
+        args = T.check(tool, {"host": "demo-pve", "command": "command -v cloudflared", "reason": "r"})
+        with self.assertRaises(T.ToolError) as caught:
+            tool.words(self.ctx(), args)  # no SSH set up: refused before any window
+        self.assertIn("Console → Connect by SSH", str(caught.exception))
+        host = dataclasses.replace(DEMO_HOSTS[0], extra={"ssh": {"user": "root", "port": 2222, "key": True}})
+        ctx = T.Context(host=host, pve=self.pve, admin=self.pve)
+        with mock.patch.object(T.ssh, "trusted_host_key", return_value=""):
+            with self.assertRaises(T.ToolError) as caught:
+                tool.run(ctx, args)
+        self.assertIn("no longer the one the user confirmed", str(caught.exception))
+        with mock.patch.object(T.ssh, "trusted_host_key", return_value="ssh-ed25519 AAAA"), \
+                mock.patch.object(T.ssh, "run_command", return_value=(1, "x" * 30000, "")) as run:
+            what, details = tool.words(ctx, args)
+            out = tool.run(ctx, args)
+            with self.assertRaises(T.ToolError):
+                tool.run(ctx, dict(args, command="   "))
+        self.assertEqual(details[0], "command -v cloudflared")  # as it will run
+        self.assertIn("as root", what)
+        run.assert_called_once_with(host.hostname, 2222, "root", "command -v cloudflared", timeout=60)
+        self.assertEqual(out["exit_code"], 1)  # a command's own failure is an answer, not an error
+        self.assertTrue(out["output_shortened"])
+        self.assertIn("characters left out", out["stdout"])
+        self.assertLess(len(out["stdout"]), T.HOST_OUTPUT_MAX + 100)
+        with mock.patch.object(T.ssh, "trusted_host_key", return_value="k"), \
+                mock.patch.object(T.ssh, "run_command", side_effect=T.ssh.SshError("The host did not answer.")):
+            with self.assertRaises(T.ToolError):
+                tool.run(ctx, args)
+        # a host saved before this switch existed starts with it Off; it lends Claude's token nothing
+        saved = {"claude": {"hosts": {"h": {"read": "on", "commands": "ask"}}}}
+        self.assertEqual(claude_policy.host_switches(saved, "h")["host_commands"], "off")
+        self.assertEqual(claude_policy.privileges({"host_commands": "on"}), [])
+
+    def test_switch_table_is_the_code_and_the_docs_follow_it(self):
+        """Which switch opens what, for anyone who downloads the app (the user's wish, 17/10): made from the tools
+        themselves — every tool under its switch — and docs/claude-access.md is that table, word for word."""
+        table = connector_tools.access_table()
+        self.assertEqual([r["key"] for r in table], list(claude_policy.KEYS))
+        self.assertEqual({t["name"] for r in table for t in r["tools"]}, set(connector_tools.TOOLS))
+        where = lambda name: [r["key"] for r in table if any(t["name"] == name for t in r["tools"])]  # noqa: E731
+        self.assertEqual(where("restore_backup"), ["change", "destroy"])
+        self.assertEqual(where("host_command"), ["host_commands"])
+        notes = {t["name"]: t["notes"] for r in table for t in r["tools"]}
+        self.assertIn("starting it also needs Power not Off", notes["create_vm"])
+        self.assertIn("asks you for a password", notes["console_type_password"])
+        self.assertIn("This app only", table[-1]["enforced"])
+        doc = Path(__file__).resolve().parent.parent / "docs" / "claude-access.md"
+        self.assertEqual(doc.read_text(encoding="utf-8"), connector_tools.access_markdown(),
+                         "docs/claude-access.md is behind the code: run tools/claude_access_doc.py")
 
     def test_delete_takes_its_backups_but_not_the_protected(self):
         c = self.cluster
@@ -1468,6 +1525,34 @@ class SshTest(unittest.TestCase):
             self.assertEqual(f.read().splitlines(), ["ssh-rsa AAAAclusternode root@pve"])  # the cluster's key stays
         os.remove(link)
         run(sshmod.remove_key_script(line))  # nothing there: nothing done
+
+    def test_command_with_the_key_any_exit_code(self):
+        """host_command's way in: the command's own exit code and output come back as they are; only ssh itself
+        failing (it exits 255) raises, and a command that runs too long is cut off here."""
+        path = os.path.join(self.tmp, "fake-ssh-cmd")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n"
+                    "for last; do :; done\n"  # (the last argument: the command line)
+                    'case "$last" in\n'
+                    '  fail) echo "not found" >&2; exit 1;;\n'
+                    '  down) echo "ssh: connect to host 192.0.2.80 port 22: Connection refused" >&2; exit 255;;\n'
+                    "  slow) sleep 5;;\n"
+                    '  *) echo "args: $*";;\n'
+                    "esac\n")
+        os.chmod(path, 0o700)
+        code, out, err = sshmod.run_command("192.0.2.80", 2222, "root", "systemctl is-active cloudflared", ssh=path)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("BatchMode=yes", out)  # never a password prompt
+        self.assertIn(f"-i {sshmod.key_path()} -o IdentitiesOnly=yes", out)  # the app's key, alone
+        self.assertIn("-p 2222", out)
+        self.assertTrue(out.strip().endswith("root@192.0.2.80 systemctl is-active cloudflared"))
+        self.assertEqual(sshmod.run_command("192.0.2.80", 22, "root", "fail", ssh=path), (1, "", "not found\n"))
+        with self.assertRaises(sshmod.SshError) as caught:
+            sshmod.run_command("192.0.2.80", 22, "root", "down", ssh=path)
+        self.assertIn("Connection refused", str(caught.exception))
+        with self.assertRaises(sshmod.SshError) as caught:
+            sshmod.run_command("192.0.2.80", 22, "root", "slow", ssh=path, timeout=1)
+        self.assertIn("did not finish within 1 s", str(caught.exception))
 
     def fake_ssh(self, expected_password):
         """An 'ssh' that asks SSH_ASKPASS for the password, as the real one does, and says what it was given. (The

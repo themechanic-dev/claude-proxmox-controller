@@ -138,7 +138,7 @@ class ApprovalDialog(QDialog):
         self.hour_btn = button("Allow This Kind for 1 Hour", "", f"Further {claude_policy.TITLES.get(kind, kind)} "
                                f"requests on {host.name} are allowed without asking for the next hour (while the app "
                                "runs).")
-        self.allow_btn = button("Allow", "destructive" if kind in ("destroy", "host") else "suggested")
+        self.allow_btn = button("Allow", "destructive" if kind in ("destroy", "host", "host_commands") else "suggested")
         self.deny_btn.clicked.connect(lambda: self.finish("deny"))
         self.hour_btn.clicked.connect(lambda: self.finish("allow-hour"))
         self.allow_btn.clicked.connect(lambda: self.finish("allow"))
@@ -156,6 +156,8 @@ class ApprovalDialog(QDialog):
             self.password.setFocus()
         else:
             self.deny_btn.setFocus()
+        if kind in claude_policy.NOT_HOUR:
+            self.hour_btn.hide()  # each command on the host is seen before it runs
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(1000)
@@ -428,5 +430,6 @@ class Connector(QObject):
 
 
 def tool_uses_api(tool) -> bool:
-    """Wake-on-LAN is sent from this computer: no Proxmox privilege to lend (and the host may be off)."""
-    return tool.name != "wake_host"
+    """Wake-on-LAN is sent from this computer (and the host may be off); a host command goes over SSH: no Proxmox
+    privilege to lend for either."""
+    return tool.name not in ("wake_host", "host_command")
