@@ -2038,6 +2038,41 @@ class ConnectorTest(UiCase):
         run.assert_called_once()
         self.assertEqual(self.role(), list(claude_policy.PRIVILEGES["read"]))  # nothing was lent
 
+    def test_container_root_password_through_the_window(self):
+        """A container's new root password: under Host commands (it goes over SSH as root); the window shows what
+        runs and asks the user for the password twice; it reaches the host only as the command's input — Claude's
+        answer and the log never hold it, and nothing is lent to Claude's token."""
+        from proxmox_controller.core import connector_tools
+        answer = self.request("set_container_root_password", host="demo-pve", vmid=100, reason="r")
+        self.assertIn("Host commands requests are Off", self.text(answer))
+        claude_policy.set_switch(self.win.settings, "demo-pve", "host_commands", "ask")
+        next(h for h in self.win.hosts if h.id == "demo-pve").extra["ssh"] = {"user": "root", "port": 22, "key": True}
+        with mock.patch.object(connector_tools.ssh, "trusted_host_key", return_value="ssh-ed25519 AAAA"), \
+                mock.patch.object(connector_tools.ssh, "run_command", return_value=(0, "", "")) as run:
+            box = self.request("set_container_root_password", wait=False, host="demo-pve", vmid=100,
+                               reason="its root password is lost")
+            self.assertTrue(wait_until(lambda: self.windows))
+            dlg = self.windows[-1]
+            shown = " ".join(w.text() for w in dlg.findChildren(type(dlg.what)))
+            self.assertIn("pct exec 100 -- chpasswd", shown)
+            self.assertIn("New root password of container 100", shown)
+            self.assertFalse(dlg.hour_btn.isVisibleTo(dlg))
+            self.assertEqual(dlg.allow_btn.property("kind"), "destructive")
+            dlg.password.setText("abcd")
+            dlg.again.setText("abcd")
+            self.assertFalse(dlg.allow_btn.isEnabled())  # at least 5 characters, as Proxmox wants for a container
+            dlg.password.setText("N3w root pass")
+            dlg.again.setText("N3w root pass")
+            self.assertEqual(self.role(), list(claude_policy.PRIVILEGES["read"]))
+            dlg.allow_btn.click()
+            self.assertTrue(wait_until(lambda: "answer" in box, 10))
+        self.assertFalse(box["answer"]["result"]["isError"], self.text(box))
+        self.assertEqual(run.call_args.kwargs["input"], "root:N3w root pass\n")
+        self.assertNotIn("N3w", run.call_args.args[3])  # not on the command line
+        self.assertNotIn("N3w", json.dumps(box["answer"]))  # Claude is told only that it was changed
+        self.assertNotIn("N3w", connector_log.path().read_text())  # nor is it in the log
+        self.assertEqual(self.role(), list(claude_policy.PRIVILEGES["read"]))  # nothing was lent
+
     def test_refusal_says_what_proxmox_checked(self):
         """Approved, yet Proxmox says no: Claude is told which privilege on which path — the way to find why."""
         self.admin.cluster.forbidden.add(r"POST /nodes/pve/lxc/\d+/status/.*")

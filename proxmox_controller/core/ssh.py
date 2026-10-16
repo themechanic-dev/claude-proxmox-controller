@@ -216,16 +216,18 @@ def run_with_key(host: str, port: int, user: str, script: str, ssh: str = "ssh",
 
 
 def run_command(host: str, port: int, user: str, script: str, ssh: str = "ssh",
-                timeout: int = SSH_TIMEOUT_S) -> tuple[int, str, str]:
+                timeout: int = SSH_TIMEOUT_S, input: str | None = None) -> tuple[int, str, str]:
     """A shell line on the host with the app's key: (exit code, output, errors) whatever the command's exit code —
-    only ssh's own failures raise (it exits 255: no answer, the key refused, the host key changed)."""
+    only ssh's own failures raise (it exits 255: no answer, the key refused, the host key changed). `input` is the
+    command's standard input: the way to hand it a password, which on the command line `ps` would show on both
+    computers."""
     argv = ssh_argv(host, port, user, True, tty=False)
     argv[0] = ssh
     argv[1:1] = ["-o", "BatchMode=yes"]
     argv.append(script)
+    given = {"stdin": subprocess.DEVNULL} if input is None else {"input": input}
     try:
-        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-                              timeout=timeout)
+        done = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout, **given)
     except subprocess.TimeoutExpired as e:
         raise SshError(f"The command did not finish within {timeout} s (it was stopped here; on {host} it may "
                        "still be running).") from e

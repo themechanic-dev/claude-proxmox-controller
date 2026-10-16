@@ -974,6 +974,80 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertEqual(claude_policy.host_switches(saved, "h")["host_commands"], "off")
         self.assertEqual(claude_policy.privileges({"host_commands": "on"}), [])
 
+    def test_container_root_password_typed_by_the_user(self):
+        """A lost root password (the user's container 200, 17/10): a new one the user types in the app's window goes
+        into the container with pct exec … chpasswd over the app's SSH key — on its input, never on a command line,
+        and never back to Claude. Refused before any window for a VM, a stopped container, or no SSH."""
+        import dataclasses
+        T = connector_tools
+        tool = T.TOOLS["set_container_root_password"]
+        self.assertEqual((tool.kind, tool.secret_min, tool.repeat_secret({})), ("host_commands", 5, True))
+        self.assertIn("container 100", tool.secret_prompt({"vmid": 100}))
+        args = T.check(tool, {"host": "demo-pve", "vmid": 100, "reason": "r"})
+        with self.assertRaises(T.ToolError) as caught:
+            tool.words(self.ctx(), args)  # no SSH set up
+        self.assertIn("Console → Connect by SSH", str(caught.exception))
+        host = dataclasses.replace(DEMO_HOSTS[0], extra={"ssh": {"user": "root", "port": 22, "key": True}})
+        ctx = T.Context(host=host, pve=self.pve, admin=self.pve)
+        with mock.patch.object(T.ssh, "trusted_host_key", return_value="ssh-ed25519 AAAA"), \
+                mock.patch.object(T.ssh, "run_command", return_value=(0, "", "")) as run:
+            for vmid, says in ((200, "is a VM"), (102, "must be running")):  # a VM; a stopped container
+                with self.assertRaises(T.ToolError) as caught:
+                    tool.words(ctx, dict(args, vmid=vmid))
+                self.assertIn(says, str(caught.exception))
+            what, details = tool.words(ctx, args)
+            ctx.secret = "n3w pa$$:wörd 'x"
+            out = tool.run(ctx, args)
+            ctx.secret = ""
+            with self.assertRaises(T.ToolError):
+                tool.run(ctx, args)  # no password: nothing run
+        self.assertEqual(what, "Set the root password of Container 100 (pihole)")
+        self.assertTrue(details[0].startswith("pct exec 100 -- chpasswd"))
+        run.assert_called_once()
+        (address, port, user, script), kw = run.call_args
+        self.assertEqual((address, port, user, kw["input"]), (host.hostname, 22, "root", "root:n3w pa$$:wörd 'x\n"))
+        self.assertTrue(script.endswith("pct exec 100 -- chpasswd"))
+        self.assertNotIn("n3w", script)  # the password is not on the command line
+        self.assertNotIn("n3w", json.dumps(out, ensure_ascii=False))  # nor in what Claude is told
+        self.assertIn("PermitRootLogin", out["ssh"])
+        with mock.patch.object(T.ssh, "trusted_host_key", return_value="k"), \
+                mock.patch.object(T.ssh, "run_command",
+                                  return_value=(1, "", "chpasswd: (user root) bad 'secret9' rejected\n")):
+            ctx.secret = "secret9"
+            with self.assertRaises(T.ToolError) as caught:
+                tool.run(ctx, args)
+        self.assertIn("not changed", str(caught.exception))
+        self.assertNotIn("secret9", str(caught.exception))  # even if a program echoed it
+
+    def test_container_password_script_on_the_right_node_only(self):
+        """The line run on the host, with a pretend pct and uname: on the container's node the password reaches
+        chpasswd on its input; on another node of a cluster nothing runs, and the reason is said plainly."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name, body in (("uname", 'echo "$FAKE_NODE.example.lan"'),
+                           ("pct", f'echo "$*" > {tmp}/args; cat > {tmp}/stdin')):
+            with open(os.path.join(tmp, name), "w") as f:
+                f.write(f"#!/bin/sh\n{body}\n")
+            os.chmod(os.path.join(tmp, name), 0o700)
+        script = connector_tools.chpasswd_script(100, "pve")
+
+        def run(node):
+            env = {**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}", "FAKE_NODE": node}
+            return subprocess.run(["sh", "-c", script], input="root:n3w pa$$\n", env=env, capture_output=True,
+                                  text=True)
+
+        done = run("pve")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        with open(os.path.join(tmp, "args")) as f:
+            self.assertEqual(f.read(), "exec 100 -- chpasswd\n")
+        with open(os.path.join(tmp, "stdin")) as f:
+            self.assertEqual(f.read(), "root:n3w pa$$\n")
+        os.remove(os.path.join(tmp, "args"))
+        done = run("pve2")
+        self.assertEqual(done.returncode, 3)
+        self.assertIn("Container 100 is on node pve, but the app's SSH reaches node pve2.", done.stderr)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "args")))  # pct never ran
+
     def test_switch_table_is_the_code_and_the_docs_follow_it(self):
         """Which switch opens what, for anyone who downloads the app (the user's wish, 17/10): made from the tools
         themselves — every tool under its switch — and docs/claude-access.md is that table, word for word."""
@@ -983,9 +1057,11 @@ class ConnectorToolsTest(unittest.TestCase):
         where = lambda name: [r["key"] for r in table if any(t["name"] == name for t in r["tools"])]  # noqa: E731
         self.assertEqual(where("restore_backup"), ["change", "destroy"])
         self.assertEqual(where("host_command"), ["host_commands"])
+        self.assertEqual(where("set_container_root_password"), ["host_commands"])  # it goes over SSH, as root
         notes = {t["name"]: t["notes"] for r in table for t in r["tools"]}
         self.assertIn("starting it also needs Power not Off", notes["create_vm"])
         self.assertIn("asks you for a password", notes["console_type_password"])
+        self.assertIn("asks you for a password", notes["set_container_root_password"])
         self.assertIn("This app only", table[-1]["enforced"])
         doc = Path(__file__).resolve().parent.parent / "docs" / "claude-access.md"
         self.assertEqual(doc.read_text(encoding="utf-8"), connector_tools.access_markdown(),
@@ -1553,6 +1629,21 @@ class SshTest(unittest.TestCase):
         with self.assertRaises(sshmod.SshError) as caught:
             sshmod.run_command("192.0.2.80", 22, "root", "slow", ssh=path, timeout=1)
         self.assertIn("did not finish within 1 s", str(caught.exception))
+
+    def test_command_input_goes_to_its_standard_input(self):
+        """A password for a command (a container's new root password) goes on ssh's standard input — not among its
+        arguments, where ps would show it; without input, standard input is empty (no ssh waiting on the terminal)."""
+        path = os.path.join(self.tmp, "fake-ssh-stdin")
+        with open(path, "w") as f:
+            f.write('#!/bin/sh\nprintf "args: %s\\n" "$*"; printf "in: "; cat\n')
+        os.chmod(path, 0o700)
+        code, out, _ = sshmod.run_command("192.0.2.80", 22, "root", "pct exec 100 -- chpasswd", ssh=path,
+                                          input="root:n3w pa$$\n")
+        self.assertEqual(code, 0)
+        args, given = out.split("\nin: ")
+        self.assertEqual(given, "root:n3w pa$$\n")
+        self.assertNotIn("n3w", args)
+        self.assertTrue(sshmod.run_command("192.0.2.80", 22, "root", "true", ssh=path)[1].endswith("in: "))
 
     def fake_ssh(self, expected_password):
         """An 'ssh' that asks SSH_ASKPASS for the password, as the real one does, and says what it was given. (The

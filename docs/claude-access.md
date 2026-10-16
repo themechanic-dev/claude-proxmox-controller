@@ -113,3 +113,4 @@ Run commands on the host itself, as root, over the app's SSH key.
 | Tool | What it does |
 |---|---|
 | `host_command` | Run a shell command on the Proxmox host itself, as root, over the SSH key the user set up in Proxmox Controller, and get its output and exit code — for what the API cannot do (installed programs, services, logs, files). |
+| `set_container_root_password` | Set a running container's root password to one the USER types in Proxmox Controller's window (you never give or see it) — for a container whose root password is lost, or to give it a new one. *(asks you for a password)* |

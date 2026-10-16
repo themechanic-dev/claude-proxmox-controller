@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import math
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -1139,6 +1140,56 @@ def _host_command(ctx: Context, a: dict):
             **({"output_shortened": True} if len(out) > HOST_OUTPUT_MAX or len(err) > HOST_OUTPUT_MAX else {})}
 
 
+def _ct_password_target(ctx: Context, a: dict) -> tuple[dict, str, int, str]:
+    """The container and the way in — refused before any window when it cannot work: not a container, not running
+    (the password is set inside it), or no SSH with the app's key."""
+    g = ctx.guest(a["vmid"])
+    if g["type"] != "lxc":
+        raise ToolError(f"{what(g)} is a VM: this sets a container's root password. A VM's is set inside it (on its "
+                        "console, with console_send and console_type_password).")
+    if g.get("status") != "running":
+        raise ToolError(f"{what(g)} is {g.get('status') or 'not running'}: the password is set inside it, so it must "
+                        "be running. Start it first (guest_power).")
+    address, port, user = _host_ssh(ctx)
+    return g, address, port, user
+
+
+def chpasswd_script(vmid: int, node: str) -> str:
+    """Sets root's password inside a container from what comes on standard input ('root:password'), so the password
+    is never on a command line. pct reaches only the containers of the node it runs on: on another node of a cluster
+    it would fail with a puzzling 'config file does not exist' — said plainly instead."""
+    want = shlex.quote(node)
+    return (f'here=$(uname -n); here=${{here%%.*}}; if [ "$here" != {want} ]; then '
+            f'echo "Container {int(vmid)} is on node "{want}", but the app\'s SSH reaches node $here." >&2; exit 3; fi; '
+            f"pct exec {int(vmid)} -- chpasswd")
+
+
+def _ct_password_words(ctx: Context, a: dict):
+    g, address, _, user = _ct_password_target(ctx, a)
+    return f"Set the root password of {what(g)}", [
+        f"pct exec {g['vmid']} -- chpasswd (once it has checked that the SSH reaches node {g.get('node', '')})",
+        f"On {address} over SSH with this app's key, as {user}. The password you "
+        "type below goes to it on its input, never on a command line; Claude does not see it."]
+
+
+def _ct_password(ctx: Context, a: dict):
+    g, address, port, user = _ct_password_target(ctx, a)
+    password = ctx.secret
+    if not password or "\n" in password or "\r" in password:
+        raise ToolError("No password was given (or it has a line break). Nothing was changed.")
+    try:
+        code, out, err = ssh.run_command(address, port, user, chpasswd_script(g["vmid"], g.get("node", "")),
+                                         timeout=60, input=f"root:{password}\n")
+    except ssh.SshError as e:
+        raise ToolError(f"{e} The password may not have been changed.") from e
+    if code != 0:
+        said = (err.strip() or out.strip() or f"exit code {code}").replace(password, "•••")  # (never echoed back)
+        raise ToolError(f"The password was not changed: {_clip(said)}")
+    return {"guest": what(g), "user": "root", "password": "changed to the one the user typed (not shown to you)",
+            "ssh": "Logging in as root with a password over SSH also needs the container's SSH to allow it "
+                   "(PermitRootLogin yes). Debian's and Ubuntu's own setting lets root in with a key only."}
+
+
 # -- the registry ----------------------------------------------------------------------------------
 
 def _tools() -> list[Tool]:
@@ -1315,6 +1366,12 @@ def _tools() -> list[Tool]:
                                   "on the host (pipes and ; work)."},
               "timeout_s": {"type": "integer", "minimum": 1, "maximum": EXEC_WAIT_S}},
              ("host", "command"), _host_command, _host_command_words),
+        Tool("set_container_root_password", "host_commands", "Set a running container's root password to one the "
+             "USER types in Proxmox Controller's window (you never give or see it) — for a container whose root "
+             "password is lost, or to give it a new one. It runs pct exec <vmid> -- chpasswd on the host over the "
+             "app's SSH key, so it is a host command; the container must be on the node the app connects to.",
+             vm, ("host", "vmid"), _ct_password, _ct_password_words,
+             secret=lambda a: f"New root password of container {a.get('vmid', '')}", secret_min=5),
     ]
 
 

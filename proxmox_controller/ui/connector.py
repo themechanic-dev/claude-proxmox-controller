@@ -430,6 +430,6 @@ class Connector(QObject):
 
 
 def tool_uses_api(tool) -> bool:
-    """Wake-on-LAN is sent from this computer (and the host may be off); a host command goes over SSH: no Proxmox
-    privilege to lend for either."""
-    return tool.name not in ("wake_host", "host_command")
+    """Wake-on-LAN is sent from this computer (and the host may be off); a host command — and a container's new root
+    password, set through one — goes over SSH: no Proxmox privilege to lend for any of them."""
+    return tool.name not in ("wake_host", "host_command", "set_container_root_password")
