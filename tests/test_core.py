@@ -1017,6 +1017,27 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertEqual(claude_policy.host_switches(saved, "h")["host_commands"], "off")
         self.assertEqual(claude_policy.privileges({"host_commands": "on"}), [])
 
+    def test_task_done_with_warnings_is_done(self):
+        """Proxmox ends a task that did its job, with warnings, "WARNINGS: <n>" (the user's Windows VM, 17/10: it
+        started, with a word about its firmware and its drivers): done — with what the warnings say — not a failure.
+        A real failure is still one."""
+        warn = ["EFI disk without 'ms-cert=2023k' option", "ide0: version 0.1.285 of the VirtIO drivers is known to"]
+        self.cluster.warn_next = list(warn)
+        out = self.run_tool("guest_power", host="demo-pve", vmid=200, action="start", reason="r")
+        self.assertEqual(out["status"], "done")
+        self.assertEqual(out["warnings"], [f"WARN: {w}" for w in warn])
+        self.assertIn("warnings: 2", out["note"])
+        self.assertEqual(self.status(200), "running")
+        self.cluster.warn_next = ["something"]
+        upid = self.pve.guest_action("pve", "qemu", 200, "shutdown")
+        self.assertEqual(self.pve.wait_task("pve", upid)["exitstatus"], "WARNINGS: 1")  # no PveError
+        bad = self.cluster.long_task("qmstart", 200, ["starting"])
+        self.cluster.finish_task(bad, "start failed: QEMU exited with code 1")
+        with self.assertRaises(PveError):
+            self.pve.wait_task("pve", bad)
+        with self.assertRaises(connector_tools.ToolError):
+            connector_tools.finish(self.ctx(), "pve", bad)
+
     def test_container_root_password_typed_by_the_user(self):
         """A lost root password (the user's container 200, 17/10): a new one the user types in the app's window goes
         into the container with pct exec … chpasswd over the app's SSH key — on its input, never on a command line,
@@ -1466,6 +1487,12 @@ class TaskWordsTest(unittest.TestCase):
                   "status": "command 'apt-get update' failed: exit code 100"}
         self.assertFalse(tasks.ok(failed))
         self.assertEqual(tasks.outcome(failed), failed["status"])
+        self.assertEqual((tasks.failed(failed), tasks.warned(failed)), (True, False))
+        warned = dict(ended, status="WARNINGS: 2")  # done, with warnings: Proxmox's own words for it
+        self.assertEqual((tasks.ok(warned), tasks.warned(warned), tasks.failed(warned)), (False, True, False))
+        self.assertEqual((tasks.failed(ended), tasks.failed(running), tasks.warned(running)), (False, False, False))
+        self.assertEqual([tasks.done(s) for s in ("OK", "WARNINGS: 2", "WARNINGS: 12", "WARNINGS:", "", "TASK ERROR",
+                                                  "unexpected status")], [True, True, True, False, False, False, False])
         self.assertEqual(tasks.started(failed, now), "Oct 12 12:00")  # another day: English month, whatever the locale
 
 

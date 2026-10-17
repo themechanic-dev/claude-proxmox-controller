@@ -355,6 +355,27 @@ class HostViewTest(UiCase):
         view.guest_action("stop")
         self.assertTrue(wait_until(lambda: self.cluster().guests[102]["status"] == "stopped"))
 
+    def test_start_done_with_warnings_is_not_a_failure(self):
+        """The user's Windows VM started, yet the app said "The task failed: WARNINGS: 2" (17/10): Proxmox ends a
+        task that did its job with warnings that way. No error window; in Tasks it is orange, not counted as failed."""
+        view = self.loaded_view()
+        self.cluster().warn_next = ["EFI disk without 'ms-cert=2023k' option, suggesting that not all UEFI 2023",
+                                    "ide0: version 0.1.285 of the VirtIO drivers for Windows is known to cause issues"]
+        self.select(view, 200)
+        view.guest_action("start")
+        self.assertTrue(wait_until(lambda: self.cluster().guests[200]["status"] == "running"))
+        self.assertTrue(wait_until(lambda: view.tasks_panel.tasks and
+                                   view.tasks_panel.tasks[0].get("status") == "WARNINGS: 2"))
+        QTest.qWait(100)
+        self.assertEqual(self.errors, [])  # no "The task failed" window
+        panel = view.tasks_panel
+        self.assertEqual(panel.table.item(0, tasks_panel.COL_STATUS).text(), "WARNINGS: 2")
+        self.assertEqual(panel.table.item(0, tasks_panel.COL_STATUS).foreground().color().name(),
+                         theme.colors().warning)
+        self.assertEqual(tasks_panel.status_color(panel.tasks[0]), theme.colors().warning)
+        self.assertEqual(panel.summary.text(), "last: VM 200 (windows-11) — Start — OK, with warnings")
+        self.assertNotIn("failed", panel.summary.text())
+
     def test_refused_action_is_shown(self):
         view = self.loaded_view()
         self.cluster().forbidden.add(r"POST /nodes/pve/lxc/\d+/status/.*")

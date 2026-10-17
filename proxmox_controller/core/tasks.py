@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 WORDS = {
@@ -24,8 +25,25 @@ def running(task: dict) -> bool:
     return not task.get("endtime") or str(task.get("status", "")).lower() == "running"
 
 
+WARNINGS = re.compile(r"^WARNINGS: \d+$")
+
+
+def done(exitstatus: str) -> bool:
+    """A finished task did what it was asked: "OK", or "WARNINGS: <n>" — Proxmox's words for done with warnings (a VM
+    that started, with a word about its firmware or its drivers). Anything else is the task's error."""
+    return exitstatus == "OK" or bool(WARNINGS.match(exitstatus))
+
+
 def ok(task: dict) -> bool:
     return str(task.get("status", "")) == "OK"
+
+
+def warned(task: dict) -> bool:
+    return not running(task) and bool(WARNINGS.match(str(task.get("status", ""))))
+
+
+def failed(task: dict) -> bool:
+    return not running(task) and not done(str(task.get("status", "")))
 
 
 def describe(task: dict, guests: dict[int, dict]) -> str:

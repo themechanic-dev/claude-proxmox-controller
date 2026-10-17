@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import quote
 
-from . import claude_policy, screen, ssh, startup, wol
+from . import claude_policy, screen, ssh, startup, tasks, wol
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
 from .vmspec import PROFILES, VMNAME, iso_name_from_url, vm_params
@@ -172,9 +172,14 @@ def finish(ctx: Context, node: str, upid, wait: float = WAIT_S) -> dict:
     while True:
         st = ctx.pve.task_status(node, upid)
         if st.get("status") == "stopped":
-            if st.get("exitstatus") != "OK":
+            status = st.get("exitstatus") or ""
+            if not tasks.done(status):
                 tail = [e.get("t", "") for e in ctx.pve.task_log(node, upid)[-8:]]
-                raise ToolError(f"The task failed: {st.get('exitstatus') or 'unknown error'}.\n" + "\n".join(tail))
+                raise ToolError(f"The task failed: {status or 'unknown error'}.\n" + "\n".join(tail))
+            if status != "OK":  # done, with warnings: what they say, the rest is in task_log
+                said = [e.get("t", "") for e in ctx.pve.task_log(node, upid) if str(e.get("t", "")).startswith("WARN")]
+                return {"status": "done", "task": upid, "warnings": said or [status],
+                        "note": f"Done, with {status.lower()}; task_log has the whole text."}
             return {"status": "done", "task": upid}
         if time.monotonic() > end:
             return {"status": "running", "task": upid,
@@ -278,7 +283,6 @@ def _backup_jobs(ctx: Context, a: dict):
 
 
 def _list_tasks(ctx: Context, a: dict):
-    from . import tasks
     names = {g["vmid"]: g for g in ctx.guests()}
     rows = []
     for node in [n["node"] for n in ctx.pve.nodes() if n.get("status", "online") == "online"]:

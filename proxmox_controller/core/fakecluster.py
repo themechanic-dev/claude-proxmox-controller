@@ -45,6 +45,7 @@ class FakeCluster:
         self.principal = "root@pam!controller"  # who is asking, while a request is handled
         self.exec_runs: dict[int, dict] = {}  # guest-agent programs: pid → their answer
         self.forbidden: set[str] = set()  # "METHOD path" patterns that answer 403, for tests
+        self.warn_next: list[str] = []  # the next task ends "WARNINGS: <n>" with these, for tests
         self.cpu_model, self.cpus, self.mem_total = "Intel(R) Xeon(R) CPU D-1528 @ 1.90GHz", 12, 48 << 30
         self.guests = {
             100: {"vmid": 100, "type": "lxc", "name": "pihole", "status": "running", "cores": 1, "memory": 512,
@@ -955,10 +956,15 @@ class FakeCluster:
 
     def _task(self, kind: str, vmid, start: int | None = None, took: int = 1) -> str:
         upid = _upid(kind, vmid)
-        self.tasks[upid] = "OK"
+        status = "OK"
+        if self.warn_next:  # done, with warnings — as a Windows VM's start says a word about its firmware
+            status = f"WARNINGS: {len(self.warn_next)}"
+            self.task_logs[upid] = [f"WARN: {w}" for w in self.warn_next] + [f"TASK {status}"]
+            self.warn_next = []
+        self.tasks[upid] = status
         start = int(time.time()) if start is None else start
         self.task_list.append({"upid": upid, "node": NODE, "type": kind, "id": str(vmid), "user": self.principal,
-                               "starttime": start, "endtime": start + took, "status": "OK",
+                               "starttime": start, "endtime": start + took, "status": status,
                                "pid": random.randint(1000, 99999)})
         return upid
 
@@ -976,7 +982,8 @@ class FakeCluster:
         t = next(t for t in self.task_list if t["upid"] == upid)
         t.update(endtime=int(time.time()), status=status)
         self.tasks[upid] = status
-        self.task_logs.setdefault(upid, []).append("TASK OK" if status == "OK" else f"TASK ERROR: {status}")
+        self.task_logs.setdefault(upid, []).append("TASK OK" if status == "OK" else f"TASK {status}"
+                                                   if status.startswith("WARNINGS: ") else f"TASK ERROR: {status}")
 
 
 _N = r"([^/]+)"

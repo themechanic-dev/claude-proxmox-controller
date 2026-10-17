@@ -30,6 +30,8 @@ def status_color(task: dict) -> str:
     c = theme.colors()
     if tasks.running(task):
         return c.accent
+    if tasks.warned(task):  # done, with warnings (Proxmox's "WARNINGS: 2"): orange, as its web UI shows it
+        return c.warning
     return c.success if tasks.ok(task) else c.danger
 
 
@@ -114,6 +116,7 @@ class TasksPanel(QWidget):
         t.setRowCount(len(self.tasks))
         dim = QColor(theme.colors().dim)
         danger = QColor(theme.colors().danger)
+        warning = QColor(theme.colors().warning)
         now = time.time()
         for r, task in enumerate(self.tasks):
             outcome = tasks.outcome(task)
@@ -126,19 +129,22 @@ class TasksPanel(QWidget):
             t.item(r, COL_DOT).setIcon(dot_icon(status_color(task)))
             t.item(r, COL_USER).setForeground(dim)
             status = t.item(r, COL_STATUS)
-            if not tasks.running(task) and not tasks.ok(task):
+            if tasks.warned(task):
+                status.setForeground(warning)
+            elif tasks.failed(task):
                 status.setForeground(danger)
             status.setToolTip(outcome if len(outcome) > 30 else "")
             if task.get("upid") == keep:
                 t.selectRow(r)
         busy = sum(1 for task in self.tasks if tasks.running(task))
-        failed = sum(1 for task in self.tasks if not tasks.running(task) and not tasks.ok(task))
+        failed = sum(1 for task in self.tasks if tasks.failed(task))
         parts = [f"{busy} running"] if busy else []
         if self.tasks and not busy:
             last = self.tasks[0]
             what = tasks.describe(last, guests)
             what = what if len(what) <= 60 else what[:59] + "…"
-            parts.append(f"last: {what} — {'OK' if tasks.ok(last) else 'failed'}")  # the error is in the list
+            how = "OK" if tasks.ok(last) else "OK, with warnings" if tasks.warned(last) else "failed"
+            parts.append(f"last: {what} — {how}")  # the error (or the warnings) in the list and the task's log
         if failed:
             parts.append(f"{failed} failed")
         self.summary.setText("  ·  ".join(parts) if parts else "No tasks yet")

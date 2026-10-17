@@ -21,6 +21,8 @@ import uuid
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode
 
+from . import tasks
+
 DEFAULT_PORT = 8006
 KINDS = ("lxc", "qemu")  # containers, virtual machines
 GUEST_ACTIONS = ("start", "shutdown", "stop", "reboot")
@@ -626,7 +628,7 @@ class Pve:
                     if entry.get("t") not in (None, "", "no content"):
                         on_log(str(entry["t"]))
             if st.get("status") == "stopped":
-                if st.get("exitstatus") != "OK":
+                if not tasks.done(st.get("exitstatus") or ""):  # (done with warnings is done: the VM did start)
                     raise PveError(f"The task failed: {st.get('exitstatus') or 'unknown error'}")
                 return st
             if time.monotonic() > end:
