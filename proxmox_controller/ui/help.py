@@ -100,7 +100,7 @@ SECTIONS = [
      "even if you close it.<br>"
      "<b>Tasks</b> — the host's recent tasks, as in the web UI's panel at the bottom: what was done, when, by whom "
      "(the app's token, or you in the web UI), how long it took and how it ended. Running ones have a blue dot and "
-     "count up; failed ones are red; orange ones did their job with warnings (Proxmox's <i>WARNINGS: 2</i> — a VM "
+     "count up; failed ones are red; yellow ones did their job with warnings (Proxmox's <i>WARNINGS: 2</i> — a VM "
      "that started, with a word about its firmware, say: the log says what). Double-click one (or right-click → "
      "Open Log) for its log, followed live while it runs; <b>Stop Task…</b> there stops one still running. Click "
      "<b>Tasks</b> to fold the list away; the app remembers it."),

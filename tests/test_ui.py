@@ -357,7 +357,7 @@ class HostViewTest(UiCase):
 
     def test_start_done_with_warnings_is_not_a_failure(self):
         """The user's Windows VM started, yet the app said "The task failed: WARNINGS: 2" (17/10): Proxmox ends a
-        task that did its job with warnings that way. No error window; in Tasks it is orange, not counted as failed."""
+        task that did its job with warnings that way. No error window; in Tasks it is yellow, not counted as failed."""
         view = self.loaded_view()
         self.cluster().warn_next = ["EFI disk without 'ms-cert=2023k' option, suggesting that not all UEFI 2023",
                                     "ide0: version 0.1.285 of the VirtIO drivers for Windows is known to cause issues"]

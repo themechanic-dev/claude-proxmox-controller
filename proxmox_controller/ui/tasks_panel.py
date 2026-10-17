@@ -30,7 +30,7 @@ def status_color(task: dict) -> str:
     c = theme.colors()
     if tasks.running(task):
         return c.accent
-    if tasks.warned(task):  # done, with warnings (Proxmox's "WARNINGS: 2"): orange, as its web UI shows it
+    if tasks.warned(task):  # done, with warnings (Proxmox's "WARNINGS: 2"): the theme's yellow
         return c.warning
     return c.success if tasks.ok(task) else c.danger
 
