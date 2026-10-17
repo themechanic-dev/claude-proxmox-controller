@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
 import threading
 from pathlib import Path
 from typing import Callable
@@ -25,10 +26,25 @@ def _private_folder(folder: Path) -> Path:
     return folder
 
 
+def user_runtime_dir(root: str = "/run/user") -> str:
+    """/run/user/<uid> — the folder XDG_RUNTIME_DIR names on a systemd system — when it is there and this user's;
+    else ''."""
+    if not hasattr(os, "getuid"):
+        return ""
+    folder = Path(root) / str(os.getuid())
+    try:
+        st = folder.stat()
+    except OSError:
+        return ""
+    return str(folder) if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() else ""
+
+
 def socket_path() -> Path:
-    """$XDG_RUNTIME_DIR/proxmox-controller/connector.sock (/run/user/<uid>: this user's alone); a private folder in
-    /tmp when that is missing or too long a path for a socket."""
-    base = os.environ.get("XDG_RUNTIME_DIR", "")
+    """$XDG_RUNTIME_DIR/proxmox-controller/connector.sock (/run/user/<uid>: this user's alone). Without
+    XDG_RUNTIME_DIR — Claude Desktop starts the bridge with a bare environment, while the app has it — the same
+    /run/user/<uid>, so the two still meet; a private folder in /tmp when neither is there or the path is too long
+    for a socket."""
+    base = os.environ.get("XDG_RUNTIME_DIR", "") or user_runtime_dir()
     path = Path(base) / "proxmox-controller" / "connector.sock" if base else None
     if path is None or len(str(path)) > MAX_SOCKET_PATH:
         path = Path(f"/tmp/proxmox-controller-{os.getuid()}") / "connector.sock"

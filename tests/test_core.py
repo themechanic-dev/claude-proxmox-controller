@@ -626,6 +626,49 @@ class ConnectorLinkTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/very" + "/long" * 30}), \
                 mock.patch.object(connector_link, "_private_folder", lambda f: f):
             self.assertTrue(str(connector_link.socket_path()).startswith(f"/tmp/proxmox-controller-{os.getuid()}/"))
+        bare = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+        with mock.patch.dict(os.environ, bare, clear=True), \
+                mock.patch.object(connector_link, "_private_folder", lambda f: f):
+            with mock.patch.object(connector_link, "user_runtime_dir", lambda: "/run/user/1000"):
+                self.assertEqual(str(connector_link.socket_path()), "/run/user/1000/proxmox-controller/connector.sock")
+            with mock.patch.object(connector_link, "user_runtime_dir", lambda: ""):
+                self.assertTrue(str(connector_link.socket_path()).startswith("/tmp/proxmox-controller-"))
+
+    def test_user_runtime_dir_only_when_it_is_the_users(self):
+        root = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, root, True)
+        self.assertEqual(connector_link.user_runtime_dir(root), "")  # not there
+        os.mkdir(os.path.join(root, str(os.getuid())))
+        self.assertEqual(connector_link.user_runtime_dir(root), os.path.join(root, str(os.getuid())))
+        os.mkdir(os.path.join(root, "4242"))
+        with mock.patch.object(connector_link.os, "getuid", return_value=4242):
+            self.assertEqual(connector_link.user_runtime_dir(root), "")  # there, but not this user's
+        odd = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, odd, True)
+        Path(odd, str(os.getuid())).touch()
+        self.assertEqual(connector_link.user_runtime_dir(odd), "")  # a file, not a folder
+
+    def test_bridge_without_xdg_runtime_dir_meets_the_app(self):
+        """Claude Desktop starts the bridge with a bare environment — no XDG_RUNTIME_DIR — while the app has it (the
+        user's sessions all said 'not running (or is still locked)' with the app open, 17/10): both must still land
+        on the same socket."""
+        root = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = os.path.join(root, str(os.getuid()))
+        os.mkdir(runtime, 0o700)
+        real = connector_link.user_runtime_dir
+        with mock.patch.object(connector_link, "user_runtime_dir", lambda: real(root)):
+            with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+                app_side = connector_link.socket_path()
+            bare = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+            with mock.patch.dict(os.environ, bare, clear=True):
+                bridge_side = connector_link.socket_path()
+            self.assertEqual(bridge_side, app_side)
+            server = connector_link.LinkServer(lambda m: {"echo": m["n"]}, app_side)
+            self.assertTrue(server.start())
+            self.addCleanup(server.stop)
+            with mock.patch.dict(os.environ, bare, clear=True):
+                self.assertEqual(connector_link.request({"n": 7}), {"echo": 7})  # the bridge's own way to the app
 
 
 class ScreenTest(unittest.TestCase):
