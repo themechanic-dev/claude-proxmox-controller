@@ -45,6 +45,7 @@ PRIVILEGES = {
 NOT_HOUR = ("host_commands",)  # each one seen: no "Allow this kind for 1 hour" (the user's rule for the host)
 OPTIONAL_PRIVILEGES = ("Sys.AccessNetwork",)  # not in every Proxmox VE 9 release
 TEMP_ALLOW_S = 3600  # "Allow this kind for 1 hour"
+TEMP_ALLOW_HOURS = (1, 3, 8, 12)  # the button: 1 hour; its arrow: the rest (the user's, 19/10: Claude works through the night)
 
 
 def host_switches(settings: dict, host_id: str) -> dict:
@@ -78,7 +79,7 @@ def privileges(switches: dict, available: tuple | None = None) -> list[str]:
 
 
 class Allowances:
-    """'Allow this kind for 1 hour', remembered only while the app runs."""
+    """'Allow this kind for 1, 3, 8 or 12 hours', remembered only while the app runs."""
 
     def __init__(self):
         self.until: dict[tuple[str, str], float] = {}
@@ -88,6 +89,10 @@ class Allowances:
 
     def active(self, host_id: str, key: str) -> bool:
         return self.until.get((host_id, key), 0) > time.monotonic()
+
+    def remaining(self, host_id: str, key: str) -> float:
+        """Seconds left of what was granted for hours (0: none)."""
+        return max(0.0, self.until.get((host_id, key), 0) - time.monotonic())
 
     def clear(self) -> None:
         self.until.clear()

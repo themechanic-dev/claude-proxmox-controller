@@ -885,8 +885,11 @@ class ClaudeAccessTest(unittest.TestCase):
                          ["on", "ask", "ask", "off", "off", "off", "off", "off"])  # the user's chosen defaults
         # (the eighth, Host commands, 17/10: Off for every new host — root on the host is the most there is)
         allow = claude_policy.Allowances()
+        self.assertEqual(allow.remaining("h", "power"), 0)
         allow.grant("h", "power", 60)
         self.assertEqual(claude_policy.decide(settings, "h", "power", allow), "on")  # "for 1 hour"
+        self.assertTrue(59 < allow.remaining("h", "power") <= 60)
+        self.assertEqual(claude_policy.TEMP_ALLOW_HOURS, (1, 3, 8, 12))  # the arrow's choices (the user's, 19/10)
         self.assertEqual(claude_policy.decide(settings, "other", "power", allow), "ask")
         claude_policy.set_switch(settings, "h", "power", "off")
         self.assertEqual(claude_policy.decide(settings, "h", "power", allow), "off")  # Off beats an hour granted

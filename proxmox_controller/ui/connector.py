@@ -15,7 +15,8 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QApplication, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout
+from PySide6.QtWidgets import (QApplication, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QToolButton,
+                               QVBoxLayout)
 
 from ..core import claude_access, claude_policy, connector_log, store
 from ..core.claude_policy import ASK, OFF, ON, Allowances
@@ -80,12 +81,13 @@ class Tokens:
 
 
 class ApprovalDialog(QDialog):
-    """"Claude asks to …" — Allow, Allow this kind for 1 hour, or Deny. No answer in two minutes is Deny.
+    """"Claude asks to …" — Allow, Allow this kind for 1 hour (its arrow: 3, 8 or 12), or Deny. No answer in two minutes
+    is Deny.
 
     A request that needs a password (a new VM's user, a container's root, typing at a console prompt) asks the user
     for it here — always, even when its kind is On — and only the app ever holds it: Claude is told it was set."""
 
-    decided = Signal(str)  # allow | allow-hour | deny | timeout | cancelled
+    decided = Signal(str)  # allow | allow-hours:<n> | deny | timeout | cancelled
 
     def __init__(self, client: str, host: Host, kind: str, what: str, details: list[str], reason: str,
                  timeout_s: int = ASK_TIMEOUT_S, secret_prompt: str = "", secret_repeat: bool = True,
@@ -136,19 +138,29 @@ class ApprovalDialog(QDialog):
         lay.addWidget(self.countdown)
         row = QHBoxLayout()
         self.deny_btn = button("Deny")
-        self.hour_btn = button("Allow This Kind for 1 Hour", "", f"Further {claude_policy.TITLES.get(kind, kind)} "
-                               f"requests on {host.name} are allowed without asking for the next hour (while the app "
-                               "runs).")
+        self.hour_btn = QToolButton()  # a click: 1 hour; the arrow: 3, 8 or 12 — as the host page's Console button
+        self.hour_btn.setText("Allow This Kind for 1 Hour")
+        self.hour_btn.setToolTip(f"Further {claude_policy.TITLES.get(kind, kind)} requests on {host.name} are allowed "
+                                 "without asking for the next hour — the arrow: 3, 8 or 12 hours (while the app runs).")
+        self.hour_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.hour_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.hour_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        hours_menu = QMenu(self.hour_btn)
+        for hours in claude_policy.TEMP_ALLOW_HOURS:
+            hours_menu.addAction(f"For {hours} Hour{'s' if hours > 1 else ''}").triggered.connect(
+                lambda _=False, h=hours: self.finish(f"allow-hours:{h}"))
+        self.hour_btn.setMenu(hours_menu)
         self.allow_btn = button("Allow", "destructive" if kind in ("destroy", "host", "host_commands") else "suggested")
         self.deny_btn.clicked.connect(lambda: self.finish("deny"))
-        self.hour_btn.clicked.connect(lambda: self.finish("allow-hour"))
+        self.hour_btn.clicked.connect(lambda: self.finish("allow-hours:1"))
         self.allow_btn.clicked.connect(lambda: self.finish("allow"))
         row.addWidget(self.deny_btn)
         row.addStretch(1)
         row.addWidget(self.hour_btn)
         row.addWidget(self.allow_btn)
         lay.addLayout(row)
-        for b in (self.deny_btn, self.hour_btn, self.allow_btn):
+        self.hour_btn.setFixedHeight(self.allow_btn.sizeHint().height())  # (a tool button is a bit taller)
+        for b in (self.deny_btn, self.allow_btn):
             b.setAutoDefault(False)  # Enter must not answer by accident
         self.repeat = secret_repeat
         if self.needs_secret:
@@ -207,6 +219,15 @@ class ApprovalDialog(QDialog):
 
     def reject(self) -> None:  # Escape: no
         self.finish("deny")
+
+
+def allowed_hours(answer: str) -> int:
+    """'allow-hours:8' → 8 — only the durations the window offers; anything else (allow, deny…) → 0."""
+    try:
+        hours = int(answer.split(":", 1)[1]) if answer.startswith("allow-hours:") else 0
+    except ValueError:
+        return 0
+    return hours if hours in claude_policy.TEMP_ALLOW_HOURS else 0
 
 
 _TRAY: dict = {}  # Windows: the icon a toast comes from, and the timer that takes it away again
@@ -328,15 +349,16 @@ class Connector(QObject):
             what, details = words[0], words[1]
             picture = words[2] if len(words) > 2 else None
             entry["what"] = what
-            decision = "allowed"
+            decision = "granted" if info["switches"][kind] == ASK else "allowed"  # (Ask, but hours were given)
             if info["state"] == ASK or prompt:  # a password is always asked of the user, whatever the switch
                 repeat = tool.repeat_secret(args)
                 fut = self.on_gui(lambda: self._ask(key, client, host, kind, what, details, args.get("reason", ""),
                                                     prompt, tool, picture, info["state"], repeat))
                 answer, ctx.secret = fut.result(ASK_TIMEOUT_S + 30)
-                if answer == "allow-hour":
-                    self.on_gui(lambda: self.allowances.grant(host.id, kind))
-                if answer not in ("allow", "allow-hour"):
+                hours = allowed_hours(answer)
+                if hours:
+                    self.on_gui(lambda: self.allowances.grant(host.id, kind, hours * 3600))
+                if answer != "allow" and not hours:
                     raise Refused({"deny": "The user denied it.",
                                    "timeout": f"No answer from the user within {ASK_TIMEOUT_S // 60} minutes: not done.",
                                    "cancelled": "Cancelled before the user answered."}.get(answer, "Not allowed."),

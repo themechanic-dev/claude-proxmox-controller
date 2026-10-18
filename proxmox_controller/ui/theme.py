@@ -77,6 +77,7 @@ def stylesheet(c: Colors) -> str:
     QLabel#heading {{ font-size: 11.5pt; font-weight: 700; }}
     QLabel#dim, QLabel#caption {{ color: {c.dim}; }}
     QLabel#caption {{ font-size: 9pt; }}
+    QLabel#grant {{ color: {c.warning}; font-size: 9pt; }}
     QLabel#big {{ font-size: 19pt; font-weight: 700; }}
     QLabel[pill="true"] {{ border-radius: 10px; padding: 2px 10px; font-weight: 700; font-size: 9.5pt; }}
     QLabel[pill="true"][state="online"] {{ background: {_alpha(c.success, 0.18)}; color: {c.success}; }}

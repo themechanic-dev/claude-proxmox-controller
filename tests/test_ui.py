@@ -15,7 +15,7 @@ try:
     from PySide6.QtCore import QPoint, Qt
     from PySide6.QtGui import QIcon
     from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QApplication, QDialog, QStyleOptionViewItem
+    from PySide6.QtWidgets import QApplication, QDialog, QStyleOptionViewItem, QToolButton
 except ImportError:  # pragma: no cover - the core tests still run with plain python3
     QApplication = None
 
@@ -2089,16 +2089,61 @@ class ConnectorTest(UiCase):
         self.assertEqual(self.admin.cluster.guests[102]["status"], "running")
         box = self.request("guest_power", wait=False, host="demo-pve", vmid=102, action="shutdown", reason="r")
         self.assertTrue(wait_until(lambda: len(self.windows) == 3))
-        self.windows[-1].hour_btn.click()
+        self.windows[-1].hour_btn.click()  # the button itself (not its arrow): 1 hour
         self.assertTrue(wait_until(lambda: "answer" in box))
+        self.assertTrue(3600 - 60 < self.conn.allowances.remaining("demo-pve", "power") <= 3600)
         self.request("guest_power", host="demo-pve", vmid=102, action="start", reason="r")
         self.assertEqual(len(self.windows), 3)  # within the hour: no window
         box = self.request("guest_power", wait=False, host="demo-pve", vmid=100, action="reboot", reason="r")
         self.request("guest_details", host="demo-pve", vmid=100)  # (reads go on meanwhile)
         self.assertEqual(len(self.windows), 3)
         self.assertTrue(wait_until(lambda: "answer" in box))
-        self.assertEqual([e["decision"] for e in connector_log.last()][-6:],
-                         ["approved", "denied", "approved", "allowed", "allowed", "allowed"])
+        decisions = [e["decision"] for e in connector_log.last()][-6:]
+        self.assertEqual(decisions[:4], ["approved", "denied", "approved", "granted"])  # (hours given, not On)
+        self.assertEqual(sorted(decisions[4:]), ["allowed", "granted"])  # the read (On) and the reboot, either first
+
+    def test_hours_from_the_arrow(self):
+        """The arrow beside 'Allow This Kind for 1 Hour' (19/10: Claude works the night through): 1, 3, 8 or 12
+        hours of that kind — shown in Claude Access, and ended there by a click on the kind's switch."""
+        access = claude_window.ClaudeWindow(self.win, self.conn, self.win.runner)
+        self.addCleanup(access.close)
+        access.show()
+        power = next(r for r in access.rows if r.key == "power")
+        self.assertFalse(power.grant.isVisible())
+        box = self.request("guest_power", wait=False, host="demo-pve", vmid=102, action="start", reason="the tests")
+        self.assertTrue(wait_until(lambda: self.windows))
+        dlg = self.windows[-1]
+        self.assertEqual(dlg.hour_btn.popupMode(), QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.assertEqual(dlg.hour_btn.height(), dlg.allow_btn.sizeHint().height())  # as tall as Allow beside it
+        hours = dlg.hour_btn.menu().actions()
+        self.assertEqual([a.text() for a in hours], ["For 1 Hour", "For 3 Hours", "For 8 Hours", "For 12 Hours"])
+        hours[2].trigger()
+        self.assertFalse(dlg.isVisible())
+        self.assertTrue(wait_until(lambda: "answer" in box, 10))
+        self.assertFalse(box["answer"]["result"]["isError"], self.text(box))
+        self.assertTrue(8 * 3600 - 60 < self.conn.allowances.remaining("demo-pve", "power") <= 8 * 3600)
+        self.assertEqual(self.conn.allowances.remaining("demo-pve", "change"), 0)  # that kind only
+        self.assertTrue(wait_until(power.grant.isVisible))
+        self.assertRegex(power.grant.text(), r"^· allowed without asking until \d\d:\d\d$")
+        end = time.strftime("%H:%M", time.localtime(time.time() + 8 * 3600))
+        self.assertIn(power.grant.text()[-5:], (end, time.strftime("%H:%M", time.localtime(time.time() + 8 * 3600 - 60))))
+        self.assertFalse(next(r for r in access.rows if r.key == "change").grant.isVisible())
+        self.request("guest_power", host="demo-pve", vmid=102, action="stop", reason="r")
+        self.assertEqual(len(self.windows), 1)  # no window while the hours last
+        self.assertTrue(wait_until(lambda: access.log.rowCount() >= 2))
+        self.assertEqual(access.log.item(0, 4).text(), "Allowed (hours you gave)")
+        self.assertEqual(access.log.item(1, 4).text(), "Approved by you")
+        power.buttons["ask"].click()  # already Ask: the click ends the hours
+        self.assertEqual(self.conn.allowances.remaining("demo-pve", "power"), 0)
+        self.assertFalse(power.grant.isVisible())
+        self.assertEqual(claude_policy.host_switches(self.win.settings, "demo-pve")["power"], "ask")
+        box = self.request("guest_power", wait=False, host="demo-pve", vmid=102, action="start", reason="r")
+        self.assertTrue(wait_until(lambda: len(self.windows) == 2))  # asked again
+        self.windows[-1].deny_btn.click()
+        self.assertTrue(wait_until(lambda: "answer" in box))
+        self.assertEqual([connector.allowed_hours(a) for a in ("allow-hours:12", "allow-hours:5", "allow-hours:",
+                                                               "allow-hours:24", "allow", "deny")],
+                         [12, 0, 0, 0, 0, 0])  # only what the window offers
 
     def test_no_answer_and_cancel(self):
         box = self.request("guest_power", wait=False, host="demo-pve", vmid=102, action="start", reason="r")

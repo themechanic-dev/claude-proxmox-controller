@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QGridLayout,
                                QHBoxLayout, QHeaderView, QPushButton, QScrollArea, QTableWidget, QTableWidgetItem,
@@ -16,7 +16,8 @@ from ..core.claude_policy import ASK, OFF, ON
 from .widgets import button, card, confirm, error, label
 from .worker import Runner
 
-DECISIONS = {"allowed": "Allowed (On)", "approved": "Approved by you", "denied": "Denied by you",
+DECISIONS = {"allowed": "Allowed (On)", "granted": "Allowed (hours you gave)", "approved": "Approved by you",
+             "denied": "Denied by you",
              "timeout": "No answer", "cancelled": "Cancelled", "off": "Refused (Off)", "not-set-up": "Not set up",
              "error": "Failed"}
 LOG_ROWS = 200
@@ -27,7 +28,18 @@ class SwitchRow:
 
     def __init__(self, grid: QGridLayout, row: int, key: str, title: str, text: str, changed):
         self.key = key
-        grid.addWidget(label(f"<b>{title}</b>"), row * 2, 0)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        head.addWidget(label(f"<b>{title}</b>"))
+        self.grant = label("", "grant")  # what the approval window's "Allow This Kind for … Hours" gave
+        self.grant.setToolTip("Given in an approval window, while the app runs. Click Off, Ask or On to end it now.")
+        self.grant.hide()
+        head.addWidget(self.grant)
+        head.addStretch(1)
+        title_holder = QWidget()
+        title_holder.setLayout(head)
+        grid.addWidget(title_holder, row * 2, 0)
         caption = label(text, "caption")  # one line: wrapped labels in a grid overlapped the next row
         caption.setToolTip(text)
         grid.addWidget(caption, row * 2 + 1, 0)
@@ -53,6 +65,13 @@ class SwitchRow:
         self.buttons[state].setChecked(True)
         for b in self.buttons.values():
             b.setEnabled(enabled)
+
+    def show_grant(self, left: float) -> None:
+        """Seconds left of the hours given (0: none)."""
+        if left > 0:
+            until = time.strftime("%H:%M", time.localtime(time.time() + left))
+            self.grant.setText(f"· allowed without asking until {until}")
+        self.grant.setVisible(left > 0)
 
 
 class ClaudeWindow(QDialog):
@@ -166,6 +185,9 @@ class ClaudeWindow(QDialog):
         outer.addLayout(row)
 
         connector.logged.connect(self.add_log)
+        self.grant_timer = QTimer(self)  # a grant runs out on its own
+        self.grant_timer.timeout.connect(self.show_grants)
+        self.grant_timer.start(15_000)
         self.fill_hosts()
         self.refresh()
         for entry in connector_log.last(LOG_ROWS):
@@ -236,6 +258,12 @@ class ClaudeWindow(QDialog):
         switches = claude_policy.host_switches(self.settings(), h.id) if h else claude_policy.DEFAULTS
         for r in self.rows:
             r.show(switches[r.key], bool(h) and not self.busy)
+        self.show_grants()
+
+    def show_grants(self) -> None:
+        h = self.current_host()
+        for r in self.rows:
+            r.show_grant(self.connector.allowances.remaining(h.id, r.key) if h else 0)
 
     # -- changes -------------------------------------------------------------------------------------
 
@@ -251,8 +279,7 @@ class ClaudeWindow(QDialog):
         if h is None:
             return
         claude_policy.set_switch(self.settings(), h.id, key, state)
-        if state != ASK:
-            self.connector.allowances.until.pop((h.id, key), None)  # an hour granted no longer applies
+        self.connector.allowances.until.pop((h.id, key), None)  # hours given end with any click here (Ask too)
         self.win._save_settings()
         self.show_host()
         if self.connector.tokens.get(h.id):
@@ -341,6 +368,7 @@ class ClaudeWindow(QDialog):
     # -- the log -------------------------------------------------------------------------------------
 
     def add_log(self, entry: dict) -> None:
+        self.show_grants()  # (hours may have just been given)
         t = self.log
         t.insertRow(0)
         when = time.strftime("%H:%M:%S", time.localtime(entry.get("time", 0)))
