@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import json
+import sys
 from concurrent.futures import Future
 from typing import Callable
 
@@ -208,9 +209,32 @@ class ApprovalDialog(QDialog):
         self.finish("deny")
 
 
+_TRAY: dict = {}  # Windows: the icon a toast comes from, and the timer that takes it away again
+
+
+def notify_windows(title: str, body: str) -> None:
+    """Windows: a toast — it comes from an icon in the notification area, shown only while the toast is up."""
+    from PySide6.QtWidgets import QSystemTrayIcon
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        return
+    if not _TRAY:
+        _TRAY["icon"] = QSystemTrayIcon(QApplication.windowIcon())
+        _TRAY["icon"].setToolTip("Proxmox Controller")
+        _TRAY["timer"] = QTimer()
+        _TRAY["timer"].setSingleShot(True)
+        _TRAY["timer"].timeout.connect(_TRAY["icon"].hide)
+    _TRAY["icon"].show()
+    _TRAY["icon"].showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 20000)
+    _TRAY["timer"].start(25000)
+
+
 def notify_desktop(title: str, body: str) -> None:
-    """A GNOME notification, so a request waiting for the user is seen even with the app behind other windows."""
+    """A desktop notification (GNOME's; on Windows a toast), so a request waiting for the user is seen even with the
+    app behind other windows."""
     try:
+        if sys.platform.startswith("win"):
+            notify_windows(title, body)
+            return
         from PySide6.QtDBus import QDBusConnection, QDBusInterface
         bus = QDBusConnection.sessionBus()
         if not bus.isConnected():

@@ -1134,6 +1134,77 @@ class GraphWallTest(UiCase):
         self.assertNotIn("demo-pve", graph_wall.WALLS)
 
 
+class WindowsLookTest(UiCase):
+    """What the app shows and does on Windows that it does not on Linux (and the reverse)."""
+
+    def test_own_taskbar_button(self):
+        class Shell32:
+            def __init__(self):
+                self.ids = []
+
+            def SetCurrentProcessExplicitAppUserModelID(self, app_id):
+                self.ids.append(app_id)
+                return 0  # S_OK
+
+        shell = Shell32()
+        self.assertTrue(app_module.set_windows_app_id("win32", shell))
+        self.assertEqual(shell.ids, ["store.themechanic.ProxmoxController"])  # the installer's shortcut: the same
+        self.assertFalse(app_module.set_windows_app_id("linux", shell))
+        self.assertFalse(app_module.set_windows_app_id("win32", object()))  # (no such call: nothing breaks)
+
+    def test_openssh_hint(self):
+        self.assertIn("Optional features → OpenSSH Client", ssh_core.install_hint("win32"))
+        self.assertIn("apt install openssh-client", ssh_core.install_hint("linux"))
+
+    def test_gnome_note_only_on_linux(self):
+        from proxmox_controller.ui import settings as settings_ui
+        from proxmox_controller.ui.settings import SettingsDialog
+        win = MainWindow(list(DEMO_HOSTS), DemoPve, demo=True)
+        self.addCleanup(win.close)
+        for platform, shown in (("linux", True), ("win32", False)):
+            with mock.patch.object(settings_ui.sys, "platform", platform), mock.patch.object(store, "save_settings"):
+                dlg = SettingsDialog(win)
+            self.addCleanup(dlg.close)
+            self.assertEqual(dlg.place_note.isVisibleTo(dlg), shown, platform)
+            self.assertTrue(dlg.place.isVisibleTo(dlg))  # the option itself: on both
+
+    def test_windows_toast_while_a_request_waits(self):
+        shown = []
+
+        class Tray:
+            MessageIcon = mock.Mock()
+
+            def __init__(self, icon):
+                self.visible = False
+
+            @staticmethod
+            def isSystemTrayAvailable():
+                return True
+
+            def setToolTip(self, text):
+                pass
+
+            def show(self):
+                self.visible = True
+
+            def hide(self):
+                self.visible = False
+
+            def showMessage(self, title, body, icon, ms):
+                shown.append((title, body, ms))
+
+        connector._TRAY.clear()
+        self.addCleanup(connector._TRAY.clear)
+        with mock.patch.object(connector.sys, "platform", "win32"), \
+                mock.patch("PySide6.QtWidgets.QSystemTrayIcon", Tray):
+            connector.notify_desktop("Claude asks", "Start VM 100 (Win) — on Home")
+        self.assertEqual(shown, [("Claude asks", "Start VM 100 (Win) — on Home", 20000)])
+        self.assertTrue(connector._TRAY["icon"].visible)  # only while the toast is up
+        self.assertTrue(connector._TRAY["timer"].isActive())
+        connector._TRAY["timer"].timeout.emit()
+        self.assertFalse(connector._TRAY["icon"].visible)
+
+
 class WindowPlaceTest(UiCase):
     def test_xwayland_only_where_it_helps(self):
         on = {"remember_place": True}
@@ -1491,7 +1562,7 @@ class HostShellTest(UiCase):
             dlg = host_shell.SshDialog(None, self.host(), self.runner, lambda: None, first_time=True)
             self.addCleanup(dlg.close)
         self.assertFalse(dlg.go.isEnabled())
-        self.assertIn("openssh-client", dlg.status.text())
+        self.assertIn(ssh_core.install_hint(), dlg.status.text())  # this computer's way to get it
 
     def test_buttons_console_and_upgrade(self):
         view = self.loaded_view()

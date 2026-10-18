@@ -57,6 +57,12 @@ def missing_tools() -> list[str]:
     return [t for t in ("ssh", "ssh-keygen", "ssh-keyscan") if shutil.which(t) is None]
 
 
+def install_hint(platform: str = sys.platform) -> str:
+    if platform.startswith("win"):  # Windows 10 and 11 bring it; it can be taken out
+        return "Windows: Settings → System → Optional features → OpenSSH Client"
+    return "Ubuntu: sudo apt install openssh-client"
+
+
 # -- the app's key ---------------------------------------------------------------------------------
 
 def ensure_key() -> str:

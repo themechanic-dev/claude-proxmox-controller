@@ -119,8 +119,7 @@ class SshDialog(QDialog):
         self._update()
         fit_to_width(self, 520)
         if missing:
-            self.status.setText("This computer lacks " + ", ".join(missing) + " (Ubuntu: sudo apt install "
-                                "openssh-client).")
+            self.status.setText("This computer lacks " + ", ".join(missing) + f" ({ssh.install_hint()}).")
             self.go.setEnabled(False)
         else:
             self.scan()

@@ -48,6 +48,19 @@ def escape_startup_id(env=os.environ) -> None:
         env["DESKTOP_STARTUP_ID"] = "".join("\\" + ch if ch in ' "\\' else ch for ch in sid)
 
 
+def set_windows_app_id(platform: str = sys.platform, shell32=None) -> bool:
+    """Windows groups a window under the program that runs it — from the source tree pythonw.exe, so the taskbar showed
+    Python's icon (measured). The app's own ID makes it a button of its own with its own icon; the installer's shortcut
+    carries the same ID, so a pinned button is the app's."""
+    if not platform.startswith("win"):
+        return False
+    try:
+        shell32 = shell32 or __import__("ctypes").windll.shell32
+        return shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID) == 0
+    except (AttributeError, OSError):
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     demo = "--demo" in argv
@@ -56,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["QT_QPA_PLATFORM"] = chosen
     if sys.platform.startswith("linux"):
         escape_startup_id()  # before Qt reads it
+    set_windows_app_id()  # (before the first window)
     app = QApplication([a for a in argv if a != "--demo"])
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(VERSION)

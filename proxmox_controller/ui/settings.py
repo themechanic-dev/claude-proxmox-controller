@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QSize, Qt
@@ -81,8 +82,10 @@ class SettingsDialog(QDialog):
         self.place.setChecked(bool(win.settings.get("remember_place", True)))
         self.place.toggled.connect(win.set_remember_place)
         lay.addWidget(self.place)
-        lay.addWidget(label("GNOME does not let apps place their own windows, so for this the app runs through "
-                            "XWayland. Takes effect the next time the app starts.", "caption", wrap=True))
+        self.place_note = label("GNOME does not let apps place their own windows, so for this the app runs through "
+                                "XWayland. Takes effect the next time the app starts.", "caption", wrap=True)
+        if sys.platform.startswith("linux"):  # (Windows lets an app place its windows: nothing to explain)
+            lay.addWidget(self.place_note)
         self.login = QCheckBox("Start with the computer")
         self.login.setChecked(autostart.is_enabled())
         self.login.toggled.connect(autostart.set_enabled)
