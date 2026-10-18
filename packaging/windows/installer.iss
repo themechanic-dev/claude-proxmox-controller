@@ -1,4 +1,5 @@
-; Inno Setup script for Proxmox Controller (run by build.py, which gives AppVersion and AppIdName).
+﻿; Inno Setup script for Proxmox Controller (run by build.py, which gives AppVersion and AppIdName).
+; Saved as UTF-8 with a BOM: that is how Inno Setup knows it is not in the computer's code page (the · below).
 ; Installs for the current user without asking for an administrator (the user may choose all users instead).
 
 #define AppName "Proxmox Controller"
@@ -38,6 +39,10 @@ Compression=lzma2/max
 SolidCompression=yes
 ; the app and its bridges are stopped by the code below, not by Windows' Restart Manager
 CloseApplications=no
+
+[Messages]
+; the signature, low on the left of every page of the wizard
+BeveledLabel=HOME LAB · by the mechanic
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

@@ -1507,7 +1507,8 @@ class WindowsPackagingTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("windows_build", here / "build.py")
         self.build = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.build)
-        self.iss = (here / "installer.iss").read_text(encoding="utf-8")
+        self.iss_bytes = (here / "installer.iss").read_bytes()
+        self.iss = self.iss_bytes.decode("utf-8-sig")
         self.spec = (here / "proxmox-controller.spec").read_text(encoding="utf-8")
 
     def test_icon_file(self):
@@ -1539,6 +1540,10 @@ class WindowsPackagingTest(unittest.TestCase):
         self.assertIn(f'#define AppIdName "{APP_ID}"', self.iss)  # the shortcut's ID is the app's own
         self.assertIn('AppUserModelID: "{#AppIdName}"', self.iss)
         self.assertIn("AppId={{CD154B40-5EEA-477B-B826-A0F95650C4E8}", self.iss)  # never changes: upgrades replace
+
+    def test_signature_in_the_wizard(self):
+        self.assertIn("BeveledLabel=HOME LAB · by the mechanic", self.iss)  # the user's signature, on every page
+        self.assertTrue(self.iss_bytes.startswith(b"\xef\xbb\xbf"))  # UTF-8 with a BOM, or Inno reads the · wrong
 
 
 class UninstallTest(unittest.TestCase):
