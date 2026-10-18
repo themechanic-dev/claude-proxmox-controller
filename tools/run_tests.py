@@ -17,6 +17,8 @@ if sys.platform.startswith("linux"):
     ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE = 0
 faulthandler.enable(all_threads=True)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+if sys.platform.startswith("win"):  # offscreen Qt on Windows finds no fonts by itself: text would be measured wrong
+    os.environ.setdefault("QT_QPA_FONTDIR", os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts"))
 args = sys.argv[1:]
 if "--strict" in args:
     args.remove("--strict")

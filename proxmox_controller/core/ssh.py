@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import store
 
+WINDOWS = sys.platform.startswith("win")
 KEY_FILE = "id_ed25519"
 KNOWN_HOSTS = "known_hosts"
 SSH_TIMEOUT_S = 20
@@ -167,19 +168,29 @@ def remove_key_script(line: str) -> str:
 
 def _askpass_helper() -> Path:
     """A tiny program ssh runs to get the password (SSH_ASKPASS): it prints what the app put in its environment for
-    that one ssh run. Nothing is written to a file."""
+    that one ssh run. Nothing is written to a file. On Windows (whose OpenSSH runs a .cmd for it, measured with
+    9.5p2) it hands that to this app's own program with --askpass: cmd's echo would mangle & | ^ % and the like."""
+    if WINDOWS:
+        from .claude_connect import bridge_command
+        path = ssh_dir() / "askpass.cmd"
+        path.write_text("@" + cmd_line([*bridge_command(), "--askpass"]) + "\r\n", encoding="utf-8",
+                        newline="")  # (as written: text mode on Windows would turn \r\n into \r\r\n)
+        return path
     path = ssh_dir() / "askpass.sh"
     path.write_text("#!/bin/sh\nprintf '%s\\n' \"$PROXMOX_CONTROLLER_SSH_SECRET\"\n")
     os.chmod(path, 0o700)
     return path
 
 
+def askpass_answer(env=os.environ) -> str:
+    """What `--askpass` prints (Windows): the password the app put in ssh's environment for that one run."""
+    return env.get("PROXMOX_CONTROLLER_SSH_SECRET", "") + "\n"
+
+
 def run_with_password(host: str, port: int, user: str, password: str, script: str,
                       ssh: str = "ssh", timeout: int = SSH_TIMEOUT_S) -> str:
     """Runs a shell line on the host, logging in with the password the user typed in the app's window (once, never
     kept). Only the password is tried — no keys — so a wrong one is one failed login, not several."""
-    if sys.platform.startswith("win"):
-        raise SshError("Not on Windows yet.")
     env = {k: v for k, v in os.environ.items() if k != "DESKTOP_STARTUP_ID"}
     env.update(SSH_ASKPASS=str(_askpass_helper()), SSH_ASKPASS_REQUIRE="force",  # (force: no DISPLAY needed)
                PROXMOX_CONTROLLER_SSH_SECRET=password)
@@ -251,12 +262,36 @@ def _explain(stderr: str) -> str:
 
 # -- the terminal window ---------------------------------------------------------------------------
 
+def cmd_line(args: list[str]) -> str:
+    """A command line for a .cmd file: every argument quoted (so cmd reads & | < > ^ in it as text) the way Windows
+    programs split their arguments, and % doubled (cmd would expand it)."""
+    out = []
+    for arg in args:
+        quoted = subprocess.list2cmdline([arg])
+        if not quoted.startswith('"'):
+            bare = quoted.rstrip("\\")
+            quoted = '"' + bare + "\\" * (2 * (len(quoted) - len(bare))) + '"'  # trailing \ doubled before the quote
+        out.append(quoted.replace("%", "%%"))
+    return " ".join(out)
+
+
+def windows_console_script(inner: list[str], title: str) -> str:
+    """Windows: a .cmd that titles its window, runs `inner` and waits for Enter. In UTF-8 (chcp 65001), so a host's
+    name in Greek, say, comes out right in the title."""
+    def safe(text: str) -> str:  # (title's text is not quoted: cmd's own characters are taken out of it)
+        return "".join(" " if ch in '&|<>^%"' else ch for ch in text)
+    return ("@echo off\r\nchcp 65001 >nul\r\n"
+            f"title {safe(title)}\r\n"
+            f"{cmd_line(inner)}\r\n"
+            f'echo.\r\nset /p "_={CLOSE_PROMPT}"\r\n')
+
+
 def terminal_argv(inner: list[str], title: str = "Proxmox Console", which=shutil.which) -> list[str]:
     """The computer's terminal running `inner`, then waiting for Enter — so what ssh said (a refused password, the
     end of an upgrade) stays on the screen. The window is titled `title` — by the terminal's own option where it has
     one, and by the terminals' common escape sequence otherwise (it showed "sh", the wrapper's name)."""
-    if sys.platform.startswith("win"):
-        raise SshError("Not on Windows yet.")
+    if WINDOWS:
+        raise SshError("On Windows the console window opens through open_terminal().")
     keep_open = ["sh", "-c", 'printf "\\033]0;%s\\007" "$1"; shift; "$@"; echo; '
                  f'printf "%s" "{CLOSE_PROMPT}"; read _', "sh", title, *inner]
     for program, titled, how in TERMINALS:
@@ -266,6 +301,12 @@ def terminal_argv(inner: list[str], title: str = "Proxmox Console", which=shutil
 
 
 def open_terminal(inner: list[str], title: str = "Proxmox Console") -> None:
+    if WINDOWS:  # a console window of its own — on Windows 11 its default terminal (Windows Terminal) opens it
+        script = ssh_dir() / "console.cmd"
+        script.write_text(windows_console_script(inner, title), encoding="utf-8", newline="")
+        subprocess.Popen(["cmd.exe", "/c", str(script)], creationflags=subprocess.CREATE_NEW_CONSOLE,
+                         cwd=tempfile.gettempdir())
+        return
     env = {k: v for k, v in os.environ.items() if k != "DESKTOP_STARTUP_ID"}  # (the app's own launch, not this)
     subprocess.Popen(terminal_argv(inner, title), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True, cwd=tempfile.gettempdir())

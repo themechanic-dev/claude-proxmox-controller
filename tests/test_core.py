@@ -10,6 +10,7 @@ import socket
 import stat
 import subprocess
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -392,7 +393,7 @@ class DemoTest(unittest.TestCase):
 class StoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name, "APPDATA": self.tmp.name})
         self.env.start()
 
     def tearDown(self):
@@ -407,12 +408,14 @@ class StoreTest(unittest.TestCase):
         hosts_text = (folder / "hosts.json").read_text()
         self.assertNotIn("s3cret", hosts_text)
         self.assertEqual(json.loads((folder / "secrets.json").read_text())["tokens"][h.id], "s3cret")
-        for name in ("hosts.json", "secrets.json"):
-            self.assertEqual(stat.S_IMODE(os.stat(folder / name).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700)
+        if os.name == "posix":  # (Windows: %APPDATA% is the user's own already)
+            for name in ("hosts.json", "secrets.json"):
+                self.assertEqual(stat.S_IMODE(os.stat(folder / name).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700)
         again = store.load_hosts()
         self.assertEqual(again, [h])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "names an fsync'd file through /proc")
     def test_writes_survive_a_power_cut(self):
         synced = []
         real_fsync = os.fsync
@@ -447,7 +450,7 @@ class StoreTest(unittest.TestCase):
 class VaultTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name, "APPDATA": self.tmp.name})
         self.env.start()
         store.lock_session()
 
@@ -598,27 +601,57 @@ class McpBridgeTest(unittest.TestCase):
 
 
 class ConnectorLinkTest(unittest.TestCase):
-    def test_round_trip_and_privacy(self):
-        folder = tempfile.mkdtemp(dir="/tmp")  # a socket's path must be short
+    def fresh_address(self):
+        """A line of the test's own: a Unix socket in a short folder (its path must be short), or on Windows a named
+        pipe."""
+        if connector_link.WINDOWS:
+            return "\\\\.\\pipe\\pvc-test-" + os.urandom(8).hex()
+        folder = tempfile.mkdtemp(dir="/tmp")
         self.addCleanup(shutil.rmtree, folder, True)
-        path = Path(folder) / "c.sock"
+        return Path(folder) / "c.sock"
+
+    def test_round_trip_and_privacy(self):
+        path = self.fresh_address()
         server = connector_link.LinkServer(lambda m: {"echo": m["n"] * 2}, path)
         self.assertTrue(server.start())
         self.addCleanup(server.stop)
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)  # this user's alone
+        if not connector_link.WINDOWS:
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)  # this user's alone
         self.assertEqual(connector_link.request({"n": 21}, path=path), {"echo": 42})
+        self.assertEqual(connector_link.request({"n": 4}, path=path), {"echo": 8})  # one request a connection
         other = connector_link.LinkServer(lambda m: {}, path)
         self.assertFalse(other.start())  # one app answers; a second window leaves it be
         server.stop()
-        self.assertFalse(path.exists())
+        if not connector_link.WINDOWS:
+            self.assertFalse(path.exists())
         with self.assertRaises(connector_link.AppNotRunning):
             connector_link.request({"n": 1}, path=path)
-        Path(path).touch()  # left by an app that ended in a power cut
+        if not connector_link.WINDOWS:
+            Path(path).touch()  # left by an app that ended in a power cut
         again = connector_link.LinkServer(lambda m: {"ok": True}, path)
-        self.assertTrue(again.start())
+        self.assertTrue(again.start())  # (Windows: the pipe's name is free again once its maker stops)
         self.addCleanup(again.stop)
         self.assertEqual(connector_link.request({}, path=path), {"ok": True})
 
+    def test_a_failing_handler_still_answers(self):
+        path = self.fresh_address()
+        server = connector_link.LinkServer(lambda m: 1 / 0, path)
+        self.assertTrue(server.start())
+        self.addCleanup(server.stop)
+        self.assertIn("ZeroDivisionError", connector_link.request({}, path=path)["error"])
+
+    def test_pipe_name(self):
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": ""}), \
+                mock.patch.object(connector_link.getpass, "getuser", return_value="DOMAIN\\Jo Doe"):
+            plain = connector_link.pipe_name()
+        self.assertEqual(plain, "\\\\.\\pipe\\proxmox-controller-DOMAIN_Jo_Doe")  # the same for the app and the bridge
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/tmp/pvc-a"}):
+            a = connector_link.pipe_name()
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/tmp/pvc-b"}):
+            b = connector_link.pipe_name()
+        self.assertNotEqual(a, b)  # each test's runtime folder, its own pipe
+
+    @unittest.skipIf(connector_link.WINDOWS, "Unix sockets")
     def test_socket_path(self):
         with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}), \
                 mock.patch.object(connector_link, "_private_folder", lambda f: f):
@@ -634,6 +667,7 @@ class ConnectorLinkTest(unittest.TestCase):
             with mock.patch.object(connector_link, "user_runtime_dir", lambda: ""):
                 self.assertTrue(str(connector_link.socket_path()).startswith("/tmp/proxmox-controller-"))
 
+    @unittest.skipIf(connector_link.WINDOWS, "Unix sockets")
     def test_user_runtime_dir_only_when_it_is_the_users(self):
         root = tempfile.mkdtemp(dir="/tmp")
         self.addCleanup(shutil.rmtree, root, True)
@@ -648,6 +682,7 @@ class ConnectorLinkTest(unittest.TestCase):
         Path(odd, str(os.getuid())).touch()
         self.assertEqual(connector_link.user_runtime_dir(odd), "")  # a file, not a folder
 
+    @unittest.skipIf(connector_link.WINDOWS, "Unix sockets")
     def test_bridge_without_xdg_runtime_dir_meets_the_app(self):
         """Claude Desktop starts the bridge with a bare environment — no XDG_RUNTIME_DIR — while the app has it (the
         user's sessions all said 'not running (or is still locked)' with the app open, 17/10): both must still land
@@ -1083,6 +1118,7 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertIn("not changed", str(caught.exception))
         self.assertNotIn("secret9", str(caught.exception))  # even if a program echoed it
 
+    @unittest.skipUnless(os.name == "posix", "the line runs on the Proxmox host: a POSIX shell")
     def test_container_password_script_on_the_right_node_only(self):
         """The line run on the host, with a pretend pct and uname: on the container's node the password reaches
         chpasswd on its input; on another node of a cluster nothing runs, and the reason is said plainly."""
@@ -1347,10 +1383,96 @@ class ConnectorToolsTest(unittest.TestCase):
             self.run_tool("run_command", host="demo-pve", vmid=100, command=["ls"], reason="r")  # a container
 
 
+class FakeRegistry:
+    """Enough of winreg for autostart: keys of HKEY_CURRENT_USER as dicts of values."""
+    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ = "HKCU", 2, 1
+
+    class Key:
+        def __init__(self, values):
+            self.values = values
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def __init__(self):
+        self.keys: dict[str, dict] = {}
+
+    def OpenKey(self, root, path, reserved=0, access=0):
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        return self.Key(self.keys[path])
+
+    def CreateKey(self, root, path):
+        return self.Key(self.keys.setdefault(path, {}))
+
+    def QueryValueEx(self, key, name):
+        if name not in key.values:
+            raise FileNotFoundError(name)
+        return key.values[name], self.REG_SZ
+
+    def SetValueEx(self, key, name, reserved, kind, value):
+        key.values[name] = value
+
+    def DeleteValue(self, key, name):
+        if name not in key.values:
+            raise FileNotFoundError(name)
+        del key.values[name]
+
+
+class WindowsAutostartTest(unittest.TestCase):
+    """Windows: a value under HKCU\\…\\Run, what Settings → Apps → Startup lists — and Windows' own switch there
+    (StartupApproved) is part of the answer."""
+
+    def test_run_value_and_windows_own_switch(self):
+        fake = FakeRegistry()
+        off, on = b"\x03" + bytes(11), b"\x02" + bytes(11)
+        with mock.patch.multiple(autostart, WINDOWS=True, registry=fake):
+            self.assertFalse(autostart.is_enabled())
+            autostart.set_enabled(True)
+            self.assertTrue(autostart.is_enabled())
+            command = fake.keys[autostart.RUN_KEY]["Proxmox Controller"]
+            self.assertTrue(command.endswith(f' -I "{autostart.ROOT / "bin" / "launch.py"}"'))  # the source tree
+            fake.keys.setdefault(autostart.APPROVED_KEY, {})["Proxmox Controller"] = off  # off in Windows' list
+            self.assertFalse(autostart.is_enabled())
+            fake.keys[autostart.APPROVED_KEY]["Proxmox Controller"] = on
+            self.assertTrue(autostart.is_enabled())
+            fake.keys[autostart.APPROVED_KEY]["Proxmox Controller"] = off
+            autostart.set_enabled(True)  # turned on here: on there too
+            self.assertNotIn("Proxmox Controller", fake.keys[autostart.APPROVED_KEY])
+            self.assertTrue(autostart.is_enabled())
+            autostart.set_enabled(False)
+            self.assertFalse(autostart.is_enabled())
+            self.assertNotIn("Proxmox Controller", fake.keys[autostart.RUN_KEY])
+            autostart.set_enabled(False)  # nothing left to remove: no error
+            exe = "C:\\Program Files\\Proxmox Controller\\Proxmox Controller.exe"
+            with mock.patch.object(autostart.sys, "frozen", True, create=True), \
+                    mock.patch.object(autostart.sys, "executable", exe):
+                autostart.set_enabled(True)
+            self.assertEqual(fake.keys[autostart.RUN_KEY]["Proxmox Controller"], f'"{exe}"')  # the installed app
+
+    @unittest.skipUnless(autostart.WINDOWS, "the real registry")
+    def test_real_registry(self):
+        import winreg
+        name = "Proxmox Controller test " + os.urandom(4).hex()  # never the real entry
+        with mock.patch.object(autostart, "VALUE", name):
+            try:
+                autostart.set_enabled(True)
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, autostart.RUN_KEY) as key:
+                    self.assertEqual(winreg.QueryValueEx(key, name)[0], autostart.windows_command())
+                self.assertTrue(autostart.is_enabled())
+            finally:
+                autostart.set_enabled(False)
+            self.assertFalse(autostart.is_enabled())
+
+
+@unittest.skipIf(autostart.WINDOWS, "Linux: ~/.config/autostart")
 class AutostartTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()  # never the real ~/.config/autostart
-        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name, "APPDATA": self.tmp.name})
         self.env.start()
 
     def tearDown(self):
@@ -1603,15 +1725,17 @@ class SshTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        patch = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": os.path.join(self.tmp, "config")})
+        config = os.path.join(self.tmp, "config")
+        patch = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config, "APPDATA": config})  # (Windows: APPDATA)
         patch.start()
         self.addCleanup(patch.stop)
 
     def test_key_and_fingerprint(self):
         line = sshmod.ensure_key()
         self.assertTrue(line.startswith("ssh-ed25519 ") and "proxmox-controller@" in line)
-        self.assertEqual(stat.S_IMODE(os.stat(sshmod.key_path()).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(sshmod.ssh_dir()).st_mode), 0o700)
+        if os.name == "posix":  # (Windows: ssh-keygen gives the file to the user, Administrators and SYSTEM alone)
+            self.assertEqual(stat.S_IMODE(os.stat(sshmod.key_path()).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(sshmod.ssh_dir()).st_mode), 0o700)
         self.assertEqual(sshmod.ensure_key(), line)  # made once
         shown = subprocess.run(["ssh-keygen", "-lf", str(sshmod.key_path()) + ".pub"], capture_output=True,
                                text=True).stdout.split()[1]
@@ -1646,6 +1770,7 @@ class SshTest(unittest.TestCase):
         self.assertNotIn("-i", bare)  # no key: ssh asks for the password in the terminal
         self.assertEqual(bare[bare.index("-p") + 1], "2222")
 
+    @unittest.skipUnless(os.name == "posix", "a POSIX shell script")
     def test_key_added_and_removed_through_proxmox_link(self):
         home, priv = os.path.join(self.tmp, "root"), os.path.join(self.tmp, "etc-pve-priv")
         os.makedirs(os.path.join(home, ".ssh"))
@@ -1672,6 +1797,7 @@ class SshTest(unittest.TestCase):
         os.remove(link)
         run(sshmod.remove_key_script(line))  # nothing there: nothing done
 
+    @unittest.skipUnless(os.name == "posix", "a POSIX shell script")
     def test_command_with_the_key_any_exit_code(self):
         """host_command's way in: the command's own exit code and output come back as they are; only ssh itself
         failing (it exits 255) raises, and a command that runs too long is cut off here."""
@@ -1700,6 +1826,7 @@ class SshTest(unittest.TestCase):
             sshmod.run_command("192.0.2.80", 22, "root", "slow", ssh=path, timeout=1)
         self.assertIn("did not finish within 1 s", str(caught.exception))
 
+    @unittest.skipUnless(os.name == "posix", "a POSIX shell script")
     def test_command_input_goes_to_its_standard_input(self):
         """A password for a command (a container's new root password) goes on ssh's standard input — not among its
         arguments, where ps would show it; without input, standard input is empty (no ssh waiting on the terminal)."""
@@ -1730,6 +1857,7 @@ class SshTest(unittest.TestCase):
         self.addCleanup(patch.stop)
         return path
 
+    @unittest.skipUnless(os.name == "posix", "a POSIX shell script")
     def test_password_given_once_to_ssh(self):
         fake = self.fake_ssh("s3cr$t 'x")
         out = sshmod.run_with_password("192.0.2.80", 22, "root", "s3cr$t 'x", "echo hi", ssh=fake)
@@ -1741,6 +1869,7 @@ class SshTest(unittest.TestCase):
             sshmod.run_with_password("192.0.2.80", 22, "root", "wrong", "true", ssh=fake)
         self.assertIn("did not accept the password", str(caught.exception))
 
+    @unittest.skipUnless(os.name == "posix", "a POSIX shell script")
     def test_terminal(self):
         inner = ["ssh", "-t", "root@192.0.2.80"]
         argv = sshmod.terminal_argv(inner, "Proxmox Console — Home", which=lambda p: p == "ptyxis")
@@ -1755,6 +1884,74 @@ class SshTest(unittest.TestCase):
         self.assertTrue(out.startswith("\x1b]0;Proxmox Console — Home\x07connected\n".encode()))
         with self.assertRaises(sshmod.SshError):
             sshmod.terminal_argv(inner, which=lambda p: None)
+
+
+class WindowsSshTest(unittest.TestCase):
+    """Windows: cmd.exe runs the .cmd files the app writes (ssh's askpass, the console window) — each argument quoted
+    for it — and Windows' OpenSSH runs askpass.cmd for the password (measured with 9.5p2)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        config = os.path.join(self.tmp, "config")
+        patch = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config, "APPDATA": config})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_cmd_line(self):
+        self.assertEqual(sshmod.cmd_line(["ssh", "-o", 'UserKnownHostsFile="C:\\Users\\Jo Doe\\kh"', "a&b", "50%",
+                                          "C:\\dir\\"]),
+                         '"ssh" "-o" "UserKnownHostsFile=\\"C:\\Users\\Jo Doe\\kh\\"" "a&b" "50%%" "C:\\dir\\\\"')
+
+    def test_console_script_and_window(self):
+        script = sshmod.windows_console_script(["ssh", "-t", "root@192.0.2.80"], "Proxmox Console — Σπίτι & co")
+        self.assertEqual(script.splitlines(), ["@echo off", "chcp 65001 >nul", "title Proxmox Console — Σπίτι   co",
+                                               '"ssh" "-t" "root@192.0.2.80"', "echo.",
+                                               f'set /p "_={sshmod.CLOSE_PROMPT}"'])
+        self.assertTrue(script.endswith("\r\n"))
+        with mock.patch.object(sshmod, "WINDOWS", True), \
+                mock.patch.object(sshmod.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
+                mock.patch.object(sshmod.subprocess, "Popen") as popen:
+            sshmod.open_terminal(["ssh", "-t", "root@192.0.2.80"], "Proxmox Console — Home")
+        path = sshmod.ssh_dir() / "console.cmd"
+        self.assertEqual(popen.call_args.args[0], ["cmd.exe", "/c", str(path)])
+        self.assertEqual(popen.call_args.kwargs["creationflags"], 16)  # a console window of its own
+        self.assertEqual(path.read_bytes().decode("utf-8"),  # (the bytes: \r\n once, never \r\r\n)
+                         sshmod.windows_console_script(["ssh", "-t", "root@192.0.2.80"], "Proxmox Console — Home"))
+
+    def test_askpass_cmd(self):
+        from proxmox_controller.core import claude_connect
+        with mock.patch.object(sshmod, "WINDOWS", True):
+            path = sshmod._askpass_helper()
+        self.assertEqual(path.name, "askpass.cmd")
+        text = path.read_bytes().decode("utf-8")
+        self.assertEqual(text, "@" + sshmod.cmd_line([*claude_connect.bridge_command(), "--askpass"]) + "\r\n")
+        self.assertEqual(sshmod.askpass_answer({"PROXMOX_CONTROLLER_SSH_SECRET": "s3cr$t & ^%"}), "s3cr$t & ^%\n")
+
+    @unittest.skipUnless(os.name == "nt", "Windows' cmd.exe")
+    def test_password_through_askpass_cmd(self):
+        """A pretend ssh that asks SSH_ASKPASS for the password as Windows' OpenSSH does — through askpass.cmd and the
+        app's own --askpass — with every character cmd would read as its own."""
+        fake_py = os.path.join(self.tmp, "fake_ssh.py")
+        with open(fake_py, "w", encoding="utf-8") as fh:
+            fh.write("import os, subprocess, sys\n"
+                     "got = subprocess.run([os.environ['SSH_ASKPASS'], \"user@h's password: \"], capture_output=True,"
+                     " text=True).stdout.rstrip('\\r\\n')\n"
+                     "if got != os.environ['FAKE_EXPECTED']:\n"
+                     "    sys.stderr.write('Permission denied (password).\\n'); sys.exit(255)\n"
+                     "print('args: ' + ' '.join(sys.argv[1:]))\n")
+        fake = os.path.join(self.tmp, "ssh.cmd")
+        with open(fake, "w") as fh:
+            fh.write(f'@"{sys.executable}" -I "{fake_py}" %*\r\n')
+        password = "s3cr$t 'x & ^% \"q\" | <>"
+        with mock.patch.dict(os.environ, {"FAKE_EXPECTED": password}):
+            out = sshmod.run_with_password("192.0.2.80", 22, "root", password, "echo hi", ssh=fake, timeout=60)
+            self.assertIn("PubkeyAuthentication=no", out)
+            self.assertTrue(out.strip().endswith("root@192.0.2.80 echo hi"))
+            with self.assertRaises(sshmod.SshError) as caught:
+                sshmod.run_with_password("192.0.2.80", 22, "root", "wrong", "true", ssh=fake, timeout=60)
+        self.assertIn("did not accept the password", str(caught.exception))
+        self.assertNotIn("s3cr", (sshmod.ssh_dir() / "askpass.cmd").read_text(encoding="utf-8"))  # never written
 
 
 class AptTest(unittest.TestCase):

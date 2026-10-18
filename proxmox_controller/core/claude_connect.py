@@ -4,7 +4,8 @@
                                                           command, which writes its settings safely even while it runs
     Claude Desktop (and Cowork)                           an entry in claude_desktop_config.json (read when it starts)
 
-Both start the same bridge: `<this folder>/bin/proxmox-controller --mcp`."""
+Both start the same bridge: `<this folder>/bin/proxmox-controller --mcp` — on Windows, the installed app's console
+program `proxmox-controller-mcp.exe` (or, from the source tree, its Python with bin/launch.py)."""
 
 from __future__ import annotations
 
@@ -12,11 +13,26 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 NAME = "proxmox-controller"
 ROOT = Path(__file__).resolve().parents[2]
 BRIDGE = ROOT / "bin" / "proxmox-controller"
+WINDOWS = sys.platform.startswith("win")
+MCP_EXE = "proxmox-controller-mcp.exe"  # the Windows build's console program: the bridge talks on stdin and stdout
+
+
+def bridge_command() -> list[str]:
+    """The program (and its first arguments) that starts the bridge; Claude adds nothing but --mcp."""
+    if getattr(sys, "frozen", False):  # the Windows installer's build: its console program beside the app
+        return [str(Path(sys.executable).with_name(MCP_EXE))]
+    if WINDOWS:  # the source tree on Windows: its own Python — the console one, not pythonw
+        python = Path(sys.executable)
+        if python.name.lower() == "pythonw.exe":
+            python = python.with_name("python.exe")
+        return [str(python), "-I", str(ROOT / "bin" / "launch.py")]
+    return [str(BRIDGE)]
 
 
 def claude_cli() -> str:
@@ -25,7 +41,11 @@ def claude_cli() -> str:
     found = shutil.which("claude")
     if found:
         return found
-    for candidate in (Path.home() / ".local" / "bin" / "claude", Path.home() / ".claude" / "local" / "claude"):
+    candidates = [Path.home() / ".local" / "bin" / "claude", Path.home() / ".claude" / "local" / "claude"]
+    if WINDOWS:  # its native installer's claude.exe; npm's claude.cmd
+        candidates = [Path.home() / ".local" / "bin" / "claude.exe",
+                      Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "npm" / "claude.cmd"]
+    for candidate in candidates:
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
     return ""
@@ -36,7 +56,10 @@ def code_config() -> Path:
 
 
 def desktop_config() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    if WINDOWS:  # %APPDATA%\\Claude, where Claude Desktop for Windows keeps it
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return Path(base) / "Claude" / "claude_desktop_config.json"
 
 
@@ -69,7 +92,7 @@ def connect_code() -> None:
         raise FileNotFoundError("Claude Code (the `claude` program) was not found on this computer.")
     if code_connected():
         _run([cli, "mcp", "remove", "--scope", "user", NAME])  # made again: the folder may have moved
-    _run([cli, "mcp", "add", "--scope", "user", NAME, "--", str(BRIDGE), "--mcp"])
+    _run([cli, "mcp", "add", "--scope", "user", NAME, "--", *bridge_command(), "--mcp"])
 
 
 def disconnect_code() -> None:
@@ -89,8 +112,9 @@ def _write_desktop(change) -> None:
 
 
 def connect_desktop() -> None:
+    command = bridge_command()
     _write_desktop(lambda d: d.setdefault("mcpServers", {}).update(
-        {NAME: {"command": str(BRIDGE), "args": ["--mcp"]}}))
+        {NAME: {"command": command[0], "args": [*command[1:], "--mcp"]}}))
 
 
 def disconnect_desktop() -> None:

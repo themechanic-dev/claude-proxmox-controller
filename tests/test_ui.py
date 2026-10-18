@@ -3,6 +3,7 @@ Questions and warnings that would wait for a click are replaced by recorders. Ne
 
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -24,7 +25,8 @@ if QApplication is not None:
     from proxmox_controller.core.pve import Host, PveError
     from proxmox_controller import app as app_module
     import threading
-    from proxmox_controller.core import claude_access, claude_policy, connector_log, ssh as ssh_core, vault
+    from proxmox_controller.core import (claude_access, claude_policy, connector_link, connector_log,
+                                         ssh as ssh_core, vault)
     from proxmox_controller.ui import (backup_jobs, backups, bulk, claude_window, connector, console, geometry,
                                        graph_wall, guest_dialogs, host_dialog, host_shell, host_view, main_window,
                                        tasks_panel, theme, vault_dialogs, vm_dialog)
@@ -38,11 +40,17 @@ if QApplication is not None:
     theme.apply(APP, dark=True)
 
 
+SHORT_TMP = "/tmp" if os.name == "posix" else None  # a Unix socket's path must be short; Windows: its own temp folder
+
+
 def wait_until(cond, timeout=5.0):
-    """Let the event loop run (the API answers arrive through it) until cond() is true."""
+    """Let the event loop run (the API answers arrive through it) until cond() is true. The short sleep lets the
+    workers' threads have the GIL: QTest.qWait keeps it while it waits — on Windows a worker then took 5.6 s instead of
+    0.05 (measured), and the test gave up. (The app itself waits in exec(), which lets it go.)"""
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        QTest.qWait(20)
+        time.sleep(0.01)
+        QTest.qWait(10)  # (last before the check: what a thread just signalled is delivered first)
         if cond():
             return True
     return bool(cond())
@@ -52,10 +60,12 @@ def wait_until(cond, timeout=5.0):
 class UiCase(unittest.TestCase):
     def setUp(self):
         DemoPve._clusters.clear()  # a fresh pretend cluster for every test
-        self.private = tempfile.mkdtemp(dir="/tmp", prefix="pvc-")  # never the real log, socket or runtime folder
+        self.private = tempfile.mkdtemp(dir=SHORT_TMP, prefix="pvc-")  # never the real log, socket or runtime folder
         self.addCleanup(lambda: __import__("shutil").rmtree(self.private, True))
-        env = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.private,
-                                           "XDG_DATA_HOME": os.path.join(self.private, "data")})
+        config, data = os.path.join(self.private, "config"), os.path.join(self.private, "data")
+        env = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.private,  # (Windows: APPDATA, LOCALAPPDATA)
+                                           "XDG_CONFIG_HOME": config, "APPDATA": config,
+                                           "XDG_DATA_HOME": data, "LOCALAPPDATA": data})
         env.start()
         self.addCleanup(env.stop)
         self.errors, self.asked = [], []
@@ -1166,7 +1176,7 @@ class WindowPlaceTest(UiCase):
         self.assertNotIn("DESKTOP_STARTUP_ID", empty)
 
     def test_main_window_reopens_as_it_was_closed(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": d}):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": d, "APPDATA": d}):
             win = MainWindow([], DemoPve)
             win.resize(733, 577)  # (the test platform's screen is 800 × 800; a saved place is kept on screen)
             win.close()
@@ -1391,7 +1401,8 @@ class HostShellTest(UiCase):
 
     def setUp(self):
         super().setUp()
-        env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": os.path.join(self.private, "config")})
+        config = os.path.join(self.private, "config")
+        env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config, "APPDATA": config})
         env.start()  # the app's own ssh folder, never the real one
         self.addCleanup(env.stop)
         self.host_key, self.ran, self.fail_password = self.KEY, [], None
@@ -1826,7 +1837,7 @@ class VaultDialogTest(UiCase):
     def setUp(self):
         super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
-        for p in (mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name}),
+        for p in (mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name, "APPDATA": self.tmp.name}),
                   mock.patch.object(vault, "KDF", {"n": 1 << 10, "r": 8, "p": 1})):  # quick keys for the test
             p.start()
             self.addCleanup(p.stop)
@@ -2296,7 +2307,8 @@ class ConnectorEndToEndTest(UiCase):
     def test_bridge_to_app(self):
         """The real bridge process, the real socket, the app (not demo mode, its own folders), the pretend cluster."""
         import subprocess
-        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": os.path.join(self.private, "config")}):
+        config = os.path.join(self.private, "config")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config, "APPDATA": config}):
             win = MainWindow(list(DEMO_HOSTS), DemoPve)
             self.addCleanup(win.close)
             self.assertTrue(win.connector.listening)
@@ -2315,8 +2327,10 @@ class ConnectorEndToEndTest(UiCase):
             root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             box = {}
 
-            def bridge():
-                done = subprocess.run([os.path.join(root, "bin", "proxmox-controller"), "--mcp"], text=True,
+            from proxmox_controller.core import claude_connect
+
+            def bridge():  # as Claude starts it (Windows: its Python with bin/launch.py)
+                done = subprocess.run([*claude_connect.bridge_command(), "--mcp"], text=True,
                                       input="".join(json.dumps(m) + "\n" for m in messages), capture_output=True,
                                       timeout=30, env=dict(os.environ))
                 box["out"] = done.stdout
@@ -2329,35 +2343,50 @@ class ConnectorEndToEndTest(UiCase):
             self.assertTrue(answers[3]["result"]["isError"])  # Host is Off
             self.assertIn("Off", answers[3]["result"]["content"][0]["text"])
             self.assertEqual([e["client"] for e in connector_log.last()], ["claude-code", "claude-code"])
+        address = win.connector.server.address
         win.close()
-        self.assertFalse(win.connector.server.path.exists())  # the socket goes with the app
+        if connector_link.WINDOWS:
+            with self.assertRaises(connector_link.AppNotRunning):  # the pipe goes with the app
+                connector_link.request({}, path=address)
+        else:
+            self.assertFalse(win.connector.server.path.exists())  # the socket goes with the app
 
 
 class ClaudeConnectTest(unittest.TestCase):
     def test_connect_both_apps(self):
         from proxmox_controller.core import claude_connect
-        home = tempfile.mkdtemp(dir="/tmp")
+        home = tempfile.mkdtemp(dir=SHORT_TMP)
         self.addCleanup(__import__("shutil").rmtree, home, True)
         calls = os.path.join(home, "calls.txt")
-        fake = os.path.join(home, "claude")  # stands in for Claude Code's program: notes what it was asked
-        with open(fake, "w") as fh:
-            fh.write(f"#!/bin/sh\nfor a in \"$@\"; do echo \"$a\"; done >> {calls}\n")  # an argument a line
-        os.chmod(fake, 0o755)
+        if os.name == "nt":  # a .cmd, as npm installs it, handing its arguments to a Python that notes them
+            notes = os.path.join(home, "note.py")
+            with open(notes, "w") as fh:
+                fh.write(f"import sys\nopen({calls!r}, 'a').write(''.join(a + '\\n' for a in sys.argv[1:]))\n")
+            fake = os.path.join(home, "claude.cmd")
+            with open(fake, "w") as fh:
+                fh.write(f'@"{sys.executable}" -I "{notes}" %*\r\n')
+        else:
+            fake = os.path.join(home, "claude")  # stands in for Claude Code's program: notes what it was asked
+            with open(fake, "w") as fh:
+                fh.write(f"#!/bin/sh\nfor a in \"$@\"; do echo \"$a\"; done >> {calls}\n")  # an argument a line
+            os.chmod(fake, 0o755)
         config = os.path.join(home, ".config")
         os.makedirs(os.path.join(config, "Claude"))
         with open(os.path.join(config, "Claude", "claude_desktop_config.json"), "w") as fh:
             json.dump({"preferences": {"keep": True}}, fh)
-        with mock.patch.dict(os.environ, {"HOME": home, "XDG_CONFIG_HOME": config, "CLAUDE_CONFIG_DIR": home}), \
+        with mock.patch.dict(os.environ, {"HOME": home, "XDG_CONFIG_HOME": config, "APPDATA": config,
+                                          "CLAUDE_CONFIG_DIR": home}), \
                 mock.patch.object(claude_connect, "claude_cli", lambda: fake):
             self.assertFalse(claude_connect.code_connected() or claude_connect.desktop_connected())
             claude_connect.connect_code()
             with open(calls) as fh:
                 self.assertEqual(fh.read().splitlines(), ["mcp", "add", "--scope", "user", "proxmox-controller",
-                                                          "--", str(claude_connect.BRIDGE), "--mcp"])
+                                                          "--", *claude_connect.bridge_command(), "--mcp"])
             claude_connect.connect_desktop()
             data = json.load(open(claude_connect.desktop_config()))
+            command = claude_connect.bridge_command()
             self.assertEqual(data["mcpServers"]["proxmox-controller"],
-                             {"command": str(claude_connect.BRIDGE), "args": ["--mcp"]})
+                             {"command": command[0], "args": [*command[1:], "--mcp"]})
             self.assertEqual(data["preferences"], {"keep": True})  # the rest of the file is left as it was
             self.assertTrue(claude_connect.desktop_connected())
             claude_connect.disconnect_desktop()
@@ -2509,18 +2538,21 @@ class MainWindowTest(UiCase):
     def test_start_with_the_computer(self):
         from proxmox_controller.core import autostart
         from proxmox_controller.ui.settings import SettingsDialog
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": d}), \
-                mock.patch.object(store, "save_settings"):
-            win = MainWindow(list(DEMO_HOSTS), DemoPve, demo=True)
+        from tests.test_core import FakeRegistry
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": d, "APPDATA": d}), \
+                mock.patch.object(store, "save_settings"), mock.patch.object(autostart, "registry", FakeRegistry()):
+            win = MainWindow(list(DEMO_HOSTS), DemoPve, demo=True)  # (Windows: a pretend registry, not the real one)
             try:
                 dlg = SettingsDialog(win)
                 self.assertTrue(dlg.login.isVisibleTo(dlg))
                 self.assertFalse(dlg.login.isChecked())
                 dlg.login.setChecked(True)
-                self.assertTrue(autostart.entry_path().exists())
+                self.assertTrue(autostart.is_enabled())
+                if not autostart.WINDOWS:
+                    self.assertTrue(autostart.entry_path().exists())
                 self.assertTrue(SettingsDialog(win).login.isChecked())  # read back from the entry itself
                 dlg.login.setChecked(False)
-                self.assertFalse(autostart.entry_path().exists())
+                self.assertFalse(autostart.is_enabled())
             finally:
                 win.close()
 
