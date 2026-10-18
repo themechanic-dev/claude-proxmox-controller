@@ -19,7 +19,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import store
+from . import procs, store
 
 WINDOWS = sys.platform.startswith("win")
 KEY_FILE = "id_ed25519"
@@ -71,7 +71,7 @@ def ensure_key() -> str:
     if not path.exists():
         comment = f"proxmox-controller@{socket.gethostname() or 'computer'}"
         done = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", str(path)],
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, **procs.hidden())
         if done.returncode != 0 or not path.exists():
             raise SshError(f"ssh-keygen could not make the key: {done.stderr.strip() or done.returncode}")
         if not sys.platform.startswith("win"):
@@ -104,7 +104,7 @@ def known_name(host: str, port: int) -> str:
 def scan_host_key(host: str, port: int = 22, timeout: int = 8) -> str:
     """The host's own key as 'type base64', to show the user before trusting it (as ssh asks the first time)."""
     done = subprocess.run(["ssh-keyscan", "-T", str(timeout), "-p", str(port), "-t", "ed25519,ecdsa,rsa", host],
-                          capture_output=True, text=True, timeout=timeout + 10)
+                          capture_output=True, text=True, timeout=timeout + 10, **procs.hidden())
     found = {}
     for line in done.stdout.splitlines():
         parts = line.split()
@@ -207,7 +207,7 @@ def run_with_password(host: str, port: int, user: str, password: str, script: st
     argv.append(script)
     try:
         done = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, **procs.hidden())
     except subprocess.TimeoutExpired as e:
         raise SshError(f"{host} did not answer within {timeout} s.") from e
     finally:
@@ -224,7 +224,8 @@ def run_with_key(host: str, port: int, user: str, script: str, ssh: str = "ssh",
     argv[1:1] = ["-o", "BatchMode=yes"]
     argv.append(script)
     try:
-        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                              **procs.hidden())
     except subprocess.TimeoutExpired as e:
         raise SshError(f"{host} did not answer within {timeout} s.") from e
     if done.returncode != 0:
@@ -244,7 +245,8 @@ def run_command(host: str, port: int, user: str, script: str, ssh: str = "ssh",
     argv.append(script)
     given = {"stdin": subprocess.DEVNULL} if input is None else {"input": input}
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout, **given)
+        done = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout, **given,
+                              **procs.hidden())
     except subprocess.TimeoutExpired as e:
         raise SshError(f"The command did not finish within {timeout} s (it was stopped here; on {host} it may "
                        "still be running).") from e

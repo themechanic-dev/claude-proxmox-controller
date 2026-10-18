@@ -2463,6 +2463,17 @@ class ClaudeConnectTest(unittest.TestCase):
             claude_connect.disconnect_desktop()
             self.assertFalse(claude_connect.desktop_connected())
             self.assertEqual(json.load(open(claude_connect.desktop_config()))["preferences"], {"keep": True})
+            desktop = claude_connect.desktop_config()
+            # with a BOM, as Windows' Notepad and PowerShell 5 save it: read, and kept as it was beside our entry
+            desktop.write_bytes(b"\xef\xbb\xbf" + json.dumps({"preferences": {"keep": True}}).encode())
+            claude_connect.connect_desktop()
+            self.assertTrue(claude_connect.desktop_connected())
+            self.assertEqual(json.loads(desktop.read_text(encoding="utf-8-sig"))["preferences"], {"keep": True})
+            # a file that cannot be read is never written over: the user's other servers would be lost
+            desktop.write_text('{"mcpServers": {"other": {}}, oops', encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                claude_connect.connect_desktop()
+            self.assertEqual(desktop.read_text(encoding="utf-8"), '{"mcpServers": {"other": {}}, oops')
 
 
 class HostDialogTest(UiCase):

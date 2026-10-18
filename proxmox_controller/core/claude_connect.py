@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import procs
+
 NAME = "proxmox-controller"
 ROOT = Path(__file__).resolve().parents[2]
 BRIDGE = ROOT / "bin" / "proxmox-controller"
@@ -63,12 +65,29 @@ def desktop_config() -> Path:
     return Path(base) / "Claude" / "claude_desktop_config.json"
 
 
-def _read(path: Path) -> dict:
+def _read(path: Path, strict: bool = False) -> dict:
+    """A Claude app's settings file. utf-8-sig: Windows' Notepad and PowerShell 5 write a BOM, and plain utf-8 took
+    the file for empty (measured). strict (before writing): a file that is there but cannot be read raises — written
+    over, it would lose the user's other servers and settings."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
         return {}
-    return data if isinstance(data, dict) else {}
+    except OSError:
+        if strict:
+            raise
+        return {}
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError as e:
+        if strict:
+            raise RuntimeError(f"{path} is not valid JSON ({e}); it was left as it is.") from e
+        return {}
+    if not isinstance(data, dict):
+        if strict:
+            raise RuntimeError(f"{path} does not hold settings; it was left as it is.")
+        return {}
+    return data
 
 
 def code_connected() -> bool:
@@ -80,7 +99,8 @@ def desktop_connected() -> bool:
 
 
 def _run(args: list[str]) -> str:
-    done = subprocess.run(args, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    done = subprocess.run(args, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                          **procs.hidden())
     if done.returncode != 0:
         raise RuntimeError((done.stderr or done.stdout or f"exit code {done.returncode}").strip())
     return done.stdout
@@ -103,7 +123,7 @@ def disconnect_code() -> None:
 
 def _write_desktop(change) -> None:
     path = desktop_config()
-    data = _read(path)
+    data = _read(path, strict=True)
     change(data)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")

@@ -518,6 +518,36 @@ class VaultTest(unittest.TestCase):
 
 
 
+class BridgeEncodingTest(unittest.TestCase):
+    """MCP talks UTF-8 a line at a time, whatever the computer's code page: on Windows the bridge's pipes came in
+    cp1252 — the — of the tools' descriptions went out as the byte 0x97 (measured with the built program)."""
+
+    def test_bridge_speaks_utf8_whatever_the_code_page(self):
+        messages = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                     "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "Δοκιμή"}}},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+        raw_in = io.BytesIO("".join(json.dumps(m, ensure_ascii=False) + "\n" for m in messages).encode("utf-8"))
+        raw_out = io.BytesIO()
+        stdin = io.TextIOWrapper(raw_in, encoding="cp1252")  # as Windows gives a program's pipes
+        stdout = io.TextIOWrapper(raw_out, encoding="cp1252", newline="\r\n", write_through=True)
+        with mock.patch.object(mcp.sys, "stdin", stdin), mock.patch.object(mcp.sys, "stdout", stdout):
+            mcp.main()
+        data = raw_out.getvalue()
+        text = data.decode("utf-8")  # strict: every byte is UTF-8
+        self.assertIn("\u2014".encode("utf-8"), data)  # the dash in the descriptions, as UTF-8
+        self.assertNotIn(b"\r\n", data)  # a message a line, ended by \n alone
+        answers = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual([a["id"] for a in answers], [1, 2])
+        self.assertEqual(len(answers[1]["result"]["tools"]), len(connector_tools.TOOLS))
+
+    def test_askpass_gives_the_passwords_own_bytes(self):
+        from proxmox_controller.core import claude_connect
+        password = "κωδικός—1 & ^%"
+        done = subprocess.run([*claude_connect.bridge_command(), "--askpass"], capture_output=True, timeout=60,
+                              env={**os.environ, "PROXMOX_CONTROLLER_SSH_SECRET": password})
+        self.assertEqual(done.stdout.rstrip(b"\r\n"), password.encode("utf-8"))
+
+
 class McpBridgeTest(unittest.TestCase):
     """The bridge Claude starts: MCP over stdin/stdout, every request handed to the app (here a recorder)."""
 
@@ -1468,6 +1498,87 @@ class WindowsAutostartTest(unittest.TestCase):
             self.assertFalse(autostart.is_enabled())
 
 
+class WindowsPackagingTest(unittest.TestCase):
+    """packaging/windows: the build's own helpers, and its names agreeing with the code that uses them."""
+
+    def setUp(self):
+        import importlib.util
+        here = Path(__file__).resolve().parent.parent / "packaging" / "windows"
+        spec = importlib.util.spec_from_file_location("windows_build", here / "build.py")
+        self.build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.build)
+        self.iss = (here / "installer.iss").read_text(encoding="utf-8")
+        self.spec = (here / "proxmox-controller.spec").read_text(encoding="utf-8")
+
+    def test_icon_file(self):
+        data = self.build.ico_bytes([(16, b"P16"), (256, b"P256xx")])
+        self.assertEqual(struct.unpack("<HHH", data[:6]), (0, 1, 2))  # an icon file of two images
+        first, second = (struct.unpack("<BBBBHHII", data[6 + 16 * i:22 + 16 * i]) for i in range(2))
+        self.assertEqual((first[0], first[6], first[7]), (16, 3, 38))  # 16×16, its PNG's length and place
+        self.assertEqual((second[0], second[6], second[7]), (0, 6, 41))  # 0 stands for 256
+        self.assertEqual(data[38:41] + data[41:], b"P16P256xx")
+
+    def test_version_resource(self):
+        self.assertEqual(self.build.version_tuple("0.1.0"), (0, 1, 0, 0))
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = Path(tmp) / "v.txt"
+        self.build.version_file(path)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("StringStruct('ProductName', 'Proxmox Controller')", text)
+        self.assertIn(f"StringStruct('ProductVersion', '{self.build.VERSION}')", text)
+        compile(text, "version_info.txt", "eval")  # PyInstaller reads it as a Python expression
+
+    def test_names_agree(self):
+        from proxmox_controller import APP_ID, APP_NAME
+        from proxmox_controller.core import claude_connect
+        self.assertIn(f'#define BridgeExe "{claude_connect.MCP_EXE}"', self.iss)  # what Claude is told to start
+        self.assertIn(f'name="{claude_connect.MCP_EXE[:-4]}", console=True', self.spec)  # what PyInstaller makes
+        self.assertIn(f'#define AppExe "{APP_NAME}.exe"', self.iss)
+        self.assertIn(f'name="{APP_NAME}", console=False', self.spec)
+        self.assertIn(f'#define AppIdName "{APP_ID}"', self.iss)  # the shortcut's ID is the app's own
+        self.assertIn('AppUserModelID: "{#AppIdName}"', self.iss)
+        self.assertIn("AppId={{CD154B40-5EEA-477B-B826-A0F95650C4E8}", self.iss)  # never changes: upgrades replace
+
+
+class UninstallTest(unittest.TestCase):
+    """What the Windows uninstaller has the app tidy before its files go."""
+
+    def test_tidies_what_points_at_the_program(self):
+        from proxmox_controller.core import claude_connect, uninstall
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        config, data = os.path.join(home, "config"), os.path.join(home, "data")
+        env = {"XDG_CONFIG_HOME": config, "APPDATA": config, "XDG_DATA_HOME": data, "LOCALAPPDATA": data,
+               "CLAUDE_CONFIG_DIR": home}
+        code = Path(home) / ".claude.json"
+        code.write_text(json.dumps({"mcpServers": {"proxmox-controller": {"command": "x"}}, "keep": 1}))
+        removed = []
+
+        def claude(args):  # Claude Code's own `claude mcp remove`, which edits its file
+            removed.append(args[1:])
+            code.write_text(json.dumps({"mcpServers": {}, "keep": 1}))
+            return ""
+
+        with mock.patch.dict(os.environ, env), mock.patch.multiple(autostart, WINDOWS=True, registry=FakeRegistry()), \
+                mock.patch.object(claude_connect, "claude_cli", lambda: "claude"), \
+                mock.patch.object(claude_connect, "_run", claude):
+            store.save_settings(dict(store.SETTINGS_DEFAULTS))
+            autostart.set_enabled(True)
+            claude_connect.connect_desktop()
+            desktop = claude_connect.desktop_config()
+            desktop.write_text(json.dumps({**json.loads(desktop.read_text()), "preferences": {"keep": True}}))
+            self.assertEqual(uninstall.cleanup(), ["start with the computer", "Claude Desktop's connector",
+                                                   "Claude Code's connector"])
+            self.assertFalse(autostart.is_enabled() or claude_connect.desktop_connected())
+            self.assertEqual(removed, [["mcp", "remove", "--scope", "user", "proxmox-controller"]])
+            self.assertEqual(json.loads(desktop.read_text())["preferences"], {"keep": True})  # the rest stays
+            self.assertTrue(store.config_dir().exists())  # the hosts and settings are the user's: kept
+            self.assertEqual(uninstall.cleanup(), [])  # nothing left to tidy
+            self.assertEqual(uninstall.cleanup(remove_data=True), ["hosts, token secrets and settings"])
+            self.assertFalse(store.config_dir().exists())
+
+
 @unittest.skipIf(autostart.WINDOWS, "Linux: ~/.config/autostart")
 class AutostartTest(unittest.TestCase):
     def setUp(self):
@@ -1927,6 +2038,35 @@ class WindowsSshTest(unittest.TestCase):
         text = path.read_bytes().decode("utf-8")
         self.assertEqual(text, "@" + sshmod.cmd_line([*claude_connect.bridge_command(), "--askpass"]) + "\r\n")
         self.assertEqual(sshmod.askpass_answer({"PROXMOX_CONTROLLER_SSH_SECRET": "s3cr$t & ^%"}), "s3cr$t & ^%\n")
+
+    def test_console_programs_get_no_window(self):
+        """Started from an app that has windows only, a console program gets a console window of its own on Windows:
+        ssh, ssh-keyscan, ssh-keygen, arp and claude are all asked to start without one."""
+        from proxmox_controller.core import claude_connect, netinfo, procs
+        flags = []
+
+        def run(argv, **kw):
+            flags.append((os.path.basename(argv[0]), kw.get("creationflags")))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(procs, "WINDOWS", True), \
+                mock.patch.object(procs.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), \
+                mock.patch.object(subprocess, "run", run):
+            sshmod.run_command("192.0.2.80", 22, "root", "true")
+            sshmod.run_with_key("192.0.2.80", 22, "root", "true")
+            sshmod.run_with_password("192.0.2.80", 22, "root", "pw", "true")
+            with self.assertRaises(sshmod.SshError):
+                sshmod.scan_host_key("192.0.2.80")  # (nothing found: said so)
+            with self.assertRaises(sshmod.SshError):
+                sshmod.ensure_key()  # (no key file made by the pretend ssh-keygen)
+            netinfo._neighbour_lines()
+            claude_connect._run(["claude", "mcp", "list"])
+        names = {name for name, _ in flags}
+        self.assertLessEqual({"ssh", "ssh-keyscan", "ssh-keygen", "claude"}, names)
+        self.assertTrue(names & {"arp", "ip"})  # (the neighbour table: arp on Windows, ip first on Linux)
+        self.assertTrue(all(f == 0x08000000 for _, f in flags), flags)
+        with mock.patch.object(procs, "WINDOWS", False):
+            self.assertEqual(procs.hidden(), {})  # nothing on Linux
 
     @unittest.skipUnless(os.name == "nt", "Windows' cmd.exe")
     def test_password_through_askpass_cmd(self):

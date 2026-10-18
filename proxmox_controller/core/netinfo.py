@@ -14,6 +14,8 @@ import socket
 import subprocess
 import sys
 
+from . import procs
+
 _MAC = re.compile(r"([0-9a-f]{2}[:-]){5}[0-9a-f]{2}", re.IGNORECASE)
 
 
@@ -74,7 +76,7 @@ def _neighbour_lines() -> list[str]:
     commands = [["arp", "-a"]] if sys.platform.startswith("win") else [["ip", "neigh"], ["arp", "-an"]]
     for cmd in commands:
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=5, **procs.hidden()).stdout
         except (OSError, subprocess.SubprocessError):
             continue
         if out.strip():

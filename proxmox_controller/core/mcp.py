@@ -134,6 +134,15 @@ def serve(lines, bridge: Bridge) -> None:
         t.join()
 
 
+def use_utf8(stdin, stdout) -> None:
+    """MCP talks UTF-8, one message a line. Windows would give a program's pipes its ANSI code page instead — cp1252
+    turned the — of the tools' descriptions into the byte 0x97 (measured), which is not UTF-8 — and \r\n for \n."""
+    for stream, newline in ((stdin, None), (stdout, "\n")):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", newline=newline)
+
+
 def main() -> int:
+    use_utf8(sys.stdin, sys.stdout)
     serve(sys.stdin, Bridge())
     return 0

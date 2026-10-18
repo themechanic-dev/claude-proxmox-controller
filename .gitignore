@@ -7,3 +7,6 @@ __pycache__/
 ΣΧΕΔΙΟ.md
 ΣΗΜΕΙΩΣΕΙΣ-GITHUB.md
 docs/*.pdf
+
+# the Windows build
+packaging/windows/build/
