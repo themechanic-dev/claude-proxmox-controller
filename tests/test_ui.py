@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PySide6.QtCore import QPoint, Qt
-    from PySide6.QtGui import QIcon
+    from PySide6.QtGui import QColor, QIcon
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog, QStyleOptionViewItem, QToolButton
 except ImportError:  # pragma: no cover - the core tests still run with plain python3
@@ -25,11 +25,11 @@ if QApplication is not None:
     from proxmox_controller.core.pve import Host, PveError
     from proxmox_controller import app as app_module
     import threading
-    from proxmox_controller.core import (claude_access, claude_policy, connector_link, connector_log,
+    from proxmox_controller.core import (claude_access, claude_policy, connector_link, connector_log, sounds,
                                          ssh as ssh_core, vault)
     from proxmox_controller.ui import (backup_jobs, backups, bulk, claude_window, connector, console, geometry,
-                                       graph_wall, guest_dialogs, host_dialog, host_shell, host_view, main_window,
-                                       tasks_panel, theme, vault_dialogs, vm_dialog)
+                                       graph_wall, guest_dialogs, hazard, host_dialog, host_shell, host_view,
+                                       main_window, tasks_panel, theme, vault_dialogs, vm_dialog)
     from proxmox_controller.ui.chart import nice_ticks
     from proxmox_controller.ui.host_dialog import HostDialog
     from proxmox_controller.ui.host_view import HostView
@@ -94,6 +94,8 @@ class UiCase(unittest.TestCase):
         self.patches += [mock.patch.object(m, "error", error) for m in (bulk, tasks_panel)]
         self.infos = []
         self.patches.append(mock.patch.object(guest_dialogs, "info", lambda _p, title, text: self.infos.append(text)))
+        self.played = []  # no test ever plays a sound on the desktop: what would play is kept here
+        self.patches.append(mock.patch.object(sounds, "play", lambda name: self.played.append(name) or True))
         self.terminals = []  # no test ever opens a real terminal window on the desktop: what would open is kept here
         self.titles = []
         self.patches.append(mock.patch.object(ssh_core, "open_terminal", lambda inner, title="": (
@@ -2427,6 +2429,59 @@ class ConnectorTest(UiCase):
         content = box["answer"]["result"]["content"]
         self.assertEqual((content[0]["type"], content[0]["mimeType"]), ("image", "image/png"))
         self.assertEqual(self.role(), list(claude_policy.PRIVILEGES["read"]))  # VM.Console only while it ran
+
+    def test_approval_window_stands_out(self):
+        """Hazard stripes along the top (the title on a plate in the middle) and all round, and the sound chosen in
+        Claude Access, once, as the window opens (the user's wish, 23/10: it was lost among many windows)."""
+        box = self.request("guest_power", wait=False, host="demo-pve", vmid=102, action="start", reason="r")
+        self.assertTrue(wait_until(lambda: self.windows))
+        dlg = self.windows[-1]
+        self.assertEqual(self.played, [])  # the sound is off until the user turns it on
+        self.assertEqual(dlg.band.text, "Claude asks")
+        self.assertIs(dlg.layout().itemAt(0).widget(), dlg.band)  # first, above "… asks to:"
+        dlg.adjustSize()
+        img = dlg.grab().toImage()
+        stripe = {hazard.YELLOW.name(), hazard.BLACK.name()}
+        for x, y in ((3, 3), (img.width() - 4, img.height() // 2), (img.width() // 2, img.height() - 4),
+                     (3, img.height() - 4)):
+            self.assertIn(img.pixelColor(x, y).name(), stripe, (x, y))  # the frame, all round
+        band = dlg.band.geometry()
+        self.assertGreaterEqual(band.top(), hazard.FRAME)  # inside the frame, not over it
+        self.assertIn(img.pixelColor(band.left() + 4, band.center().y()).name(), stripe)  # the band's left end
+        plate = img.pixelColor(band.center().x(), band.top() + 6)  # (above the title's letters)
+        self.assertEqual(plate.name(), QColor(theme.colors().window).name())  # the plate in the middle
+        dlg.deny_btn.click()
+        self.assertTrue(wait_until(lambda: "answer" in box))
+
+        self.win.settings["claude"].update(sound_on=True, sound="bell")
+        box = self.request("guest_power", wait=False, host="demo-pve", vmid=102, action="start", reason="r")
+        self.assertTrue(wait_until(lambda: len(self.windows) == 2))
+        self.assertEqual(self.played, ["bell"])  # once, as it opened
+        self.windows[-1].deny_btn.click()
+        self.assertTrue(wait_until(lambda: "answer" in box))
+        self.assertEqual(self.played, ["bell"])
+
+    def test_claude_window_sound(self):
+        dlg = claude_window.ClaudeWindow(self.win, self.conn, self.win.runner)
+        self.addCleanup(dlg.close)
+        self.assertFalse(dlg.sound_on.isChecked())
+        self.assertEqual([dlg.sound.itemText(i) for i in range(dlg.sound.count())], ["Double beep", "Beep", "Bell"])
+        self.assertEqual(dlg.sound.currentData(), "double-beep")
+        dlg.sound_on.setChecked(True)
+        dlg.sound.setCurrentIndex(dlg.sound.findData("beep"))
+        self.assertEqual((self.win.settings["claude"]["sound_on"], self.win.settings["claude"]["sound"]),
+                         (True, "beep"))
+        self.assertEqual(sounds.chosen(self.win.settings), "beep")
+        dlg.sound_test.click()
+        self.assertEqual(self.played, ["beep"])
+        again = claude_window.ClaudeWindow(self.win, self.conn, self.win.runner)  # as saved
+        self.addCleanup(again.close)
+        self.assertEqual((again.sound_on.isChecked(), again.sound.currentData()), (True, "beep"))
+        with mock.patch.object(sounds, "play", lambda name: False):  # nothing here can play it
+            dlg.sound_test.click()
+        self.assertIn("pw-play", self.errors[-1][1])
+        dlg.sound_on.setChecked(False)
+        self.assertIsNone(sounds.chosen(self.win.settings))
 
     def test_claude_window(self):
         dlg = claude_window.ClaudeWindow(self.win, self.conn, self.win.runner)

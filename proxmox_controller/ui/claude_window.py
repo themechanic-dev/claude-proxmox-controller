@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
                                QHBoxLayout, QHeaderView, QPushButton, QScrollArea, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
-from ..core import claude_access, claude_connect, claude_policy, connector_log, store
+from ..core import claude_access, claude_connect, claude_policy, connector_log, sounds, store
 from ..core.claude_policy import ASK, OFF, ON
 from .widgets import button, card, confirm, error, label
 from .worker import Runner
@@ -97,6 +97,25 @@ class ClaudeWindow(QDialog):
         lay.addLayout(head)
         self.status = label("", "dim", wrap=True)
         lay.addWidget(self.status)
+        sound_row = QHBoxLayout()  # once, when an approval window opens: it is found at once among many windows
+        self.sound_on = QCheckBox("Play a sound when Claude asks")
+        self.sound_on.setToolTip("Once, when an approval window opens.")
+        self.sound = QComboBox()
+        for key, text in sounds.SOUNDS:
+            self.sound.addItem(text, key)
+        self.sound_test = button("▶ Play")
+        self.sound_test.setToolTip("Hear the chosen sound now.")
+        claude = self.settings().get("claude", {})
+        self.sound_on.setChecked(bool(claude.get("sound_on")))
+        self.sound.setCurrentIndex(max(0, self.sound.findData(claude.get("sound", sounds.DEFAULT))))
+        self.sound_on.toggled.connect(lambda *_: self.save_sound())
+        self.sound.currentIndexChanged.connect(lambda *_: self.save_sound())
+        self.sound_test.clicked.connect(self.test_sound)
+        sound_row.addWidget(self.sound_on)
+        sound_row.addWidget(self.sound)
+        sound_row.addWidget(self.sound_test)
+        sound_row.addStretch(1)
+        lay.addLayout(sound_row)
 
         # the Claude apps
         apps = QGridLayout()
@@ -273,6 +292,16 @@ class ClaudeWindow(QDialog):
             self.connector.allowances.clear()
         self.win._save_settings()
         self.refresh()
+
+    def save_sound(self) -> None:
+        claude = self.settings().setdefault("claude", {})
+        claude["sound_on"] = self.sound_on.isChecked()
+        claude["sound"] = self.sound.currentData()
+        self.win._save_settings()
+
+    def test_sound(self) -> None:
+        if not sounds.play(self.sound.currentData()):
+            error(self, "Claude Access", sounds.NO_PLAYER)
 
     def set_switch(self, key: str, state: str) -> None:
         h = self.current_host()

@@ -18,12 +18,12 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (QApplication, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QToolButton,
                                QVBoxLayout)
 
-from ..core import claude_access, claude_policy, connector_log, store
+from ..core import claude_access, claude_policy, connector_log, sounds, store
 from ..core.claude_policy import ASK, OFF, ON, Allowances
 from ..core.connector_link import LinkServer
 from ..core.connector_tools import TOOLS, Context, Image, ToolError, check
 from ..core.pve import Host, Pve, PveError
-from . import theme
+from . import hazard, theme
 from .widgets import button, label
 
 ASK_TIMEOUT_S = 120
@@ -82,7 +82,8 @@ class Tokens:
 
 class ApprovalDialog(QDialog):
     """"Claude asks to …" — Allow, Allow this kind for 1 hour (its arrow: 3, 8 or 12), or Deny. No answer in two minutes
-    is Deny.
+    is Deny. Hazard stripes along its top and all round, and (if chosen in Claude Access) a sound, so it is found at
+    once among many windows.
 
     A request that needs a password (a new VM's user, a container's root, typing at a console prompt) asks the user
     for it here — always, even when its kind is On — and only the app ever holds it: Claude is told it was set."""
@@ -99,6 +100,9 @@ class ApprovalDialog(QDialog):
         self.left = timeout_s
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
+        lay.setContentsMargins(hazard.FRAME + 16, hazard.FRAME + 14, hazard.FRAME + 16, hazard.FRAME + 12)
+        self.band = hazard.HazardBand("Claude asks")
+        lay.addWidget(self.band)
         lay.addWidget(label(f"{html.escape(client)} asks to:", "dim"))
         self.what = label(html.escape(what), "title", wrap=True)
         lay.addWidget(self.what)
@@ -212,6 +216,10 @@ class ApprovalDialog(QDialog):
         # QDialog.done hides it. (Not close(): QDialog's close calls reject(), which here means Deny — and with the
         # answer already given it did nothing and kept the window open.)
         QDialog.done(self, QDialog.DialogCode.Accepted if answer.startswith("allow") else QDialog.DialogCode.Rejected)
+
+    def paintEvent(self, ev) -> None:
+        super().paintEvent(ev)
+        hazard.paint_frame(self)
 
     def closeEvent(self, ev) -> None:  # the window's X: no
         self.finish("deny")
@@ -460,9 +468,19 @@ class Connector(QObject):
         dlg.raise_()
         dlg.activateWindow()
         QApplication.alert(dlg)
+        self.play_sound()
         self.notify_desktop("Claude asks", f"{what} — on {host.name}")
         self.asking.emit(dlg)
         return fut
+
+    def play_sound(self) -> None:
+        """The sound chosen in Claude Access, once, as the window opens — never in the way of the request."""
+        name = sounds.chosen(self.win.settings)
+        if name:
+            try:
+                sounds.play(name)
+            except Exception:  # a sound that cannot play costs the request nothing
+                pass
 
     def _cancel(self, key: str) -> None:
         dlg = self.approvals.pop(key, None)

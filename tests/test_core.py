@@ -21,7 +21,7 @@ from unittest import mock
 
 from proxmox_controller.core import apt, ssh as sshmod
 from proxmox_controller.core import (autostart, claude_access, claude_policy, connector_link, connector_tools, jobs,
-                                     mcp, netinfo, screen, spice, startup, store, tasks, vault, vmhw, wol)
+                                     mcp, netinfo, screen, sounds, spice, startup, store, tasks, vault, vmhw, wol)
 from proxmox_controller.core.des import encrypt_block, vnc_response
 from proxmox_controller.core.fakevnc import FakeVncServer
 from proxmox_controller.core.rfb import RfbClient, RfbError, qnum_from_evdev, qnum_from_windows
@@ -2228,3 +2228,73 @@ class AptTest(unittest.TestCase):
                     {"URIs": ["https://enterprise.proxmox.com/debian/ceph-squid"], "Enabled": 1}]}],
                 "standard-repos": [{"handle": "ceph-squid-enterprise", "status": 1}]}  # no free one offered
         self.assertEqual(apt.plan_no_subscription(info), [])
+
+
+class SoundsTest(unittest.TestCase):
+    """The sound when Claude asks: plain tones made here, played by the system — never by these tests."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patch = mock.patch.object(store, "data_dir", lambda: self.tmp)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_the_sounds(self):
+        import wave
+        for name, seconds in (("double-beep", 0.31), ("beep", 0.22), ("bell", 1.6)):
+            w = wave.open(io.BytesIO(sounds.wav_bytes(name)))
+            self.assertEqual((w.getnchannels(), w.getsampwidth(), w.getframerate()), (1, 2, 44100))
+            self.assertAlmostEqual(w.getnframes() / 44100, seconds, places=2)
+            frames = struct.unpack(f"<{w.getnframes()}h", w.readframes(w.getnframes()))
+            self.assertLessEqual(max(abs(f) for f in frames), 16384)  # half the scale: firm, not harsh
+            self.assertGreater(max(abs(f) for f in frames), 16000)
+            self.assertLess(max(abs(f) for f in frames[:10] + frames[-10:]), 2500)  # soft start and end: no click
+        self.assertEqual([n for n, _ in sounds.SOUNDS], ["double-beep", "beep", "bell"])
+        with self.assertRaises(ValueError):
+            sounds.samples("siren")
+
+    def test_written_once_and_played_by_the_system(self):
+        found = {"aplay", "paplay"}
+        self.assertEqual(sounds.player(lambda c: c in found), ["paplay"])  # in this order: PipeWire, Pulse, ALSA
+        self.assertEqual(sounds.player(lambda c: c == "aplay"), ["aplay", "-q"])
+        self.assertIsNone(sounds.player(lambda c: False))
+        started = []
+
+        class Proc:
+            def __init__(self, cmd, **kw):
+                started.append((cmd, kw))
+
+            def wait(self):
+                return 0
+        with mock.patch.object(sounds.sys, "platform", "linux"), \
+                mock.patch.object(sounds, "player", lambda: ["pw-play"]), \
+                mock.patch.object(sounds.subprocess, "Popen", Proc):
+            self.assertTrue(sounds.play("bell"))
+        path = self.tmp / "sounds" / "bell.wav"
+        self.assertEqual(started[0][0], ["pw-play", str(path)])
+        self.assertEqual(started[0][1]["stdout"], subprocess.DEVNULL)
+        self.assertEqual(path.read_bytes(), sounds.wav_bytes("bell"))
+        path.write_bytes(b"kept")  # written once: not again on each play
+        self.assertEqual(sounds.path_of("bell").read_bytes(), b"kept")
+        with mock.patch.object(sounds.sys, "platform", "linux"), mock.patch.object(sounds, "player", lambda: None), \
+                mock.patch.object(sounds.subprocess, "Popen", Proc):
+            self.assertFalse(sounds.play("beep"))  # nothing here can play it: said, not hidden
+        self.assertEqual(len(started), 1)
+
+    def test_windows_plays_it_with_winsound(self):
+        played = []
+        fake = type(sys)("winsound")
+        fake.SND_FILENAME, fake.SND_ASYNC, fake.SND_NODEFAULT = 0x20000, 0x1, 0x2
+        fake.PlaySound = lambda path, flags: played.append((path, flags))
+        with mock.patch.object(sounds.sys, "platform", "win32"), mock.patch.dict(sys.modules, {"winsound": fake}):
+            self.assertTrue(sounds.play("double-beep"))
+        self.assertEqual(played, [(str(self.tmp / "sounds" / "double-beep.wav"), 0x20003)])  # without waiting
+
+    def test_the_choice(self):
+        self.assertIsNone(sounds.chosen({}))
+        self.assertIsNone(sounds.chosen({"claude": {"sound": "bell"}}))  # off unless the box is ticked
+        self.assertEqual(sounds.chosen({"claude": {"sound_on": True}}), "double-beep")
+        self.assertEqual(sounds.chosen({"claude": {"sound_on": True, "sound": "bell"}}), "bell")
+        self.assertEqual(sounds.chosen({"claude": {"sound_on": True, "sound": "siren"}}), "double-beep")
+
