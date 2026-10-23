@@ -490,7 +490,7 @@ class GuestDialogsTest(UiCase):
         self.assertEqual(self.cluster().guests[201]["extra"]["tablet"], "1")
         self.assertEqual(self.infos, [])  # plugged in at once (USB hotplug): nothing waits for a restart
         self.assertEqual(self.client().monitor("pve", 201, "info mice").splitlines()[-1],
-                         "* Mouse #2: QEMU HID Tablet (absolute)")
+                         "* Mouse #3: QEMU HID Tablet (absolute)")
 
         self.cluster().guests[200]["spice"] = False  # the default display: Proxmox's tablet is on
         sw = guest_dialogs.EditGuestDialog(None, self.client, self.runner, self.guest(200))

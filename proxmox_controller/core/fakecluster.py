@@ -629,9 +629,10 @@ class FakeCluster:
         return out
 
     def monitor(self, p, node, vmid):
-        """QEMU's monitor, for 'info mice' only: the mouse a click from the console moves, as QEMU lists it. A USB
-        tablet when the VM has one (Proxmox leaves it out with the SPICE display unless it is set); else, in a Linux
-        guest, QEMU's vmmouse (the kernel drives it); else only the relative PS/2 mouse (a Windows guest)."""
+        """QEMU's monitor, for 'info mice' only: the mouse a click from the console moves, as QEMU lists it (measured
+        on the user's host, 23/10: Windows 11 with SPICE and no tablet — only the PS/2 mouse; Ubuntu — vmmouse, which
+        the Linux kernel turns on, beside the tablet). A USB tablet when the VM has one (Proxmox leaves it out with
+        the SPICE display unless it is set); else, in a Linux guest, vmmouse; else only the relative PS/2 mouse."""
         g = self._guest("qemu", vmid)
         if p.get("command", "").split() != ["info", "mice"]:
             raise PermissionError(f"the pretend monitor answers 'info mice' only, not '{p.get('command', '')}'")
@@ -641,11 +642,13 @@ class FakeCluster:
         tablet = vmhw.tablet_of(cfg)
         if "tablet" in self.pending_keys.get(int(vmid), set()):
             tablet = not tablet  # set, but not plugged in until the next start
+        linux = str(cfg.get("ostype", "l26")).startswith("l")
+        vmmouse = "  Mouse #5: vmmouse (absolute)\n" if linux else ""
         if tablet:
-            return "  Mouse #1: QEMU PS/2 Mouse\n* Mouse #2: QEMU HID Tablet (absolute)\n"
-        if str(cfg.get("ostype", "l26")).startswith("l"):
-            return "  Mouse #1: QEMU PS/2 Mouse\n* Mouse #3: VMware VMMouse (absolute)\n"
-        return "* Mouse #1: QEMU PS/2 Mouse\n"
+            return "  Mouse #2: QEMU PS/2 Mouse\n" + vmmouse + "* Mouse #3: QEMU HID Tablet (absolute)\n"
+        if linux:
+            return "  Mouse #2: QEMU PS/2 Mouse\n" + vmmouse.replace("  ", "* ", 1)
+        return "* Mouse #2: QEMU PS/2 Mouse\n"
 
     def spiceproxy(self, p, node, vmid):
         g = self._guest("qemu", vmid)

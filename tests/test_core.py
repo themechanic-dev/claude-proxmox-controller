@@ -1452,7 +1452,10 @@ class ConnectorToolsTest(unittest.TestCase):
                          "clicked")
 
         self.assertNotIn("tablet", self.pve.guest_config("pve", "qemu", 201))  # Linux, SPICE, no tablet …
-        self.assertEqual(connector_tools.pointer_state(self.pve.monitor("pve", 201, "info mice"))[0], "absolute")
+        self.assertEqual(connector_tools.pointer_state(self.pve.monitor("pve", 201, "info mice")),
+                         ("absolute", "vmmouse (absolute)"))  # (as measured on Ubuntu VMs, 23/10)
+        self.assertEqual(connector_tools.pointer_state("* Mouse #2: QEMU PS/2 Mouse"),
+                         ("relative", "QEMU PS/2 Mouse"))  # VM 103's answer, word for word
         self.run_tool("console_click", host="demo-pve", vmid=201, x=5, y=6, reason="r")  # … QEMU's vmmouse: fine
         out = self.run_tool("console_click", host="demo-pve", vmid=100, x=5, y=6, reason="r")  # a container's console
         self.assertEqual((out["done"], "note" in out), ("clicked", False))  # (a terminal: no pointer to check)
