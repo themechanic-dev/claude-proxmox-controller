@@ -9,6 +9,7 @@ is sent.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -653,6 +654,26 @@ class Pve:
     def agent_exec_status(self, node: str, vmid: int, pid: int) -> dict:
         """{"exited": 0|1, "exitcode", "out-data", "err-data", "out-truncated", "err-truncated", …}"""
         return self.get(f"/nodes/{q(node)}/qemu/{int(vmid)}/agent/exec-status", pid=int(pid)) or {}
+
+    def agent_ping(self, node: str, vmid: int) -> bool:
+        """Whether the VM's QEMU guest agent answers now."""
+        try:
+            self.post(f"/nodes/{q(node)}/qemu/{int(vmid)}/agent/ping")
+            return True
+        except PveError:
+            return False
+
+    def agent_file_read(self, node: str, vmid: int, path: str, offset: int = 0, count: int = 16 << 20) -> bytes:
+        """Up to `count` bytes (16 MiB at most) of a file inside the VM, from `offset`, through the guest agent."""
+        params = {"file": path, "count": int(count), "decode": 0}
+        if offset:
+            params["offset"] = int(offset)  # (Proxmox 9; asked for only when needed)
+        data = self.get(f"/nodes/{q(node)}/qemu/{int(vmid)}/agent/file-read", **params) or {}
+        return base64.b64decode(data.get("content", "") or "")
+
+    def agent_file_write(self, node: str, vmid: int, path: str, content_b64: str) -> None:
+        """Writes a file inside the VM (replacing it) through the guest agent: at most 60 KiB of base64 a call."""
+        self.post(f"/nodes/{q(node)}/qemu/{int(vmid)}/agent/file-write", file=path, content=content_b64, encode=0)
 
     def console_url(self, node: str, kind: str, vmid: int) -> str:
         _check_kind(kind)

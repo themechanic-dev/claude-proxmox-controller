@@ -22,6 +22,7 @@ from unittest import mock
 from proxmox_controller.core import apt, ssh as sshmod
 from proxmox_controller.core import (autostart, claude_access, claude_policy, connector_link, connector_tools, jobs,
                                      mcp, netinfo, screen, sounds, spice, startup, store, tasks, vault, vmhw, wol)
+from proxmox_controller.core import guestfiles
 from proxmox_controller.core.des import encrypt_block, vnc_response
 from proxmox_controller.core.fakevnc import FakeVncServer
 from proxmox_controller.core.rfb import RfbClient, RfbError, qnum_from_evdev, qnum_from_windows
@@ -882,7 +883,7 @@ class ClaudeAccessTest(unittest.TestCase):
         self.assertEqual(claude_policy.decide(settings, "h", "read"), "off")  # the switch for all starts off
         settings["claude"] = {"enabled": True}
         self.assertEqual([claude_policy.decide(settings, "h", k) for k in claude_policy.KEYS],
-                         ["on", "ask", "ask", "off", "off", "off", "off", "off"])  # the user's chosen defaults
+                         ["on", "ask", "ask", "off", "off", "off", "off", "off", "off"])  # the user's chosen defaults
         # (the eighth, Host commands, 17/10: Off for every new host — root on the host is the most there is)
         allow = claude_policy.Allowances()
         self.assertEqual(allow.remaining("h", "power"), 0)
@@ -1468,6 +1469,87 @@ class ConnectorToolsTest(unittest.TestCase):
         out = self.run_tool("console_click", host="demo-pve", vmid=201, x=5, y=6, reason="r")
         self.assertEqual(out["done"], "clicked")
         self.assertIn("could not be checked (Permission check failed", out["note"])
+
+    def test_file_tools(self):
+        """Claude's Files: list a guest's folder, send the user's files into it, receive its files — each path shown
+        whole in the approval window, nothing replaced unless asked, nothing done without an agent that answers."""
+        made = []
+
+        class FakeFiles:
+            os_name = "linux"
+
+            def __init__(self, pve, node, vmid, os_name, address):
+                made.append(("open", vmid, os_name, address))
+
+            def home(self):
+                return "/home"
+
+            def list(self, folder):
+                return folder, [guestfiles.Entry("docs", True, 0, 0), guestfiles.Entry("a.txt", False, 3, 1700000000)]
+
+            def send(self, paths, dest, progress, cancel):
+                made.append(("send", [p.name for p in paths], dest))
+                return "network"
+
+            def receive(self, folder, names, dest, progress, cancel, total=None):
+                progress(42, None, "proxmox")
+                made.append(("receive", folder, names, str(dest)))
+                return "proxmox"
+
+        local = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, local, True)
+        (local / "a.txt").write_text("abc")
+        (local / "b.bin").write_bytes(b"x" * 2048)
+        self.assertEqual({connector_tools.TOOLS[t].kind for t in ("list_guest_files", "send_files", "receive_files")},
+                         {"files"})
+        self.assertEqual((claude_policy.DEFAULTS["files"], claude_policy.PRIVILEGES["files"]),
+                         ("off", ("VM.GuestAgent.Unrestricted",)))
+        with mock.patch.object(connector_tools.guestfiles, "VmFiles", FakeFiles), \
+                mock.patch.object(connector_tools.guestfiles, "address_towards", lambda host, port: "192.0.2.5"):
+            out = self.run_tool("list_guest_files", host="demo-pve", vmid=201, reason="r")
+            self.assertEqual((out["folder"], [e["name"] for e in out["entries"]]), ("/home", ["docs", "a.txt"]))
+            self.assertEqual(out["entries"][1]["size"], 3)
+            self.assertNotIn("size", out["entries"][0])
+            self.assertEqual(made[0], ("open", 201, "linux", "192.0.2.5"))
+            what, lines = self.words("send_files", host="demo-pve", vmid=201, paths=[str(local / "b.bin")],
+                                     folder="/home/user", reason="r")
+            self.assertEqual(what, "Copy 1 item from this computer into VM 201 (ubuntu-desktop)")
+            self.assertEqual(lines, [str(local / "b.bin"), "Into: /home/user  (2.0 KiB)", "Nothing there is replaced."])
+            with self.assertRaises(connector_tools.ToolError) as caught:
+                self.run_tool("send_files", host="demo-pve", vmid=201, paths=[str(local / "a.txt")], folder="/home",
+                              reason="r")
+            self.assertIn("Already in /home: a.txt", str(caught.exception))
+            out = self.run_tool("send_files", host="demo-pve", vmid=201, paths=[str(local / "a.txt")], folder="/home",
+                                replace=True, reason="r")
+            self.assertEqual((out["way"], made[-1]), ("network", ("send", ["a.txt"], "/home")))
+            for bad in (["relative/a.txt"], [str(local / "nope")], []):
+                with self.assertRaises(connector_tools.ToolError):
+                    self.words("send_files", host="demo-pve", vmid=201, paths=bad, folder="/home", reason="r")
+            with self.assertRaises(connector_tools.ToolError) as caught:  # refused before the user is asked
+                self.words("receive_files", host="demo-pve", vmid=201, folder="/home", names=["a.txt"], to=str(local),
+                           reason="r")
+            self.assertIn("replace: true", str(caught.exception))
+            what, lines = self.words("receive_files", host="demo-pve", vmid=201, folder="/home", names=["c.txt"],
+                                     to=str(local), reason="r")
+            self.assertEqual(lines, ["From: /home", "• c.txt", f"Into: {local}", "Nothing there is replaced."])
+            out = self.run_tool("receive_files", host="demo-pve", vmid=201, folder="/home", names=["c.txt"],
+                                to=str(local), reason="r")
+            self.assertEqual((out["bytes"], out["way"], made[-1]), (42, "proxmox", ("receive", "/home", ["c.txt"],
+                                                                                    str(local))))
+            for names in (["../etc"], ["a/b"], [""]):
+                with self.assertRaises(connector_tools.ToolError):
+                    self.words("receive_files", host="demo-pve", vmid=201, folder="/home", names=names, to=str(local),
+                               reason="r")
+            with self.assertRaises(connector_tools.ToolError):
+                self.words("receive_files", host="demo-pve", vmid=201, folder="/home", names=["x"], to="relative",
+                           reason="r")
+            self.cluster.guests[201]["agent_down"] = True
+            with self.assertRaises(connector_tools.ToolError) as caught:
+                self.run_tool("list_guest_files", host="demo-pve", vmid=201, reason="r")
+            self.assertIn("Install Guest Agent", str(caught.exception))
+            with self.assertRaises(connector_tools.ToolError) as caught:  # a container: over the host's SSH key
+                self.run_tool("list_guest_files", host="demo-pve", vmid=100, reason="r")
+            self.assertIn("SSH with this app's key is not set up", str(caught.exception))
 
     def test_console_and_commands(self):
         picture = self.run_tool("console_screenshot", host="demo-pve", vmid=201, reason="r")
@@ -2297,4 +2379,215 @@ class SoundsTest(unittest.TestCase):
         self.assertEqual(sounds.chosen({"claude": {"sound_on": True}}), "double-beep")
         self.assertEqual(sounds.chosen({"claude": {"sound_on": True, "sound": "bell"}}), "bell")
         self.assertEqual(sounds.chosen({"claude": {"sound_on": True, "sound": "siren"}}), "double-beep")
+
+
+class LocalAgent:
+    """Stands in for Proxmox's guest-agent calls: the guest's commands run on this computer (for the Linux side —
+    sh, tar, curl, base64 — on temporary folders), its file calls on the local disk. `unreachable`: the guest cannot
+    reach this computer (its curl goes to a closed port)."""
+
+    def __init__(self, unreachable=False):
+        import itertools
+        self.procs, self.ids, self.unreachable, self.started = {}, itertools.count(100), unreachable, []
+
+    def agent_exec(self, node, vmid, argv, input_data=""):
+        if self.unreachable:
+            argv = ["http://127.0.0.1:9/x" if a.startswith("http://") else a for a in argv]
+        self.started.append(argv)
+        pid = next(self.ids)
+        self.procs[pid] = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return pid
+
+    def agent_exec_status(self, node, vmid, pid):
+        p = self.procs[pid]
+        if p.poll() is None:
+            return {"exited": 0}
+        out, err = p.communicate()
+        return {"exited": 1, "exitcode": p.returncode, "out-data": out, "err-data": err}
+
+    def agent_file_write(self, node, vmid, path, content_b64):
+        Path(path).write_bytes(base64.b64decode(content_b64))
+
+    def agent_file_read(self, node, vmid, path, offset=0, count=16 << 20):
+        with open(path, "rb") as f:
+            f.seek(offset)
+            return f.read(count)
+
+
+@unittest.skipIf(sys.platform.startswith("win") or not all(shutil.which(c) for c in ("sh", "tar", "curl", "base64")),
+                 "the Linux guest's side runs here")
+class GuestFilesLinuxTest(unittest.TestCase):
+    """Files to and from a Linux VM, its side run for real: over the network (this computer's channel, the guest's
+    curl) and through Proxmox (the agent's file calls) — names in Greek, folders whole, contents byte for byte."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.pc, self.vm = self.root / "pc", self.root / "vm"
+        (self.pc / "φάκελος" / "μέσα").mkdir(parents=True)
+        (self.pc / "φάκελος" / "μέσα" / "σημειώσεις.txt").write_text("γεια σου κόσμε\n", encoding="utf-8")
+        (self.pc / "setup.bin").write_bytes(os.urandom(2 * 1024 * 1024 + 7))
+        self.vm.mkdir()
+        (self.vm / "υπάρχον.md").write_text("ήδη εδώ", encoding="utf-8")
+        self.progress = []
+
+    def files(self, unreachable=False):
+        self.agent = LocalAgent(unreachable)
+        return guestfiles.VmFiles(self.agent, "pve", 112, "linux", "127.0.0.1")
+
+    def note(self, done, total, how):
+        self.progress.append((done, total, how))
+
+    def test_round_trip_both_ways(self):
+        for unreachable, way in ((False, "network"), (True, "proxmox")):
+            for p in list(self.vm.iterdir()):
+                if p.name != "υπάρχον.md":
+                    shutil.rmtree(p) if p.is_dir() else p.unlink()
+            files = self.files(unreachable)
+            self.progress.clear()
+            self.assertEqual(files.send([self.pc / "φάκελος", self.pc / "setup.bin"], str(self.vm), self.note,
+                                        threading.Event()), way)
+            self.assertEqual((self.vm / "φάκελος" / "μέσα" / "σημειώσεις.txt").read_text(encoding="utf-8"),
+                             "γεια σου κόσμε\n")
+            self.assertEqual((self.vm / "setup.bin").read_bytes(), (self.pc / "setup.bin").read_bytes())
+            self.assertEqual({h for _d, _t, h in self.progress}, {way})
+            self.assertEqual(self.progress[-1][0], self.progress[-1][1] if way == "proxmox" else self.progress[-1][0])
+            folder, entries = files.list(str(self.vm))
+            self.assertEqual(folder, str(self.vm))
+            self.assertEqual([(e.name, e.is_dir) for e in entries],
+                             [("φάκελος", True), ("setup.bin", False), ("υπάρχον.md", False)])  # folders first
+            self.assertEqual(entries[1].size, 2 * 1024 * 1024 + 7)
+            back = self.root / f"back-{way}"
+            back.mkdir()
+            self.assertEqual(files.receive(str(self.vm), ["φάκελος", "setup.bin", "υπάρχον.md"], back, self.note,
+                                           threading.Event()), way)
+            self.assertEqual((back / "setup.bin").read_bytes(), (self.pc / "setup.bin").read_bytes())
+            self.assertEqual((back / "υπάρχον.md").read_text(encoding="utf-8"), "ήδη εδώ")
+            self.assertTrue((back / "φάκελος" / "μέσα" / "σημειώσεις.txt").exists())
+        self.assertEqual([p for p in os.listdir("/tmp") if p.startswith("pcx-")], [])  # Proxmox's way cleans up
+        for argv in self.agent.started:  # the agent is never given anything but ASCII (it stalls on other text)
+            self.assertTrue(all(ord(c) < 128 for a in argv for c in a), argv)
+
+    def test_falls_back_at_once_when_the_guest_cannot_reach_this_computer(self):
+        t0 = time.monotonic()
+        self.assertEqual(self.files(True).send([self.pc / "setup.bin"], str(self.vm), self.note, threading.Event()),
+                         "proxmox")
+        self.assertLess(time.monotonic() - t0, guestfiles.CONNECT_WAIT_S)  # as soon as curl gave up
+
+    def test_a_folder_that_is_not_there(self):
+        files = self.files()
+        with self.assertRaises(guestfiles.GuestError):
+            files.list(str(self.root / "nope"))
+        with self.assertRaises(guestfiles.GuestError):
+            files.send([self.pc / "setup.bin"], str(self.root / "nope"), self.note, threading.Event())
+
+    def test_cancel(self):
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(guestfiles.Cancelled):
+            self.files(True).send([self.pc / "setup.bin"], str(self.vm), self.note, cancel)
+        self.assertEqual([p for p in os.listdir("/tmp") if p.startswith("pcx-")], [])
+
+    def test_container_over_a_pipe(self):
+        ct = guestfiles.ContainerFiles("pve", 22, "root", 105)
+        ct._argv = lambda inner: inner  # (what `pct exec` would run inside, run here)
+        self.assertEqual(ct.send([self.pc / "φάκελος"], str(self.vm), self.note, threading.Event()), "ssh")
+        self.assertTrue((self.vm / "φάκελος" / "μέσα" / "σημειώσεις.txt").exists())
+        self.assertEqual([e.name for e in ct.list(str(self.vm))[1]], ["φάκελος", "υπάρχον.md"])
+        back = self.root / "back"
+        back.mkdir()
+        self.assertEqual(ct.receive(str(self.vm), ["φάκελος"], back, self.note, threading.Event()), "ssh")
+        self.assertEqual((back / "φάκελος" / "μέσα" / "σημειώσεις.txt").read_text(encoding="utf-8"),
+                         "γεια σου κόσμε\n")
+        argv = guestfiles.ContainerFiles("pve", 2222, "root", 105)._argv(["sh", "-c", "it's"])
+        self.assertEqual(argv[-1], "pct exec 105 -- 'sh' '-c' 'it'\\''s'")  # one line for the host's shell
+        self.assertIn("BatchMode=yes", argv)
+
+
+class GuestFilesTest(unittest.TestCase):
+    def test_paths_and_listing(self):
+        self.assertEqual(guestfiles.os_of({"ostype": "win11"}), "windows")
+        self.assertEqual(guestfiles.os_of({"ostype": "l26"}), "linux")
+        self.assertEqual(guestfiles.join("windows", "C:\\Users", "user"), "C:\\Users\\user")
+        self.assertEqual(guestfiles.parent("windows", "C:\\Users\\user"), "C:\\Users")
+        self.assertEqual(guestfiles.parent("windows", "C:\\"), "")  # above a drive: the drives
+        self.assertEqual(guestfiles.parent("linux", "/home/user/"), "/home")
+        self.assertEqual(guestfiles.parent("linux", "/"), "/")
+        b = guestfiles.b64
+        out = "PWD " + b("C:\\Users\\user") + "\r\n" + f"F 12 1700000000 {b('σημειώσεις.txt')}\r\n" + \
+              f"D 0 1700000000 {b('Desktop')}\r\n"
+        folder, entries = guestfiles.parse_listing(out, "windows")
+        self.assertEqual(folder, "C:\\Users\\user")
+        self.assertEqual([(e.name, e.is_dir, e.size) for e in entries], [("Desktop", True, 0),
+                                                                        ("σημειώσεις.txt", False, 12)])
+        drives = guestfiles.parse_listing("PWD \r\n" + f"D 0 0 {b('C:' + chr(92))}\r\n", "windows")
+        self.assertEqual((drives[0], [e.name for e in drives[1]]), ("", ["C:\\"]))
+        with self.assertRaises(guestfiles.GuestError):
+            guestfiles.parse_listing("ERR No such folder\n", "linux")
+
+    def test_scripts_stay_ascii_and_are_filled(self):
+        for name in ("LINUX_LIST", "LINUX_SEND_NET", "LINUX_RECV_NET", "LINUX_JOIN", "LINUX_PACK", "WINDOWS_LIST",
+                     "WINDOWS_SEND_NET", "WINDOWS_RECV_NET", "WINDOWS_JOIN", "WINDOWS_PACK"):
+            self.assertTrue(all(ord(c) < 128 for c in getattr(guestfiles, name)), name)
+        sent = []
+        agent = mock.Mock()
+        agent.agent_exec.side_effect = lambda node, vmid, argv, input_data="": sent.append(argv) or 7
+        agent.agent_exec_status.return_value = {"exited": 1, "exitcode": 0,
+                                                "out-data": "PWD " + guestfiles.b64("C:\\Χρήστης") + "\n"}
+        win = guestfiles.VmFiles(agent, "pve", 103, "windows", "192.0.2.5")
+        self.assertEqual(win.list("C:\\Χρήστης")[0], "C:\\Χρήστης")
+        script = sent[-1][-1]
+        self.assertEqual(sent[-1][:2], ["powershell", "-NoProfile"])
+        self.assertIn(guestfiles.b64("C:\\Χρήστης"), script)  # the folder only as base64
+        self.assertNotIn("{path}", script)
+        self.assertTrue(all(ord(c) < 128 for c in script))
+
+    def test_channel(self):
+        import http.client
+        got = []
+        channel = guestfiles.Channel("127.0.0.1", source=lambda out: out.write(b"x" * 100000),
+                                     sink=lambda body: got.append(body.read()))
+        self.addCleanup(channel.close)
+        conn = http.client.HTTPConnection("127.0.0.1", channel.port, timeout=10)
+        conn.request("GET", "/wrong/get")
+        self.assertEqual(conn.getresponse().status, 404)  # only the secret path
+        conn = http.client.HTTPConnection("127.0.0.1", channel.port, timeout=10)
+        conn.request("GET", f"/{channel.secret}/get")
+        self.assertEqual(len(conn.getresponse().read()), 100000)
+        conn = http.client.HTTPConnection("127.0.0.1", channel.port, timeout=10)
+        conn.putrequest("PUT", f"/{channel.secret}/put")
+        conn.putheader("Transfer-Encoding", "chunked")  # as curl -T - sends it
+        conn.endheaders()
+        for part in (b"hello ", b"chunked ", b"world"):
+            conn.send(b"%x\r\n%s\r\n" % (len(part), part))
+        conn.send(b"0\r\n\r\n")
+        self.assertEqual(conn.getresponse().status, 200)
+        self.assertEqual(got, [b"hello chunked world"])
+        self.assertTrue(channel.reached.is_set() and channel.done.is_set())
+
+    def test_zip_keeps_greek_names_and_nothing_lands_outside(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "src" / "φάκελος").mkdir(parents=True)
+        (root / "src" / "φάκελος" / "αρχείο.txt").write_text("ναι", encoding="utf-8")
+        with open(root / "a.zip", "wb") as f:
+            guestfiles.write_zip([root / "src" / "φάκελος"], f)
+        (root / "out").mkdir()
+        guestfiles.extract_zip(root / "a.zip", root / "out")
+        self.assertEqual((root / "out" / "φάκελος" / "αρχείο.txt").read_text(encoding="utf-8"), "ναι")
+        import zipfile
+        with zipfile.ZipFile(root / "evil.zip", "w") as z:
+            z.writestr("../outside.txt", "no")
+        guestfiles.extract_zip(root / "evil.zip", root / "out")
+        self.assertFalse((root / "outside.txt").exists())
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as t:
+            info = tarfile.TarInfo("../outside.txt")
+            info.size = 2
+            t.addfile(info, io.BytesIO(b"no"))
+        buf.seek(0)
+        with self.assertRaises(tarfile.TarError):  # a guest's archive cannot write outside the chosen folder
+            guestfiles.extract_tar(buf, root / "out")
+        self.assertFalse((root / "outside.txt").exists())
 

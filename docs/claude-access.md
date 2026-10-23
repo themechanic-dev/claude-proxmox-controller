@@ -104,6 +104,18 @@ Run commands inside VMs that have the QEMU guest agent.
 |---|---|
 | `run_command` | Run a program inside a running VM through the QEMU guest agent and get its output (for example ["systemctl", "status", "nginx"], or ["sh", "-c", "df -h"]). |
 
+## Files — default: Off
+
+Copy files between this computer and VMs or containers, and list their folders.
+
+*VMs — this app and Proxmox: lent to Claude's token only for a request the app allows: VM.GuestAgent.Unrestricted; only the app's own copy and listing commands run with it. Containers — this app only: over the app's SSH key, as host commands. Paths on the user's computer are shown whole in the approval window; nothing is replaced unless replace is asked.*
+
+| Tool | What it does |
+|---|---|
+| `list_guest_files` | The files and folders in a folder of a running VM (through its QEMU guest agent) or container (over the host's SSH): name, folder or not, size, modified. |
+| `send_files` | Copy files and folders of the user's computer (whole paths) into a folder of a running VM or container — names and times kept, folders whole. |
+| `receive_files` | Copy files and folders (names) from a folder of a running VM or container into a folder of the user's computer (a whole path that exists). |
+
 ## Host commands — default: Off
 
 Run commands on the host itself, as root, over the app's SSH key.

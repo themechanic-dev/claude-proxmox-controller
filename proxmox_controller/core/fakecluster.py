@@ -336,6 +336,8 @@ class FakeCluster:
         g = self._guest(kind, vmid)
         g["status"] = "running" if action in ("start", "reboot") else "stopped"
         self.pending_keys.pop(int(vmid), None)  # a stop or a restart applies what was waiting
+        if "agent_next" in g:
+            g["agent"] = g.pop("agent_next")
         return self._task(f"vz{action}" if kind == "lxc" else f"qm{action}", vmid)
 
     def guest_config(self, p, node, kind, vmid):
@@ -373,8 +375,11 @@ class FakeCluster:
             g.get("cfg", {}).pop(key, None)
             g.get("extra", {}).pop(key, None)
         for key, value in p.items():
-            if re.fullmatch(r"vga|audio\d|usb\d+|startup|tablet|hotplug", key):
-                was = vmhw.tablet_of(self.guest_config({}, node, kind, vmid)) if key == "tablet" else None
+            if re.fullmatch(r"vga|audio\d|usb\d+|startup|tablet|hotplug|ide\d|sata\d+|scsi\d+", key):
+                before = self.guest_config({}, node, kind, vmid)
+                was = vmhw.tablet_of(before) if key == "tablet" else None
+                if re.fullmatch(r"ide\d|sata\d+|scsi\d+", key) and key not in before and g["status"] == "running":
+                    self.pending_keys.setdefault(int(vmid), set()).add(key)  # a new drive: at the next start
                 (g["cfg"] if "cfg" in g else g.setdefault("extra", {}))[key] = value
                 if g["status"] == "running" and re.fullmatch(r"vga|audio\d", key):
                     self.pending_keys.setdefault(int(vmid), set()).add(key)  # display and sound wait for a restart
@@ -385,6 +390,13 @@ class FakeCluster:
         for key in ("cores", "memory", "swap", "onboot"):
             if key in p:
                 g[key] = int(p[key])
+        if "agent" in p:
+            on = 1 if str(p["agent"]).split(",")[0] in ("1", "enabled=1") else 0
+            if g["status"] == "running" and on != int(g.get("agent") or 0):
+                g["agent_next"] = on
+                self.pending_keys.setdefault(int(vmid), set()).add("agent")
+            else:
+                g["agent"] = on
         for key in ("description", "net0", "tags"):
             if key in p:
                 g[key] = p[key]
@@ -424,6 +436,8 @@ class FakeCluster:
             raise KeyError(vmid)
         if not g.get("agent"):
             raise RuntimeError("No QEMU guest agent configured")
+        if g.get("agent_down"):
+            raise RuntimeError("QEMU guest agent is not running")
         return {"result": [{"name": "lo", "ip-addresses": [{"ip-address": "127.0.0.1", "ip-address-type": "ipv4"}]},
                            {"name": "ens18", "ip-addresses": [{"ip-address": g["ip"], "ip-address-type": "ipv4"}]},
                            {"name": "docker0", "ip-addresses": [{"ip-address": "172.17.0.1",
@@ -435,6 +449,8 @@ class FakeCluster:
             raise RuntimeError(f"VM {vmid} not running")
         if not g.get("agent"):
             raise RuntimeError("No QEMU guest agent configured")
+        if g.get("agent_down"):
+            raise RuntimeError("QEMU guest agent is not running")
         command = p.get("command") or []
         command = [command] if isinstance(command, str) else [str(c) for c in command]
         if not command:
@@ -457,6 +473,14 @@ class FakeCluster:
         self.exec_runs[pid] = {"exited": 1, "exitcode": code, **({"out-data": out} if out else {}),
                                **({"err-data": err} if err else {})}
         return {"pid": pid}
+
+    def agent_ping(self, p, node, vmid):
+        """Answers when the agent is turned on, plugged in (the VM started with it) and running inside
+        (g["agent_down"]: installed or not, it does not answer)."""
+        g = self._guest("qemu", vmid)
+        if g["status"] != "running" or not g.get("agent") or g.get("agent_down"):
+            raise RuntimeError("QEMU guest agent is not running")
+        return {}
 
     def agent_exec_status(self, p, node, vmid):
         run = self.exec_runs.get(int(p.get("pid", 0)))
@@ -667,7 +691,8 @@ class FakeCluster:
         g = self._guest("qemu", vmid)
         cfg = self.guest_config({}, node, "qemu", vmid)
         waiting = self.pending_keys.get(int(vmid), set()) if g["status"] == "running" else set()
-        return [{"key": k, "value": v, **({"pending": v} if k in waiting else {})} for k, v in cfg.items()]
+        out = [{"key": k, "value": v, **({"pending": v} if k in waiting else {})} for k, v in cfg.items()]
+        return out + [{"key": k, "pending": str(g.get(f"{k}_next", 1))} for k in sorted(waiting) if k not in cfg]
 
     # -- backups ---------------------------------------------------------------------------------
 
@@ -1071,6 +1096,7 @@ ROUTES = [
     (("POST", rf"/nodes/{_N}/qemu/(\d+)/clone"), FakeCluster.clone),
     (("GET", rf"/nodes/{_N}/tasks/{_N}/status"), FakeCluster.task_status),
     (("POST", rf"/nodes/{_N}/qemu/(\d+)/agent/exec"), FakeCluster.agent_exec),
+    (("POST", rf"/nodes/{_N}/qemu/(\d+)/agent/ping"), FakeCluster.agent_ping),
     (("GET", rf"/nodes/{_N}/qemu/(\d+)/agent/exec-status"), FakeCluster.agent_exec_status),
     (("POST", r"/access/users"), FakeCluster.create_user),
     (("GET", r"/access/users"), FakeCluster.list_users),
@@ -1106,6 +1132,7 @@ REQUIRES = [
     (("GET", r"/nodes/[^/]+/qemu/\d+/agent/network-get-interfaces"), [("VM.GuestAgent.Audit",),
                                                                       ("VM.GuestAgent.Unrestricted",)]),
     (("POST", r"/nodes/[^/]+/qemu/\d+/agent/exec"), [("VM.GuestAgent.Unrestricted",)]),
+    (("POST", r"/nodes/[^/]+/qemu/\d+/agent/ping"), [("VM.GuestAgent.Audit",), ("VM.GuestAgent.Unrestricted",)]),
     (("GET", r"/nodes/[^/]+/qemu/\d+/agent/exec-status"), [("VM.GuestAgent.Unrestricted",)]),
     (("POST", _G + r"/snapshot"), [("VM.Snapshot",)]),
     (("POST", _G + r"/snapshot/[^/]+/rollback"), [("VM.Snapshot",), ("VM.Snapshot.Rollback",)]),

@@ -383,7 +383,8 @@ class HostView(QWidget):
         actions.setSpacing(6)
         self.act: dict[str, object] = {}
         for key, text in (("start", "Start"), ("shutdown", "Shut Down…"), ("stop", "Stop…"), ("reboot", "Reboot…"),
-                          ("console", "Console"), ("edit", "Edit…"), ("notes", "Notes…"), ("snapshots", "Snapshots…"),
+                          ("console", "Console"), ("files", "Files…"),
+                          ("edit", "Edit…"), ("notes", "Notes…"), ("snapshots", "Snapshots…"),
                           ("backups", "Backups…"),
                           ("graphs", "Graphs…"), ("delete", "Delete…")):
             if key == "console":  # a click opens the usual console; the arrow offers every kind
@@ -401,6 +402,8 @@ class HostView(QWidget):
             b.clicked.connect(lambda _=False, k=key: self.guest_action(k))
             actions.addWidget(b)
             self.act[key] = b
+        self.act["files"].setToolTip("Copy files and folders between this computer and the guest (a VM whose "
+                                     "guest agent does not answer: the app offers to install it)")
         self.act["console"].setFixedHeight(self.act["start"].sizeHint().height())  # a tool button is a bit taller
         self.console_btn.setFixedHeight(self.reboot_btn.sizeHint().height())
         self.jobs_btn.setFixedHeight(self.new_btn.sizeHint().height())
@@ -808,7 +811,8 @@ class HostView(QWidget):
             stopped = bool(g) and g.get("status") == "stopped"
             template = bool(g) and bool(g.get("template"))  # a template is copied, never started
             enabled = {"start": stopped and not template, "shutdown": running, "stop": running, "reboot": running,
-                       "console": running, "edit": bool(g), "notes": bool(g), "snapshots": bool(g) and not template,
+                       "console": running, "files": running,
+                       "edit": bool(g), "notes": bool(g), "snapshots": bool(g) and not template,
                        "backups": bool(g),
                        "graphs": bool(g),
                        "delete": stopped}
@@ -829,6 +833,8 @@ class HostView(QWidget):
             a = menu.addAction(b.text())
             a.setEnabled(b.isEnabled())
             a.triggered.connect(lambda _=False, k=key: self.guest_action(k))
+            if key == "files" and self._agent_missing(self.selected()):
+                menu.addAction("Install Guest Agent…").triggered.connect(lambda: self.guest_action("agent"))
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def guest_action(self, key: str) -> None:
@@ -858,6 +864,10 @@ class HostView(QWidget):
                            started=key in ("start", "reboot"))
         elif key == "console":
             self.open_console(g, self.prefs.get("console", "auto"))
+        elif key == "files":
+            self.open_files(g)
+        elif key == "agent":
+            self.install_agent(g)
         else:
             from . import guest_dialogs
             if key == "graphs":  # a window of its own, for any screen; it holds no reference to this page
@@ -1171,6 +1181,58 @@ class HostView(QWidget):
 
     def open_host_console(self) -> None:
         self._with_ssh(self._shell)
+
+    # -- files and the guest agent -------------------------------------------------------------------
+
+    def _agent_missing(self, g: dict | None) -> bool:
+        """A running VM whose QEMU guest agent does not answer (as the last look at its addresses found)."""
+        return (bool(g) and g["type"] == "qemu" and g.get("status") == "running" and g["vmid"] in self.details
+                and (self.details.get(g["vmid"]) or {}).get("source") != "guest")
+
+    def open_files(self, g: dict) -> None:
+        """Files…: this computer ↔ the guest — a VM through its guest agent (and the network), a container through the
+        host's SSH with the app's key. A VM whose agent does not answer is offered the agent first."""
+        from ..core import guestfiles
+        host = self.host
+        if self._agent_missing(g):
+            if confirm(self, "Install the guest agent?", f"VM {g['vmid']} ({g.get('name', '')}): its QEMU guest agent "
+                       "does not answer, and Files needs it. The app can install it through the VM's console.",
+                       "Install Guest Agent…"):
+                self.install_agent(g)
+            return
+        title = f"{'Container' if g['type'] == 'lxc' else 'VM'} {g['vmid']} ({g.get('name', '')})"
+        if g["type"] == "lxc":
+            def go():
+                from . import host_shell
+                s = host_shell.settings_of(host)
+                if not s.get("key"):
+                    error(self, "Files", "Copies to and from a container go over SSH with this app's key: turn on "
+                                         "'Use a key' in SSH Settings (the arrow beside Console, at the top).")
+                    return
+                port, user = int(s.get("port", 22)), str(s.get("user") or "root")
+                self._show_files(title, "Container · over the host's SSH",
+                                 lambda: guestfiles.ContainerFiles(host.hostname, port, user, g["vmid"]))
+            self._with_ssh(go)
+            return
+        client = self.client()
+
+        def make():
+            os_name = guestfiles.os_of(client.guest_config(g["node"], "qemu", g["vmid"]))
+            return guestfiles.VmFiles(client, g["node"], g["vmid"], os_name,
+                                      guestfiles.address_towards(host.hostname, host.port))
+        self._show_files(title, "", make)
+
+    def _show_files(self, title: str, subtitle: str, make) -> None:
+        from . import files_window
+        dlg = files_window.FilesWindow(self, title, subtitle, make, self.runner)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
+
+    def install_agent(self, g: dict) -> None:
+        from . import agent_setup
+        dlg = agent_setup.AgentSetupDialog(self, self.client, self.runner, g)
+        dlg.finished.connect(lambda *_: self._refresh_details(force=True))
+        dlg.show()
 
     def ssh_settings(self) -> None:
         from . import host_shell

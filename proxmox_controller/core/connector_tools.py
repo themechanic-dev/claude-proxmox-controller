@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import quote
 
-from . import claude_policy, screen, ssh, startup, tasks, vmhw, wol
+from . import claude_policy, guestfiles, screen, ssh, startup, tasks, vmhw, wol
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
 from .vmspec import PROFILES, VMNAME, iso_name_from_url, vm_params
@@ -1178,6 +1178,140 @@ def _exec(ctx: Context, a: dict):
         time.sleep(0.5)
 
 
+# -- Files ----------------------------------------------------------------------------------------
+
+def _files_of(ctx: Context, g: dict):
+    """The guest's side of a copy: a running VM whose agent answers (through it, Claude's token with Files lent), or
+    a running container (over the host's SSH with the app's key). ToolError before anything is done otherwise."""
+    if g.get("status") != "running":
+        raise ToolError(f"{what(g)} is not running.")
+    if g["type"] == "lxc":
+        address, port, user = _host_ssh(ctx)
+        return guestfiles.ContainerFiles(address, port, user, g["vmid"])
+    reader = ctx.admin or ctx.pve
+    if not reader.agent_ping(g["node"], g["vmid"]):
+        raise ToolError(f"The QEMU guest agent of {what(g)} does not answer: the user can install it with Install "
+                        "Guest Agent… in Proxmox Controller (on the VM's row). Nothing was done.")
+    os_name = guestfiles.os_of(reader.guest_config(g["node"], "qemu", g["vmid"]))
+    return guestfiles.VmFiles(ctx.pve, g["node"], g["vmid"], os_name,
+                              guestfiles.address_towards(ctx.host.hostname, ctx.host.port))
+
+
+def _local_paths(a: dict) -> list:
+    from pathlib import Path
+    paths = [Path(p).expanduser() for p in a["paths"]]
+    if not paths:
+        raise ToolError("paths: at least one file or folder of the user's computer.")
+    for p in paths:
+        if not p.is_absolute():
+            raise ToolError(f"{p}: give whole paths (from / or a drive letter).")
+        if not p.exists():
+            raise ToolError(f"{p}: there is no such file or folder on the user's computer.")
+    return paths
+
+
+def _local_folder(a: dict):
+    from pathlib import Path
+    to = Path(a["to"]).expanduser()
+    if not to.is_absolute() or not to.is_dir():
+        raise ToolError(f"{to}: give a folder of the user's computer that exists, as a whole path.")
+    clash = sorted(n for n in a["names"] if (to / n).exists())
+    if clash and not a.get("replace"):
+        raise ToolError(f"Already in {to}: {', '.join(clash)}. Nothing was copied; ask with replace: true to "
+                        "replace them.")
+    return to
+
+
+def _bad_names(names: list[str]) -> None:
+    for n in names:
+        if not n or "/" in n or "\\" in n or n in (".", ".."):
+            raise ToolError(f"names: '{n}' — names inside the folder, without slashes.")
+
+
+def _list_files_words(ctx: Context, a: dict):
+    g = ctx.guest(a["vmid"])
+    return f"List the folder {a.get('folder') or '(its home)'} of {what(g)}", []
+
+
+def _list_files(ctx: Context, a: dict):
+    g = ctx.guest(a["vmid"])
+    files = _files_of(ctx, g)
+    try:
+        folder, entries = files.list(a.get("folder") or files.home())
+    except guestfiles.GuestError as e:
+        raise ToolError(str(e)) from e
+    return {"guest": what(g), "folder": folder, "entries": [
+        {"name": e.name, "folder": e.is_dir, **({} if e.is_dir else {"size": e.size}),
+         "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(e.mtime)) if e.mtime else ""}
+        for e in entries]}
+
+
+def _send_files_words(ctx: Context, a: dict):
+    g = ctx.guest(a["vmid"])
+    paths = _local_paths(a)
+    size = guestfiles.total_size(paths)
+    return f"Copy {len(paths)} item{'s' if len(paths) != 1 else ''} from this computer into {what(g)}", [
+        *(f"{p}" for p in paths[:12]), *([f"… and {len(paths) - 12} more"] if len(paths) > 12 else []),
+        f"Into: {a['folder']}  ({_bytes(size)})",
+        "Replaces items of the same name there." if a.get("replace") else "Nothing there is replaced."]
+
+
+def _send_files(ctx: Context, a: dict):
+    g = ctx.guest(a["vmid"])
+    paths = _local_paths(a)
+    files = _files_of(ctx, g)
+    try:
+        folder, entries = files.list(a["folder"])
+        clash = sorted({p.name for p in paths} & {e.name for e in entries})
+        if clash and not a.get("replace"):
+            raise ToolError(f"Already in {folder}: {', '.join(clash)}. Nothing was copied; ask with replace: true to "
+                            "replace them.")
+        t0 = time.monotonic()
+        way = files.send(paths, folder, lambda *_: None, _never())
+    except guestfiles.GuestError as e:
+        raise ToolError(str(e)) from e
+    return {"guest": what(g), "sent": [p.name for p in paths], "into": folder, "bytes": guestfiles.total_size(paths),
+            "seconds": round(time.monotonic() - t0, 1), "way": way}
+
+
+def _receive_files_words(ctx: Context, a: dict):
+    g = ctx.guest(a["vmid"])
+    _bad_names(a["names"])
+    to = _local_folder(a)
+    names = a["names"]
+    return f"Copy {len(names)} item{'s' if len(names) != 1 else ''} from {what(g)} to this computer", [
+        f"From: {a['folder']}", *(f"• {n}" for n in names[:12]),
+        *([f"… and {len(names) - 12} more"] if len(names) > 12 else []), f"Into: {to}",
+        "Replaces items of the same name there." if a.get("replace") else "Nothing there is replaced."]
+
+
+def _receive_files(ctx: Context, a: dict):
+    g = ctx.guest(a["vmid"])
+    _bad_names(a["names"])
+    to = _local_folder(a)
+    files = _files_of(ctx, g)
+    try:
+        t0 = time.monotonic()
+        moved = [0]
+        way = files.receive(a["folder"], list(a["names"]), to, lambda done, *_: moved.__setitem__(0, done), _never())
+    except guestfiles.GuestError as e:
+        raise ToolError(str(e)) from e
+    return {"guest": what(g), "received": list(a["names"]), "into": str(to), "bytes": moved[0],
+            "seconds": round(time.monotonic() - t0, 1), "way": way}
+
+
+def _never():
+    import threading
+    return threading.Event()
+
+
+def _bytes(n: int) -> str:
+    for unit, step in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if n >= step:
+            return f"{n / step:.1f} {unit}"
+    return f"{n} B"
+
+
 def _host_ssh(ctx: Context) -> tuple[str, int, str]:
     """(address, port, user) for a command on the host — when the user set up SSH with the app's key for it and the
     host's key is still the one they confirmed. ToolError otherwise, before anything is asked or run."""
@@ -1434,6 +1568,25 @@ def _tools() -> list[Tool]:
              secret=lambda a: "The new password (it goes into both fields)" if a.get("confirm") or a.get("confirm_at")
              else "The password to type",
              secret_repeat=lambda a: bool(a.get("confirm") or a.get("confirm_at"))),
+        Tool("list_guest_files", "files", "The files and folders in a folder of a running VM (through its QEMU guest "
+             "agent) or container (over the host's SSH): name, folder or not, size, modified. Without folder: /home "
+             "on Linux, C:\\Users on Windows, /root in a container; on Windows an empty folder lists the drives.",
+             {**vm, "folder": {"type": "string"}}, ("host", "vmid"), _list_files, _list_files_words),
+        Tool("send_files", "files", "Copy files and folders of the user's computer (whole paths) into a folder of a "
+             "running VM or container — names and times kept, folders whole. Fast over the network when the guest "
+             "can reach the computer, otherwise through Proxmox (about 1 MB/s). What is there already is not "
+             "replaced unless replace is true. The user sees every path in the approval window.",
+             {**vm, "paths": {"type": "array", "items": {"type": "string"}},
+              "folder": {"type": "string", "description": "The guest's folder it goes into."},
+              "replace": {"type": "boolean"}}, ("host", "vmid", "paths", "folder"), _send_files, _send_files_words),
+        Tool("receive_files", "files", "Copy files and folders (names) from a folder of a running VM or container into "
+             "a folder of the user's computer (a whole path that exists). What is there already is not replaced "
+             "unless replace is true.",
+             {**vm, "folder": {"type": "string", "description": "The guest's folder they are in."},
+              "names": {"type": "array", "items": {"type": "string"}},
+              "to": {"type": "string", "description": "The folder of the user's computer they go into."},
+              "replace": {"type": "boolean"}}, ("host", "vmid", "folder", "names", "to"), _receive_files,
+             _receive_files_words),
         Tool("run_command", "commands", "Run a program inside a running VM through the QEMU guest agent and get its "
              "output (for example [\"systemctl\", \"status\", \"nginx\"], or [\"sh\", \"-c\", \"df -h\"]).",
              {**vm, "command": {"type": "array", "items": {"type": "string"}},
@@ -1491,6 +1644,11 @@ def access_table() -> list[dict]:
                         "(no 'Allow This Kind for 1 Hour', nor longer). The app's SSH key file itself is not encrypted: a program "
                         "running as you on this computer (Claude Code with a shell, too) could read it and use it "
                         "without asking — Off stops the connector, not that.")
+        elif key == "files":
+            enforced = ("VMs — this app and Proxmox: lent to Claude's token only for a request the app allows: "
+                        f"{', '.join(privs)}; only the app's own copy and listing commands run with it. Containers — "
+                        "this app only: over the app's SSH key, as host commands. Paths on the user's computer are "
+                        "shown whole in the approval window; nothing is replaced unless replace is asked.")
         elif key == "read":
             enforced = "This app and Proxmox: Claude's token holds these privileges while Read is On: " + ", ".join(privs)
         else:

@@ -4,9 +4,11 @@ Questions and warnings that would wait for a click are replaced by recorders. Ne
 import json
 import os
 import sys
+import shutil
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -26,10 +28,11 @@ if QApplication is not None:
     from proxmox_controller import app as app_module
     import threading
     from proxmox_controller.core import (claude_access, claude_policy, connector_link, connector_log, sounds,
-                                         ssh as ssh_core, vault)
+                                         screen as screen_core, ssh as ssh_core, vault)
     from proxmox_controller.ui import (backup_jobs, backups, bulk, claude_window, connector, console, geometry,
-                                       graph_wall, guest_dialogs, hazard, host_dialog, host_shell, host_view,
-                                       main_window, tasks_panel, theme, vault_dialogs, vm_dialog)
+                                       agent_setup, files_window, graph_wall, guest_dialogs, hazard, host_dialog,
+                                       host_shell, host_view, main_window, tasks_panel, theme, vault_dialogs,
+                                       vm_dialog)
     from proxmox_controller.ui.chart import nice_ticks
     from proxmox_controller.ui.host_dialog import HostDialog
     from proxmox_controller.ui.host_view import HostView
@@ -90,6 +93,8 @@ class UiCase(unittest.TestCase):
         self.patches.append(mock.patch.object(tasks_panel, "confirm", confirm))
         self.patches.append(mock.patch.object(vault_dialogs, "confirm", confirm))
         self.patches.append(mock.patch.object(claude_window, "confirm", confirm))
+        self.patches += [mock.patch.object(files_window, "confirm", confirm), mock.patch.object(files_window, "error", error),
+                         mock.patch.object(agent_setup, "error", error)]
         self.patches.append(mock.patch.object(claude_window, "error", error))
         self.patches += [mock.patch.object(m, "error", error) for m in (bulk, tasks_panel)]
         self.infos = []
@@ -232,8 +237,8 @@ class HostViewTest(UiCase):
         enabled = lambda: {k for k, b in view.act.items() if b.isEnabled()}  # noqa: E731
         self.assertEqual(enabled(), set())  # nothing selected
         self.select(view, 100)  # running container
-        self.assertEqual(enabled(), {"shutdown", "stop", "reboot", "console", "edit", "notes", "snapshots", "backups",
-                                     "graphs"})
+        self.assertEqual(enabled(), {"shutdown", "stop", "reboot", "console", "files", "edit", "notes", "snapshots",
+                                     "backups", "graphs"})
         self.select(view, 102)  # stopped container
         self.assertEqual(enabled(), {"start", "edit", "notes", "snapshots", "backups", "graphs", "delete"})
         self.select(view, 200)  # stopped VM: deleted the same way as a container
@@ -262,7 +267,9 @@ class HostViewTest(UiCase):
         self.addCleanup(view.close)
         QTest.qWait(30)
         hdr = view.table.horizontalHeader()
-        natural = hdr.sectionSize(host_view.COL_NAME)
+        view.resize(1700, 760)
+        QTest.qWait(30)
+        natural = hdr.sectionSize(host_view.COL_NAME)  # (wide: as much as it wants)
         for width in (850, 1700, 1250):
             view.resize(width, 760)
             QTest.qWait(30)
@@ -424,6 +431,238 @@ class HostViewTest(UiCase):
         self.assertEqual(self.asked, ["Shut down the host?"])
         QTest.qWait(200)
         self.assertEqual(self.notes, [])
+
+
+class FakeGuestSide:
+    """The guest's side of Files (core/guestfiles), in memory: what it was asked, and a gate to hold a copy."""
+
+    os_name = "linux"
+
+    def __init__(self):
+        from proxmox_controller.core.guestfiles import Entry
+        self.Entry = Entry
+        self.entries = [Entry("old.txt", False, 5, 0), Entry("docs", True, 0, 0)]
+        self.calls, self.gate, self.fail = [], threading.Event(), None
+        self.gate.set()
+
+    def home(self):
+        return "/home/user"
+
+    def list(self, folder):
+        if self.fail:
+            raise self.fail
+        return folder, list(self.entries)
+
+    def send(self, paths, dest, progress, cancel):
+        from proxmox_controller.core.guestfiles import Cancelled
+        self.calls.append(("send", [p.name for p in paths], dest))
+        for i in range(5):
+            while not self.gate.is_set():
+                if cancel.is_set():
+                    raise Cancelled()
+                time.sleep(0.01)
+            progress((i + 1) * 100, 500, "network")
+        self.entries.append(self.Entry(paths[0].name, False, 1, 0))
+        return "network"
+
+    def receive(self, folder, names, dest, progress, cancel, total=None):
+        self.calls.append(("receive", folder, list(names), str(dest)))
+        (dest / names[0]).write_text("from the guest")
+        progress(14, total, "proxmox")
+        return "proxmox"
+
+
+class FilesWindowTest(UiCase):
+    def setUp(self):
+        super().setUp()
+        self.local = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.local, True)
+        (self.local / "new.txt").write_text("new")
+        (self.local / "old.txt").write_text("old")
+        self.side = FakeGuestSide()
+        self.dlg = files_window.FilesWindow(None, "VM 201 (ubuntu)", "", lambda: self.side, self.runner,
+                                            local_start=self.local)
+        self.assertTrue(wait_until(lambda: self.dlg.remote.folder == "/home/user"))
+
+    def tearDown(self):
+        self.side.gate.set()
+        self.dlg.close()  # (before the patches stop: a copy still going asks first)
+        super().tearDown()
+
+    def choose(self, pane, name):
+        pane.tree.clearSelection()
+        for i in range(pane.tree.topLevelItemCount()):
+            item = pane.tree.topLevelItem(i)
+            if item.data(0, Qt.ItemDataRole.UserRole) == name:
+                item.setSelected(True)
+
+    def test_send_and_receive(self):
+        dlg = self.dlg
+        self.assertEqual(dlg.remote.subtitle.text(), "Linux · as root")
+        self.assertEqual([e.name for e in dlg.local.entries], ["new.txt", "old.txt"])
+        self.assertEqual([e.name for e in dlg.remote.entries], ["old.txt", "docs"])
+        self.choose(dlg.local, "new.txt")
+        dlg.send_btn.click()
+        self.assertTrue(wait_until(lambda: dlg.result.text().startswith("Done")))
+        self.assertEqual(self.side.calls[-1], ("send", ["new.txt"], "/home/user"))
+        self.assertIn("over the network", dlg.result.text())
+        self.assertTrue(wait_until(lambda: "new.txt" in [e.name for e in dlg.remote.entries]))  # read again
+        self.assertFalse(dlg.progress_card.isVisibleTo(dlg))
+        self.choose(dlg.local, "old.txt")
+        self.answer = False
+        dlg.send_btn.click()  # already there: asked first, and not sent
+        self.assertEqual(self.asked[-1], "Replace?")
+        self.assertEqual(len(self.side.calls), 1)
+        self.answer = True
+        self.choose(dlg.remote, "old.txt")
+        dlg.receive_btn.click()  # here too: replaced once asked
+        self.assertTrue(wait_until(lambda: dlg.result.text().startswith("Done")))
+        self.assertEqual(self.side.calls[-1], ("receive", "/home/user", ["old.txt"], str(self.local)))
+        self.assertEqual((self.local / "old.txt").read_text(), "from the guest")
+        self.assertIn("through Proxmox (slow)", dlg.result.text())
+        self.assertTrue(wait_until(lambda: dlg.cancel is None))
+        dlg.remote.tree.clearSelection()
+        dlg.receive_btn.click()
+        self.assertEqual(self.errors[-1], ("Receive", "Choose what to receive on the right first."))
+
+    def test_drag_from_one_side_to_the_other(self):
+        dlg = self.dlg
+        self.choose(dlg.local, "new.txt")
+        dlg.remote.tree.dropped.emit("local", [])  # dropped on the guest's side: Send
+        self.assertTrue(wait_until(lambda: self.side.calls and self.side.calls[-1][0] == "send"))
+        self.assertTrue(wait_until(lambda: dlg.cancel is None))
+        dlg.remote.tree.dropped.emit("desktop", [str(self.local / "old.txt")])  # from the desktop's file manager
+        self.assertTrue(wait_until(lambda: len(self.side.calls) == 2))
+        self.assertEqual(self.side.calls[-1], ("send", ["old.txt"], "/home/user"))
+        self.assertEqual(self.asked[-1], "Replace?")
+        self.assertTrue(wait_until(lambda: dlg.cancel is None))
+        self.choose(dlg.remote, "old.txt")
+        dlg.local.tree.dropped.emit("remote", [])  # dropped on this computer's side: Receive
+        self.assertTrue(wait_until(lambda: self.side.calls[-1][0] == "receive"))
+        mime = dlg.local.tree.mimeData([])
+        self.assertEqual(bytes(mime.data(files_window.MIME)).decode(), "local")
+
+    def test_progress_cancel_and_folders(self):
+        dlg = self.dlg
+        self.side.gate.clear()
+        self.choose(dlg.local, "new.txt")
+        dlg.send_btn.click()
+        self.assertTrue(wait_until(lambda: dlg.progress_card.isVisibleTo(dlg) and dlg.stop_btn.isEnabled()))
+        self.assertFalse(dlg.send_btn.isEnabled())  # one copy at a time
+        dlg.stop_btn.click()
+        self.assertTrue(wait_until(lambda: dlg.result.text() == "Cancelled."))
+        self.side.gate.set()
+        self.side.calls.clear()
+        dlg.remote.tree.itemDoubleClicked.emit(dlg.remote.tree.topLevelItem(1), 0)  # docs: opened
+        self.assertTrue(wait_until(lambda: dlg.remote.folder == "/home/user/docs"))
+        dlg.remote.up.click()
+        self.assertTrue(wait_until(lambda: dlg.remote.folder == "/home/user"))
+        self.side.fail = files_window.GuestError("No such folder")
+        dlg.go_remote("/nope")
+        self.assertTrue(wait_until(lambda: self.errors))
+        self.assertEqual(self.errors[-1], ("Files", "No such folder"))
+        self.assertEqual(files_window.file_size(1536), "1.5 KiB")
+        self.assertEqual(files_window.file_size(500), "500 B")
+
+
+class AgentSetupTest(UiCase):
+    """Install Guest Agent, on the pretend cluster: what is turned on, what is typed into the console, the password
+    and Windows' Yes passed from the window, the restart, and the wait for the agent."""
+
+    def client(self):
+        return DemoPve(DEMO_HOSTS[0])
+
+    def guest(self, vmid):
+        return next(g for g in self.client().guests() if g["vmid"] == vmid)
+
+    def setUp(self):
+        super().setUp()
+        self.client()
+        for patch in (mock.patch.object(agent_setup, "POLL_S", 0.05), mock.patch.object(screen_core, "KEY_GAP_S", 0.0)):
+            patch.start()  # (typing a whole command key by key takes seconds on a real console)
+            self.addCleanup(patch.stop)
+
+    def cluster(self):
+        return DemoPve._clusters["demo-pve"]
+
+    def typed(self):
+        """Everything typed into any of the VM's consoles, as text (keys pressed down)."""
+        out = []
+        for server in self.cluster().consoles:
+            for k in server.keys:
+                if k[1]:
+                    out.append(chr(k[2]) if k[2] < 0x10000 and k[2] < 0xFF00 else f"<{k[2]:x}>")
+        return "".join(out)
+
+    def test_linux_with_the_agent_on_but_silent(self):
+        self.cluster().guests[201]["agent_down"] = True
+        dlg = agent_setup.AgentSetupDialog(None, self.client, self.runner, self.guest(201))
+        self.addCleanup(dlg.close)
+        self.assertTrue(wait_until(lambda: dlg.install_btn.isEnabled()))
+        self.assertTrue(dlg.steps[0].text().startswith("—"))  # already on
+        dlg.install_btn.click()
+        self.assertTrue(wait_until(lambda: dlg.password.isVisibleTo(dlg)))
+        self.assertIn("apt-get install -y qemu-guest-agent", self.typed())
+        self.assertFalse(dlg.restart_btn.isVisibleTo(dlg))  # it was on: no restart needed
+        dlg.password.setText("pw1")
+        dlg.type_password.click()
+        self.assertTrue(wait_until(lambda: self.typed().endswith("pw1<ff0d>")))
+        self.assertEqual(dlg.password.text(), "")  # not kept
+        self.cluster().guests[201]["agent_down"] = False
+        self.assertTrue(wait_until(lambda: dlg.status.text().startswith("✓"), 10))
+        self.assertTrue(all(s.text()[0] in "✓—" for s in dlg.steps))
+
+    def test_linux_with_the_agent_off_restarts_once(self):
+        self.cluster().guests[201]["agent"] = 0
+        dlg = agent_setup.AgentSetupDialog(None, self.client, self.runner, self.guest(201))
+        self.addCleanup(dlg.close)
+        self.assertTrue(wait_until(lambda: dlg.install_btn.isEnabled()))
+        dlg.install_btn.click()
+        self.assertTrue(wait_until(lambda: dlg.restart_btn.isVisibleTo(dlg)))
+        self.assertIn("at the next start", dlg.steps[0].text())
+        self.assertEqual(self.cluster().guests[201].get("agent_next"), 1)  # turned on, waiting for the restart
+        dlg.restart_btn.click()
+        self.assertTrue(wait_until(lambda: dlg.status.text().startswith("✓"), 10))
+        self.assertEqual(self.cluster().guests[201]["agent"], 1)
+
+    def test_windows_puts_the_drivers_disc_in_and_presses_yes(self):
+        g = self.cluster().guests[200]
+        g.update(status="running", agent=1, agent_down=True)
+        g.setdefault("extra", {}).update(ostype="win11", ide2="local:iso/ubuntu-24.04.1-live-server-amd64.iso,media=cdrom")
+        dlg = agent_setup.AgentSetupDialog(None, self.client, self.runner, self.guest(200))
+        self.addCleanup(dlg.close)
+        self.assertTrue(wait_until(lambda: dlg.install_btn.isEnabled()))
+        self.assertIn("Windows", dlg.who.text())
+        dlg.install_btn.click()
+        self.assertTrue(wait_until(lambda: dlg.yes_btn.isVisibleTo(dlg), 15))
+        self.assertIn("local:iso/virtio-win.iso", self.cluster().isos)  # downloaded onto the host
+        self.assertEqual(g["extra"]["ide2"], "local:iso/virtio-win.iso,media=cdrom")  # in the existing drive, at once
+        self.assertIn("virtio-win-guest-tools.exe", self.typed())
+        before = len(self.typed())
+        dlg.yes_btn.click()
+        self.assertTrue(wait_until(lambda: len(self.typed()) > before))
+        self.assertIn("y", self.typed()[before:])  # Alt+Y
+        g["agent_down"] = False
+        self.assertTrue(wait_until(lambda: dlg.status.text().startswith("✓"), 10))
+
+    def test_nothing_to_do_when_it_answers(self):
+        dlg = agent_setup.AgentSetupDialog(None, self.client, self.runner, self.guest(201))
+        self.addCleanup(dlg.close)
+        self.assertTrue(wait_until(lambda: dlg.status.text().startswith("✓")))
+        self.assertFalse(dlg.install_btn.isEnabled())
+
+    def test_files_offers_the_agent_when_it_is_silent(self):
+        self.cluster().guests[201]["agent_down"] = True
+        view = self.loaded_view()
+        self.addCleanup(view.close)
+        self.assertTrue(wait_until(lambda: 201 in view.details))
+        self.assertTrue(view._agent_missing(self.guest(201)))
+        self.assertFalse(view._agent_missing(self.guest(100)))  # a container: no agent to miss
+        opened = []
+        with mock.patch.object(agent_setup, "AgentSetupDialog", lambda *a: opened.append(a[3]["vmid"]) or mock.Mock()):
+            self.answer = True
+            view.open_files(self.guest(201))
+        self.assertEqual((self.asked[-1], opened), ("Install the guest agent?", [201]))
 
 
 class GuestDialogsTest(UiCase):

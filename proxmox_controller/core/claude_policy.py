@@ -1,4 +1,4 @@
-"""What Claude may do through the connector: eight kinds of request, each Off, Ask or On, per host, under one
+"""What Claude may do through the connector: nine kinds of request, each Off, Ask or On, per host, under one
 switch for all. The Proxmox privileges of Claude's own token follow the same switches (core/claude_access.py), so a
 kind that is Off is refused by Proxmox too — not only by this app. Host commands are the exception: they go over
 SSH with the app's key, not through the API, so only this app refuses them.
@@ -22,6 +22,7 @@ CATEGORIES = (  # (each description fits one line beside its switch; Help has th
     ("host", "Host", "Shut down or reboot the host itself", OFF),
     ("console", "Console", "See a guest's screen, type into it and click on it", OFF),
     ("commands", "Commands", "Run commands inside VMs that have the QEMU guest agent", OFF),
+    ("files", "Files", "Copy files between this computer and VMs or containers, and list their folders", OFF),
     ("host_commands", "Host commands", "Run commands on the host itself, as root, over the app's SSH key", OFF),
 )
 KEYS = tuple(c[0] for c in CATEGORIES)
@@ -40,6 +41,9 @@ PRIVILEGES = {
     "host": ("Sys.PowerMgmt",),
     "console": ("VM.Console",),
     "commands": ("VM.GuestAgent.Unrestricted",),
+    # VMs: the agent's exec and file calls (Unrestricted covers both); only the app's own copy commands run.
+    # Containers go over the app's SSH key, as host commands do.
+    "files": ("VM.GuestAgent.Unrestricted",),
     "host_commands": (),  # over SSH with the app's key: no API privilege to lend (and none Proxmox could refuse)
 }
 NOT_HOUR = ("host_commands",)  # each one seen: no "Allow this kind for 1 hour" (the user's rule for the host)
