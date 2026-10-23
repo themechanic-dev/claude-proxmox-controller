@@ -1,6 +1,7 @@
 """A VM's display, sound card and USB devices in Proxmox's own config format, read and written in one place.
 
     vga: qxl                                   the display (qxl = SPICE)
+    tablet: 1                                  the USB tablet: an absolute pointer (clicks land where they are sent)
     audio0: device=ich9-intel-hda,driver=spice  the sound card and where its sound goes
     usb0: host=0781:5581,usb3=1                 a USB device of the host, by vendor:product (any port)
     usb1: spice                                 a slot for a USB device of the viewing computer, through SPICE
@@ -16,6 +17,10 @@ SOUND_CARDS = (("ich9-intel-hda", "Intel HD Audio (ich9)"), ("intel-hda", "Intel
 SOUND_OUTPUTS = (("spice", "SPICE"), ("none", "None (silent)"))
 SPICE_USB_PORTS = 2      # devices of this computer that can be handed to the VM at the same time
 USB_SLOTS_OLD, USB_SLOTS = 5, 14  # Proxmox 7 allows usb0–usb4; 8 and newer usb0–usb13
+# Proxmox leaves the USB tablet out with these displays unless the VM sets it (QemuServer.pm: "disable for spice because
+# it is not needed" — it is, for a VNC console: without it the guest has only a relative mouse, and a click sent to a
+# point lands wherever the pointer already is; Windows has no other absolute mouse, Linux has QEMU's vmmouse)
+TABLET_OFF_WITH = re.compile(r"qxl[234]?|serial\d+")
 _USB_KEY = re.compile(r"usb(\d+)$")
 
 
@@ -34,6 +39,14 @@ def options(text: str) -> dict:
 def display_of(cfg: dict) -> str:
     vga = options(str(cfg.get("vga", "")))
     return vga.get("type", "std") or "std"
+
+
+def tablet_of(cfg: dict, display: str | None = None) -> bool:
+    """Whether the VM gets the USB tablet: its own setting, or else Proxmox's default for the display (`display`: the
+    one it will have, if that is changing)."""
+    if "tablet" in cfg:
+        return str(cfg["tablet"]).strip().lower() not in ("0", "", "false", "no", "off")
+    return not TABLET_OFF_WITH.fullmatch(display if display is not None else display_of(cfg))
 
 
 def sound_of(cfg: dict) -> tuple[str, str] | None:

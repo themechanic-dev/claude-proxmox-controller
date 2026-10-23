@@ -475,6 +475,41 @@ class GuestDialogsTest(UiCase):
         self.usb_items(again.hw)["046d:c52b"].setCheckState(Qt.CheckState.Unchecked)
         self.assertEqual(again.changes(), {"delete": "audio0,usb0"})
 
+    def test_edit_vm_usb_tablet(self):
+        """The Pointer row: the tablet as the VM has it (Proxmox's default where it is not set — off with SPICE), and
+        set outright when the display changes to SPICE, which would drop it."""
+        dlg = guest_dialogs.EditGuestDialog(None, self.client, self.runner, self.guest(201))  # running, SPICE, unset
+        self.assertTrue(wait_until(lambda: dlg.isEnabled() and dlg.original))
+        self.assertTrue(dlg.hw.form.isRowVisible(dlg.hw.tablet))
+        self.assertFalse(dlg.hw.tablet.isChecked())
+        self.assertEqual(dlg.changes(), {})
+        dlg.hw.tablet.setChecked(True)
+        self.assertEqual(dlg.changes(), {"tablet": 1})
+        dlg.save()
+        self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
+        self.assertEqual(self.cluster().guests[201]["extra"]["tablet"], "1")
+        self.assertEqual(self.infos, [])  # plugged in at once (USB hotplug): nothing waits for a restart
+        self.assertEqual(self.client().monitor("pve", 201, "info mice").splitlines()[-1],
+                         "* Mouse #2: QEMU HID Tablet (absolute)")
+
+        self.cluster().guests[200]["spice"] = False  # the default display: Proxmox's tablet is on
+        sw = guest_dialogs.EditGuestDialog(None, self.client, self.runner, self.guest(200))
+        self.assertTrue(wait_until(lambda: sw.isEnabled() and sw.original))
+        self.assertTrue(sw.hw.tablet.isChecked())
+        sw.hw.display.setCurrentIndex(sw.hw.display.findData("qxl"))
+        self.assertEqual(sw.changes(), {"vga": "qxl", "tablet": 1})  # kept through the change to SPICE
+        sw.hw.tablet.setChecked(False)
+        self.assertEqual(sw.changes(), {"vga": "qxl"})  # (SPICE leaves it out anyway)
+        sw.reject()
+
+        self.cluster().guests[201]["extra"]["tablet"] = "0"  # set off outright: left as it is
+        off = guest_dialogs.EditGuestDialog(None, self.client, self.runner, self.guest(201))
+        self.assertTrue(wait_until(lambda: off.isEnabled() and off.original))
+        self.assertFalse(off.hw.tablet.isChecked())
+        off.hw.display.setCurrentIndex(off.hw.display.findData("std"))
+        self.assertEqual(off.changes(), {"delete": "vga"})
+        off.reject()
+
     def test_edit_vm_unplugged_device_and_limit(self):
         self.client()
         self.cluster().guests[200]["extra"] = {"usb0": "host=1234:abcd"}  # set up, but not plugged in now
@@ -879,6 +914,8 @@ class VmDialogTest(UiCase):
         self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
         cfg = self.cluster().guests[103]["cfg"]
         self.assertEqual((cfg["vga"], cfg["audio0"]), ("qxl", "device=ich9-intel-hda,driver=spice"))
+        self.assertTrue(hw.tablet.isChecked())
+        self.assertEqual(cfg["tablet"], "1")  # Proxmox leaves the tablet out with SPICE unless it is set
         self.assertEqual((cfg["usb0"], cfg["usb1"], cfg["usb2"]), ("host=0781:5581,usb3=1", "spice", "spice"))
         hw.display.setCurrentIndex(hw.display.findData("std"))  # SPICE USB needs the SPICE display
         self.assertFalse(hw.spice_usb.isEnabled())

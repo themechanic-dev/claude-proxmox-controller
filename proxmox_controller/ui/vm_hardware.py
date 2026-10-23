@@ -1,4 +1,4 @@
-"""A VM's display, sound card and USB devices as rows of a form — the same rows in New VM and in Edit."""
+"""A VM's display, pointer, sound card and USB devices as rows of a form — the same rows in New VM and in Edit."""
 
 from __future__ import annotations
 
@@ -23,6 +23,11 @@ class HardwareFields:
         self.display = QComboBox()
         for key, text in vmhw.DISPLAYS:
             self.display.addItem(text, key)
+        self.tablet = QCheckBox("USB tablet: the pointer lands exactly where you point")
+        self.tablet.setToolTip("An absolute pointer, for this app's console and for Claude's clicks. Without it the "
+                               "guest has only a relative mouse: Windows then puts a click wherever its pointer "
+                               "already is. Proxmox leaves the tablet out with the SPICE display unless it is set "
+                               "here.")
         self.sound = QComboBox()
         self.sound.addItem("None", "")
         for key, text in vmhw.SOUND_CARDS:
@@ -51,6 +56,7 @@ class HardwareFields:
         ubox.addWidget(self.spice_usb)
         self.hint = label("", "caption", wrap=True)
         form.addRow("Display", self.display)
+        form.addRow("Pointer", self.tablet)
         form.addRow("Sound", self.sound_box)
         form.addRow("", self.hint)
         form.addRow("USB devices", self.usb_box)
@@ -62,7 +68,7 @@ class HardwareFields:
 
     def set_visible(self, on: bool) -> None:
         self.shown = on
-        for field in (self.display, self.sound_box, self.usb_box):
+        for field in (self.display, self.tablet, self.sound_box, self.usb_box):
             self.form.setRowVisible(field, on)
         self._update()
 
@@ -78,8 +84,10 @@ class HardwareFields:
         self.spice_usb.setEnabled(spice)
 
     def set_defaults(self) -> None:
-        """A new VM: the SPICE display and an Intel HD Audio card that plays through SPICE."""
+        """A new VM: the SPICE display (with the USB tablet: Proxmox would leave it out) and an Intel HD Audio card
+        that plays through SPICE."""
         self.display.setCurrentIndex(self.display.findData("qxl"))
+        self.tablet.setChecked(True)
         self.sound.setCurrentIndex(self.sound.findData("ich9-intel-hda"))
         self.output.setCurrentIndex(self.output.findData("spice"))
 
@@ -114,6 +122,7 @@ class HardwareFields:
         if self.display.findData(display) < 0:  # something this app does not offer, such as cirrus
             self.display.addItem(f"{display} (as set now)", display)
         self.display.setCurrentIndex(self.display.findData(display))
+        self.tablet.setChecked(vmhw.tablet_of(cfg))  # as the VM has it now — Proxmox's default where it is not set
         sound = vmhw.sound_of(cfg)
         self.sound.setCurrentIndex(max(0, self.sound.findData(sound[0])) if sound else 0)
         if sound:
@@ -142,6 +151,7 @@ class HardwareFields:
         out: dict = {}
         if self.display.currentData() != "std":
             out["vga"] = self.display.currentData()
+        out["tablet"] = 1 if self.tablet.isChecked() else 0  # said outright: it then outlives a change of display
         if self.sound.currentData():
             out["audio0"] = vmhw.sound_value(self.sound.currentData(), self.output.currentData())
         for n, value in enumerate(self._wanted_usb()):
@@ -154,6 +164,8 @@ class HardwareFields:
         display = self.display.currentData()
         if display != vmhw.display_of(cfg):
             parts.append({"vga": display} if display != "std" else {"delete": "vga"})
+        if self.tablet.isChecked() != vmhw.tablet_of(cfg, display):  # with the display it will have: SPICE drops it
+            parts.append({"tablet": 1 if self.tablet.isChecked() else 0})
         sound = (self.sound.currentData(), self.output.currentData()) if self.sound.currentData() else None
         if sound != vmhw.sound_of(cfg):
             parts.append({"audio0": vmhw.sound_value(*sound)} if sound else {"delete": "audio0"})

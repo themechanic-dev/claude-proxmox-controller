@@ -441,6 +441,11 @@ class Pve:
         from .vmhw import is_hub
         return [d for d in (self.get(f"/nodes/{q(node)}/hardware/usb") or []) if not is_hub(d)]
 
+    def monitor(self, node: str, vmid: int, command: str) -> str:
+        """A QEMU monitor command's answer, for a reading such as 'info mice'. Proxmox 9 lets 'info' through with
+        Sys.Audit; other commands need more."""
+        return str(self.post(f"/nodes/{q(node)}/qemu/{int(vmid)}/monitor", command=command) or "")
+
     def pending(self, node: str, vmid: int) -> list[str]:
         """Settings of a running VM that change only at its next start."""
         items = self.get(f"/nodes/{q(node)}/qemu/{int(vmid)}/pending") or []

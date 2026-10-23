@@ -285,7 +285,8 @@ class EditGuestDialog(_GuestDialog):
 
         self.run_task(apply, self._saved, "Saving")
 
-    PENDING_NAMES = {"vga": "Display", "audio0": "Sound", "cores": "CPU cores", "memory": "Memory"}
+    PENDING_NAMES = {"vga": "Display", "audio0": "Sound", "cores": "CPU cores", "memory": "Memory",
+                     "tablet": "USB tablet"}
 
     def _saved(self) -> None:
         if self.pending_after:

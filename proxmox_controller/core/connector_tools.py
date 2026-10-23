@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import quote
 
-from . import claude_policy, screen, ssh, startup, tasks, wol
+from . import claude_policy, screen, ssh, startup, tasks, vmhw, wol
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
 from .vmspec import PROFILES, VMNAME, iso_name_from_url, vm_params
@@ -97,6 +97,7 @@ class Context:
     kinds: frozenset = frozenset(("read", "power", "change", "destroy", "host", "console", "commands"))  # not Off
     showing: bool = False          # the request goes to the user's window: its words may bring a picture
     _guests: list | None = field(default=None, repr=False)
+    pointers: dict = field(default_factory=dict, repr=False)  # vmid → (state, mouse), read once a request
 
     def guests(self) -> list[dict]:
         if self._guests is None:
@@ -403,6 +404,9 @@ EDITABLE = {
                            "description": "Seconds it may take to shut down when the host does; 0 = default."},
     "tags": {"type": "array", "items": {"type": "string"}, "description": "Proxmox tags (replaces them)."},
     "notes": {"type": "string", "description": "The guest's notes (Markdown; replaces them)."},
+    "tablet": {"type": "boolean", "description": "VMs: the USB tablet, an absolute pointer — console_click needs it "
+               "(Windows has no other). The SPICE display leaves it out unless it is set. Plugged in at once where "
+               "USB hotplug is on, otherwise at the next start."},
 }
 
 
@@ -438,11 +442,17 @@ def _edit_changes(g: dict, cfg: dict, ch: dict) -> dict:
         out["tags"] = ";".join(ch["tags"])
     if "notes" in ch:
         out["description"] = ch["notes"]
-    return {k: v for k, v in out.items() if k == "delete" or str(cfg.get(k, "")) != str(v)}
+    if "tablet" in ch:
+        if g["type"] != "qemu":
+            raise ToolError("tablet is for VMs.")
+        if vmhw.tablet_of(cfg) != ch["tablet"]:  # what it has now: its own setting or Proxmox's default for the display
+            out["tablet"] = 1 if ch["tablet"] else 0
+    return {k: v for k, v in out.items() if k in ("delete", "tablet") or str(cfg.get(k, "")) != str(v)}
 
 
 LABELS = {"cores": "CPU cores", "memory": "Memory (MiB)", "swap": "Swap (MiB)", "name": "Name", "hostname": "Hostname",
-          "onboot": "Start at boot", "startup": "Boot order", "tags": "Tags", "description": "Notes"}
+          "onboot": "Start at boot", "startup": "Boot order", "tags": "Tags", "description": "Notes",
+          "tablet": "USB tablet"}
 
 
 def _edit_words(ctx: Context, a: dict):
@@ -455,10 +465,15 @@ def _edit_words(ctx: Context, a: dict):
             lines.append(f"Remove: {v}")
         elif k == "description":
             lines.append(f"Notes: {len(str(cfg.get(k, '')))} → {len(str(v))} characters")
+        elif k == "tablet":
+            lines.append(f"USB tablet: {'on' if vmhw.tablet_of(cfg) else 'off'} → {'on' if v else 'off'}")
         else:
             lines.append(f"{LABELS.get(k, k)}: {cfg.get(k, '—')} → {v}")
     if g.get("status") == "running" and any(k in changes for k in ("cores", "memory")) and g["type"] == "qemu":
         lines.append("Running VM: CPU and memory changes may wait for its next start.")
+    if g.get("status") == "running" and "tablet" in changes:
+        lines.append("Running VM: the tablet is plugged in at once where USB hotplug is on, otherwise at its next "
+                     "start.")
     return f"Edit {what(g)}", lines or ["Nothing would change."]
 
 
@@ -469,7 +484,16 @@ def _edit(ctx: Context, a: dict):
     if not changes:
         return {"guest": what(g), "changed": [], "note": "Nothing differed from the current settings."}
     ctx.pve.update_config(g["node"], g["type"], g["vmid"], changes)
-    return {"guest": what(g), "changed": sorted(changes)}
+    out = {"guest": what(g), "changed": sorted(changes)}
+    if "tablet" in changes and g.get("status") == "running":
+        try:
+            later = "tablet" in (ctx.admin or ctx.pve).pending(g["node"], g["vmid"])
+        except PveError:
+            later = None
+        out["tablet"] = ("waits for the VM's next start (USB hotplug is off for it): reboot it from Proxmox — a "
+                         "restart inside the guest is not enough" if later else
+                         "plugged in now" if later is False else "set; whether it is in already could not be read")
+    return out
 
 
 def _grow_words(ctx: Context, a: dict):
@@ -547,7 +571,9 @@ def _vm_params(ctx: Context, a: dict) -> tuple[str, dict]:
                   host_cpu=bool(a.get("host_cpu")), memory=a.get("memory_mib", prof["memory"]),
                   disk_gb=a.get("disk_gb", prof["disk"]), storage=storage, bridge=a.get("bridge", "vmbr0"),
                   agent=a.get("guest_agent", True), onboot=bool(a.get("start_at_boot")), start=_start(ctx, a))
-    p.update(vga="qxl", audio0="device=ich9-intel-hda,driver=spice")  # as the New VM window: SPICE display and sound
+    # as the New VM window: SPICE display and sound — and the USB tablet, which Proxmox leaves out with SPICE (without
+    # it a click from console_click lands wherever the pointer already is)
+    p.update(vga="qxl", audio0="device=ich9-intel-hda,driver=spice", tablet=1)
     return node, p
 
 
@@ -662,7 +688,7 @@ def _cloud_vm_params(ctx: Context, a: dict) -> tuple[str, dict, int]:
          "agent": "1", "ciuser": user, "ipconfig0": "ip=dhcp", "vga": "qxl" if desktop else "std",
          "onboot": bool(a.get("start_at_boot"))}
     if desktop:
-        p["audio0"] = "device=ich9-intel-hda,driver=spice"
+        p.update(audio0="device=ich9-intel-hda,driver=spice", tablet=1)  # (Proxmox leaves the tablet out with SPICE)
     if a.get("ssh_public_key"):
         p["sshkeys"] = quote(a["ssh_public_key"].strip(), safe="")  # Proxmox wants the keys URL-encoded
     return node, p, disk
@@ -724,6 +750,8 @@ def _confirm_point(a: dict) -> tuple[int, int] | None:
 def _type_password_words(ctx: Context, a: dict):
     g = ctx.guest(a["vmid"])
     at = _confirm_point(a)
+    if at is not None and g.get("status") == "running":
+        _need_pointer(ctx, g, "Nothing was typed.")  # the click on the second field could not land
     picture = None
     try:  # the screen as it is now, so the user sees where the password would go
         w, h, pixels = screen.capture(lambda: (ctx.admin or ctx.pve).open_vnc(g["node"], g["type"], g["vmid"]))
@@ -763,6 +791,7 @@ def _type_password(ctx: Context, a: dict):
     enter = ["enter"] if a.get("enter", True) else []
     if at is not None:  # the first field, a click on the second, the second
         opener = _opener(ctx, g)
+        _need_pointer(ctx, g, "Nothing was typed.")
         screen.send(opener, ctx.secret)
         try:
             screen.click(opener, at[0], at[1])
@@ -1005,6 +1034,46 @@ def _host_power(ctx: Context, a: dict):
 
 # -- Console ---------------------------------------------------------------------------------------
 
+def pointer_state(text: str) -> tuple[str, str]:
+    """From QEMU's 'info mice': ('absolute' | 'relative' | 'unknown', the mouse in use — the line marked '*')."""
+    for line in (text or "").splitlines():
+        if line.lstrip().startswith("*"):
+            return ("absolute" if "(absolute)" in line else "relative"), line.split(":", 1)[-1].strip()
+    return "unknown", ""
+
+
+def _pointer(ctx: Context, g: dict) -> tuple[str, str]:
+    """Whether a click can land where it is sent: the guest's mouse in use, read from QEMU's monitor. Without an
+    absolute one (no USB tablet) the console can only move the pointer by steps from where the same connection last
+    put it — and each click is a connection of its own — so the click lands wherever the pointer already is. Asked
+    once a request. ('unknown', why) where it cannot be read (a container, an older Proxmox)."""
+    if g["vmid"] not in ctx.pointers:
+        if g["type"] != "qemu":
+            ctx.pointers[g["vmid"]] = ("unknown", "a container")
+        else:
+            try:
+                ctx.pointers[g["vmid"]] = pointer_state((ctx.admin or ctx.pve).monitor(g["node"], g["vmid"],
+                                                                                       "info mice"))
+            except PveError as e:
+                ctx.pointers[g["vmid"]] = ("unknown", str(e)[:160])
+    return ctx.pointers[g["vmid"]]
+
+
+def _need_pointer(ctx: Context, g: dict, nothing_done: str) -> str:
+    """ToolError where a click cannot land (rather than a click that only seems done); a note where it was not known."""
+    state, mouse = _pointer(ctx, g)
+    if state == "relative":
+        raise ToolError(f"{what(g)} has no absolute pointer: its mouse is '{mouse}', which moves only by steps, so a "
+                        f"click sent to a point would land wherever the pointer already is. {nothing_done} Give the VM "
+                        "a USB tablet: edit_guest with changes {\"tablet\": true} — Proxmox plugs it in at once where "
+                        "USB hotplug is on, otherwise at the VM's next start (the SPICE display leaves it out unless "
+                        "it is set). Keys (console_send) work meanwhile.")
+    if state == "unknown" and g["type"] == "qemu":
+        return (f"The guest's pointer could not be checked ({mouse or 'no answer'}). If console_screenshot shows the "
+                "click elsewhere, the VM needs a USB tablet: edit_guest with changes {\"tablet\": true}.")
+    return ""
+
+
 def _opener(ctx: Context, g: dict) -> Callable[[], tuple]:
     if g.get("status") != "running":
         raise ToolError(f"{what(g)} is not running.")
@@ -1024,6 +1093,8 @@ def _screenshot(ctx: Context, a: dict):
 
 def _click_words(ctx: Context, a: dict):
     g = ctx.guest(a["vmid"])
+    if g.get("status") == "running":
+        _need_pointer(ctx, g, "Nothing was clicked.")  # before the user is asked about a click that cannot land
     if a.get("scroll"):
         how = f"Scroll {'up' if a['scroll'] > 0 else 'down'} {abs(a['scroll'])}"
     else:
@@ -1043,13 +1114,18 @@ def _click_words(ctx: Context, a: dict):
 
 def _click(ctx: Context, a: dict):
     g = ctx.guest(a["vmid"])
+    opener = _opener(ctx, g)
+    note = _need_pointer(ctx, g, "Nothing was clicked.")
     try:
-        sx, sy = screen.click(_opener(ctx, g), a["x"], a["y"], a.get("button", "left"), bool(a.get("double")),
+        sx, sy = screen.click(opener, a["x"], a["y"], a.get("button", "left"), bool(a.get("double")),
                               a.get("scroll", 0))
     except ValueError as e:
         raise ToolError(str(e)) from e
-    return {"guest": what(g), "done": "scrolled" if a.get("scroll") else "clicked", "at_screen_pixel": [sx, sy],
-            "next": "console_screenshot shows what it did."}
+    out = {"guest": what(g), "done": "scrolled" if a.get("scroll") else "clicked", "at_screen_pixel": [sx, sy],
+           "next": "console_screenshot shows what it did."}
+    if note:
+        out["note"] = note
+    return out
 
 
 def _send_words(ctx: Context, a: dict):
@@ -1256,7 +1332,7 @@ def _tools() -> list[Tool]:
              {**vm, "storage": {"type": "string"}, "mode": {"type": "string", "enum": ["snapshot", "suspend", "stop"]},
               "protected": {"type": "boolean"}, "note": {"type": "string"}}, ("host", "vmid"), _backup, _backup_words),
         Tool("create_vm", "change", "Create a VM that boots an ISO image (see list_install_media). Profiles: linux, "
-             "win11 (UEFI, Secure Boot, TPM 2.0), win10, other. It gets a SPICE display and sound.",
+             "win11 (UEFI, Secure Boot, TPM 2.0), win10, other. It gets a SPICE display, sound and a USB tablet.",
              {**host, "name": {"type": "string"}, "iso": {"type": "string", "description": "An ISO's volid."},
               "profile": {"type": "string", "enum": list(PROFILES)}, "vmid": {"type": "integer", "minimum": 100},
               "cores": {"type": "integer", "minimum": 1, "maximum": 512},
@@ -1272,7 +1348,7 @@ def _tools() -> list[Tool]:
         Tool("create_cloud_vm", "change", "Create an Ubuntu VM from a cloud image (see get_cloud_image) — ready in "
              "about a minute, no installer: a user, its password (the USER types it in Proxmox Controller's window; "
              "you never give or see a password), optionally an SSH public key, network by DHCP. edition 'desktop' "
-             "adds a SPICE display and sound; the desktop itself is installed after the first start.",
+             "adds a SPICE display, sound and a USB tablet; the desktop itself is installed after the first start.",
              {**host, "name": {"type": "string"}, "image": {"type": "string", "description": "The image's volid."},
               "edition": {"type": "string", "enum": ["server", "desktop"]},
               "username": {"type": "string", "description": "Default: user."}, "vmid": {"type": "integer", "minimum": 100},
@@ -1334,7 +1410,9 @@ def _tools() -> list[Tool]:
         Tool("console_click", "console", "Click — or double-click, right-click, or turn the wheel (scroll: + up, − down) — "
              "on a running guest's screen at x, y of the latest console_screenshot picture (take a fresh one first: "
              "the click lands where things are now). For installers and desktops that need the mouse; keys "
-             "(console_send) are surer where they work. The user sees a red mark where it will land.",
+             "(console_send) are surer where they work. The user sees a red mark where it will land. It needs an "
+             "absolute pointer in the VM (a USB tablet; Linux also has QEMU's vmmouse): without one it says so "
+             "and clicks nothing.",
              {**vm, "x": {"type": "integer", "minimum": 0}, "y": {"type": "integer", "minimum": 0},
               "button": {"type": "string", "enum": list(screen.BUTTONS)}, "double": {"type": "boolean"},
               "scroll": {"type": "integer", "minimum": -50, "maximum": 50,

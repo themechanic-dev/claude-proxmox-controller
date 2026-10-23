@@ -1297,10 +1297,12 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertEqual(cfg["sshkeys"], "ssh-ed25519%20AAAA%20me%40pc")  # URL-encoded, as Proxmox wants
         self.assertIn(f"import-from={image}", cfg["scsi0"])
         self.assertEqual((self.cluster.guests[vmid]["disk_gb"], self.status(vmid)), (20, "running"))
+        self.assertNotIn("tablet", cfg)  # the server edition: the default display, which keeps Proxmox's tablet
         desk = self.run_tool("create_cloud_vm", secret="x", host="demo-pve", name="desk", image=image,
                              edition="desktop", start=False, reason="r")
         dcfg = self.pve.guest_config("pve", "qemu", desk["vmid"])
         self.assertEqual((dcfg["vga"], dcfg["memory"], self.status(desk["vmid"])), ("qxl", 4096, "stopped"))
+        self.assertEqual(str(dcfg["tablet"]), "1")  # SPICE would leave it out
         self.assertIn("ubuntu-desktop-minimal", " ".join(desk["next_steps"]))
         for bad in ({"image": "local:import/nope.qcow2"}, {"image": image, "username": "Root!"}):
             with self.assertRaises(connector_tools.ToolError):
@@ -1393,6 +1395,76 @@ class ConnectorToolsTest(unittest.TestCase):
             self.run_tool("console_click", host="demo-pve", vmid=102, x=5, y=6, reason="r")  # not running
         with self.assertRaises(connector_tools.ToolError):
             self.run_tool("console_click", host="demo-pve", vmid=201, x=5, y=6, button="thumb", reason="r")
+
+    def test_clicks_need_an_absolute_pointer(self):
+        """23/10, VM 103 (Windows 11, SPICE display): console_click said "clicked" and nothing happened — Proxmox
+        leaves the USB tablet out with SPICE, Windows then has only the relative PS/2 mouse, and a click sent to a
+        point lands wherever the pointer already is. Now: the tablet comes with every VM the app makes, edit_guest
+        adds it to one that lacks it, and a click that cannot land is refused, saying why, before anything is done."""
+        iso = self.pve.isos("pve")[0]["volid"]
+        made = self.run_tool("create_vm", host="demo-pve", name="win", iso=iso, profile="win11", start=True,
+                             reason="r")
+        vmid = made["vmid"]
+        cfg = self.pve.guest_config("pve", "qemu", vmid)
+        self.assertEqual((cfg["vga"], str(cfg["tablet"])), ("qxl", "1"))  # SPICE, and the tablet said outright
+        self.assertEqual(connector_tools.pointer_state(self.pve.monitor("pve", vmid, "info mice")),
+                         ("absolute", "QEMU HID Tablet (absolute)"))
+        self.assertEqual(self.run_tool("console_click", host="demo-pve", vmid=vmid, x=5, y=6, reason="r")["done"],
+                         "clicked")
+        self.assertNotIn("note", self.run_tool("console_click", host="demo-pve", vmid=vmid, x=5, y=6, reason="r"))
+
+        self.cluster.guests[vmid]["cfg"].pop("tablet")  # as VM 103, made before: SPICE and no tablet
+        before = len(self.cluster.consoles)
+        for refused in (lambda: self.words("console_click", host="demo-pve", vmid=vmid, x=5, y=6, reason="r"),
+                        lambda: self.run_tool("console_click", host="demo-pve", vmid=vmid, x=5, y=6, reason="r")):
+            with self.assertRaises(connector_tools.ToolError) as caught:
+                refused()
+            for words in ("no absolute pointer", "QEMU PS/2 Mouse", "Nothing was clicked", '"tablet": true'):
+                self.assertIn(words, str(caught.exception))
+        for refused in (lambda: self.words("console_type_password", host="demo-pve", vmid=vmid, confirm_at=[9, 9],
+                                           reason="r"),
+                        lambda: self.run_tool("console_type_password", secret="k7", host="demo-pve", vmid=vmid,
+                                              confirm_at=[9, 9], reason="r")):
+            with self.assertRaises(connector_tools.ToolError) as caught:
+                refused()
+            self.assertIn("Nothing was typed", str(caught.exception))
+        self.assertEqual(len(self.cluster.consoles), before)  # refused before a console was even opened
+        self.run_tool("console_type_password", secret="k7", host="demo-pve", vmid=vmid, reason="r")  # keys: fine
+
+        what, lines = self.words("edit_guest", host="demo-pve", vmid=vmid, changes={"tablet": True}, reason="r")
+        self.assertIn("USB tablet: off → on", lines)
+        self.assertTrue(any("plugged in at once where USB hotplug is on" in line for line in lines))
+        out = self.run_tool("edit_guest", host="demo-pve", vmid=vmid, changes={"tablet": True}, reason="r")
+        self.assertEqual((out["changed"], out["tablet"]), (["tablet"], "plugged in now"))
+        self.assertEqual(self.run_tool("console_click", host="demo-pve", vmid=vmid, x=5, y=6, reason="r")["done"],
+                         "clicked")
+        self.assertEqual(self.run_tool("edit_guest", host="demo-pve", vmid=vmid, changes={"tablet": True},
+                                       reason="r")["changed"], [])  # it has it: nothing to change
+
+        self.pve.update_config("pve", "qemu", vmid, {"hotplug": "network,disk", "tablet": 0})  # no USB hotplug
+        self.pve.guest_action("pve", "qemu", vmid, "reboot")
+        out = self.run_tool("edit_guest", host="demo-pve", vmid=vmid, changes={"tablet": True}, reason="r")
+        self.assertIn("waits for the VM's next start", out["tablet"])
+        with self.assertRaises(connector_tools.ToolError):
+            self.run_tool("console_click", host="demo-pve", vmid=vmid, x=5, y=6, reason="r")  # not in until then
+        self.pve.guest_action("pve", "qemu", vmid, "reboot")
+        self.assertEqual(self.run_tool("console_click", host="demo-pve", vmid=vmid, x=5, y=6, reason="r")["done"],
+                         "clicked")
+
+        self.assertNotIn("tablet", self.pve.guest_config("pve", "qemu", 201))  # Linux, SPICE, no tablet …
+        self.assertEqual(connector_tools.pointer_state(self.pve.monitor("pve", 201, "info mice"))[0], "absolute")
+        self.run_tool("console_click", host="demo-pve", vmid=201, x=5, y=6, reason="r")  # … QEMU's vmmouse: fine
+        out = self.run_tool("console_click", host="demo-pve", vmid=100, x=5, y=6, reason="r")  # a container's console
+        self.assertEqual((out["done"], "note" in out), ("clicked", False))  # (a terminal: no pointer to check)
+        with self.assertRaises(connector_tools.ToolError):
+            self.run_tool("edit_guest", host="demo-pve", vmid=100, changes={"tablet": True}, reason="r")  # container
+
+        def no_monitor(*_a):
+            raise PveError("Permission check failed (/vms/201, Sys.Audit)", 403)
+        self.pve.monitor = no_monitor  # (an older Proxmox, or no right to read it): clicked, and said so
+        out = self.run_tool("console_click", host="demo-pve", vmid=201, x=5, y=6, reason="r")
+        self.assertEqual(out["done"], "clicked")
+        self.assertIn("could not be checked (Permission check failed", out["note"])
 
     def test_console_and_commands(self):
         picture = self.run_tool("console_screenshot", host="demo-pve", vmid=201, reason="r")

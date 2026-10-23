@@ -11,6 +11,8 @@ import re
 import time
 from copy import deepcopy
 
+from . import vmhw
+
 NODE = "pve"
 
 
@@ -371,10 +373,15 @@ class FakeCluster:
             g.get("cfg", {}).pop(key, None)
             g.get("extra", {}).pop(key, None)
         for key, value in p.items():
-            if re.fullmatch(r"vga|audio\d|usb\d+|startup", key):
+            if re.fullmatch(r"vga|audio\d|usb\d+|startup|tablet|hotplug", key):
+                was = vmhw.tablet_of(self.guest_config({}, node, kind, vmid)) if key == "tablet" else None
                 (g["cfg"] if "cfg" in g else g.setdefault("extra", {}))[key] = value
                 if g["status"] == "running" and re.fullmatch(r"vga|audio\d", key):
                     self.pending_keys.setdefault(int(vmid), set()).add(key)  # display and sound wait for a restart
+                hotplug = str(self.guest_config({}, node, kind, vmid).get("hotplug", "network,disk,usb"))
+                if (key == "tablet" and g["status"] == "running" and "usb" not in hotplug.split(",")
+                        and was != vmhw.tablet_of(self.guest_config({}, node, kind, vmid))):
+                    self.pending_keys.setdefault(int(vmid), set()).add(key)  # as Proxmox: plugged in only with USB hotplug
         for key in ("cores", "memory", "swap", "onboot"):
             if key in p:
                 g[key] = int(p[key])
@@ -620,6 +627,25 @@ class FakeCluster:
         if on and (g.get("spice") or vga.startswith("qxl")):
             out["spice"] = 1
         return out
+
+    def monitor(self, p, node, vmid):
+        """QEMU's monitor, for 'info mice' only: the mouse a click from the console moves, as QEMU lists it. A USB
+        tablet when the VM has one (Proxmox leaves it out with the SPICE display unless it is set); else, in a Linux
+        guest, QEMU's vmmouse (the kernel drives it); else only the relative PS/2 mouse (a Windows guest)."""
+        g = self._guest("qemu", vmid)
+        if p.get("command", "").split() != ["info", "mice"]:
+            raise PermissionError(f"the pretend monitor answers 'info mice' only, not '{p.get('command', '')}'")
+        if g["status"] != "running":
+            raise RuntimeError(f"VM {vmid} not running")
+        cfg = self.guest_config({}, node, "qemu", vmid)
+        tablet = vmhw.tablet_of(cfg)
+        if "tablet" in self.pending_keys.get(int(vmid), set()):
+            tablet = not tablet  # set, but not plugged in until the next start
+        if tablet:
+            return "  Mouse #1: QEMU PS/2 Mouse\n* Mouse #2: QEMU HID Tablet (absolute)\n"
+        if str(cfg.get("ostype", "l26")).startswith("l"):
+            return "  Mouse #1: QEMU PS/2 Mouse\n* Mouse #3: VMware VMMouse (absolute)\n"
+        return "* Mouse #1: QEMU PS/2 Mouse\n"
 
     def spiceproxy(self, p, node, vmid):
         g = self._guest("qemu", vmid)
@@ -1038,6 +1064,7 @@ ROUTES = [
     (("GET", rf"/nodes/{_N}/qemu/(\d+)/pending"), FakeCluster.qemu_pending),
     (("GET", rf"/nodes/{_N}/qemu/(\d+)/status/current"), FakeCluster.qemu_status),
     (("POST", rf"/nodes/{_N}/qemu/(\d+)/spiceproxy"), FakeCluster.spiceproxy),
+    (("POST", rf"/nodes/{_N}/qemu/(\d+)/monitor"), FakeCluster.monitor),
     (("POST", rf"/nodes/{_N}/qemu/(\d+)/clone"), FakeCluster.clone),
     (("GET", rf"/nodes/{_N}/tasks/{_N}/status"), FakeCluster.task_status),
     (("POST", rf"/nodes/{_N}/qemu/(\d+)/agent/exec"), FakeCluster.agent_exec),
@@ -1088,6 +1115,7 @@ REQUIRES = [
     (("POST", r"/nodes/[^/]+/storage/[^/]+/upload"), [("Datastore.AllocateTemplate",)]),
     (("POST", _G + r"/vncproxy"), [("VM.Console",)]),
     (("POST", r"/nodes/[^/]+/qemu/\d+/spiceproxy"), [("VM.Console",)]),
+    (("POST", r"/nodes/[^/]+/qemu/\d+/monitor"), [("Sys.Audit",), ("Sys.Modify",)]),  # (Proxmox 9: 'info' needs no more)
     (("GET", r"/nodes/[^/]+/hardware/usb"), [("Sys.Modify",)]),
     (("POST", r"/nodes/[^/]+/vzdump"), [("VM.Backup", "Datastore.AllocateSpace")]),
     (("DELETE", r"/nodes/[^/]+/storage/[^/]+/content/.+"), [("Datastore.Allocate",),
