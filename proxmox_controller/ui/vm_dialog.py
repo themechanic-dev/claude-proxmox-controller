@@ -491,7 +491,7 @@ class CreateVmDialog(_Busy, QDialog):
             form.setRowVisible(self._row_of(field), visible)
         self.edition.setEnabled(setup)
         self.language.setEnabled(setup)
-        self.dark.setVisible(setup)
+        self.dark.setVisible(setup or desktop)
         self.rdp.setEnabled(setup or desktop)
         if cloud and not desktop:
             self.rdp.setChecked(False)
@@ -822,7 +822,7 @@ class CreateVmDialog(_Busy, QDialog):
 
     def _cloud_job(self, pve: Pve, node: str, vmid: int, name: str) -> Callable[[], tuple]:
         """Ubuntu from its cloud image: Server with Proxmox's cloud-init drive, Desktop with the app's setup disc."""
-        desktop, rdp = self.desktop(), self.rdp.isChecked()
+        desktop, rdp, dark = self.desktop(), self.rdp.isChecked(), self.dark.isChecked()
         user, password, key = self.user.text(), self.password.text(), self.ssh_key.text().strip()
         disk, start = self.disk.value(), self.start.isChecked()
         params = {**cloudvm.vm_params(vmid=vmid, name=name, image=cloudvm.find_image(self.cloud_images,
@@ -841,10 +841,9 @@ class CreateVmDialog(_Busy, QDialog):
             disc = None
             if desktop:
                 place = timezones.region(timezones.host_zone(pve, node))
-                files = {"user-data": cloudseed.user_data(vm_name=name, user=user, password=password, ssh_keys=[key],
-                                                          remote_desktop=rdp, time_zone=place["iana"],
-                                                          keyboard=place["keyboard"]).encode(),
-                         "meta-data": cloudseed.meta_data(name, vmid).encode()}
+                files = cloudseed.seed_files(vm_name=name, vmid=vmid, user=user, password=password, ssh_keys=[key],
+                                             remote_desktop=rdp, dark=dark, time_zone=place["iana"],
+                                             keyboard=place["keyboard"])
                 volid = setupdisc.upload(pve, node, seed_storage, vmid, files, cloudseed.SEED_LABEL)
                 params["ide2"] = f"{volid},media=cdrom"
                 disc = setupdisc.entry("", node, vmid, volid, "ide2", True)

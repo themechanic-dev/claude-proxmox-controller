@@ -1391,9 +1391,10 @@ class ConnectorToolsTest(unittest.TestCase):
     def test_desktop_with_remote_desktop(self):
         image = self.run_tool("get_cloud_image", host="demo-pve", release="24.04", reason="r")["image"]
         args = dict(host="demo-pve", name="desk", image=image, edition="desktop", remote_desktop=True,
-                    username="nikos", start=False, reason="r")
+                    dark_theme=True, username="nikos", start=False, reason="r")
         _, lines = self.words("create_cloud_vm", **args)
-        self.assertIn("Remote Desktop (xrdp", " ".join(lines))
+        self.assertIn("Ubuntu's own Remote Desktop", " ".join(lines))
+        self.assertIn("for Remote Desktop the password itself too", " ".join(lines))
         out, kept = self.run_with("create_cloud_vm", secret="Lnx-Pass-9", **args)
         self.assertNotIn("Lnx-Pass-9", json.dumps(out))
         cfg = self.pve.guest_config("pve", "qemu", out["vmid"])
@@ -1402,13 +1403,18 @@ class ConnectorToolsTest(unittest.TestCase):
         label, files = read_iso(self.cluster.files[disc.split("/")[1]], joliet=True)
         self.assertEqual(label, "cidata")
         data = json.loads(files["user-data"].decode().split("\n", 1)[1])
-        self.assertIn("xrdp", data["packages"])
+        self.assertIn("gnome-remote-desktop", data["packages"])
+        self.assertEqual(files["rdp-password"], b"Lnx-Pass-9\n")  # for grdctl, beside user-data (not in it)
+        self.assertNotIn(b"Lnx-Pass-9", files["user-data"])
+        self.assertIn(["dconf", "update"], data["runcmd"])
         self.assertEqual((data["timezone"], data["keyboard"]["layout"]), ("Europe/Athens", "us,gr"))  # the host's
         self.assertEqual(data["password"], cloudseed.sha512_crypt("Lnx-Pass-9", data["password"].split("$")[2]))
         self.assertNotIn(out["vmid"], self.cluster.secrets)  # not through Proxmox's cloud-init this time
-        self.assertIn("Remote Desktop: connect to its address, port 3389", " ".join(out["next_steps"]))
-        with self.assertRaises(connector_tools.ToolError):
-            self.run_with("create_cloud_vm", secret="x", **{**args, "name": "srv", "edition": "server"})
+        self.assertIn("connect to its address, port 3389", " ".join(out["next_steps"]))
+        self.assertIn("self-signed certificate", " ".join(out["next_steps"]))
+        for bad in ({"dark_theme": False}, {"remote_desktop": False}):
+            with self.assertRaises(connector_tools.ToolError):  # a server has no desktop for either
+                self.run_with("create_cloud_vm", secret="x", **{**args, "name": "srv", "edition": "server", **bad})
 
     def test_typing_a_password(self):
         what, lines, picture = self.words("console_type_password", host="demo-pve", vmid=201, reason="login")
@@ -2970,18 +2976,54 @@ class CloudSeedTest(unittest.TestCase):
     def test_desktop_with_remote_desktop(self):
         cfg = self.config(remote_desktop=True)
         self.assertEqual((cfg["user"], cfg["users"], cfg["hostname"], cfg["fqdn"]),
-                         ("nikos", ["default"], "desk", "desk.lan"))
+                         ({"name": "nikos", "gecos": "nikos"}, ["default"], "desk", "desk.lan"))
         salt = cfg["password"].split("$")[2]
         self.assertEqual(cfg["password"], cloudseed.sha512_crypt("Pw-1234", salt))
         self.assertEqual(cfg["ssh_authorized_keys"], ["ssh-ed25519 AAAA me@pc"])
-        for pkg in ("qemu-guest-agent", "ubuntu-desktop-minimal", "xrdp", "xorgxrdp", "xfce4"):
+        for pkg in ("qemu-guest-agent", "ubuntu-desktop-minimal", "gnome-remote-desktop", "openssl"):
             self.assertIn(pkg, cfg["packages"])
-        self.assertIn(["update-alternatives", "--set", "x-session-manager", "/usr/bin/xfce4-session"], cfg["runcmd"])
-        self.assertIn(["systemctl", "enable", "--now", "xrdp"], cfg["runcmd"])
-        self.assertEqual(cfg["runcmd"][0], ["systemctl", "start", "qemu-guest-agent"])
+        self.assertNotIn("xrdp", cfg["packages"])
+        # the password: from the disc into memory on the first boot only
+        fetch = cfg["bootcmd"][0]
+        for part in ("mount -o ro -L cidata", "/rdp-password /run/pvc-rdp-password", "[ ! -e " + cloudseed.RDP_DONE):
+            self.assertIn(part, fetch)
+        self.assertTrue(fetch.endswith("; true"))  # no disc any more: not an error
+        run = cfg["runcmd"]
+        grd = ["grdctl", "--system", "rdp"]
+        self.assertEqual(run[0][:5], ["runuser", "-u", "gnome-remote-desktop", "--", "openssl"])
+        self.assertIn("/CN=desk", run[0])
+        credentials = ["sh", "-c", "grdctl --system rdp set-credentials nikos < /run/pvc-rdp-password; "
+                       "rm -f /run/pvc-rdp-password"]
+        order = [run.index(c) for c in (grd + ["set-tls-key", cloudseed.GRD_HOME + "/rdp-tls.key"],
+                                        grd + ["set-tls-cert", cloudseed.GRD_HOME + "/rdp-tls.crt"], credentials,
+                                        grd + ["enable"], ["systemctl", "enable", "gnome-remote-desktop.service"])]
+        self.assertEqual(order, sorted(order))  # measured: the credentials before enable, which starts the service
+        self.assertIn(["sh", "-c", f"mkdir -p /var/lib/proxmox-controller && touch {cloudseed.RDP_DONE}"], run)
+        self.assertIn("gnome-initial-setup-done", json.dumps(run))  # no "Welcome" wizard asking for the password
+        self.assertEqual(run[-1], ["systemctl", "start", "qemu-guest-agent"])  # last: the app reads it as set up
         self.assertEqual(cfg["power_state"]["mode"], "reboot")
         self.assertTrue(cfg["package_upgrade"])  # the image on the host ages: the VM starts up to date
-        self.assertIn("color-manager", cfg["write_files"][0]["content"])
+        self.assertNotIn("write_files", cfg)
+
+    def test_dark_theme(self):
+        cfg = self.config(dark=True)
+        files = {f["path"]: f["content"] for f in cfg["write_files"]}
+        self.assertEqual(files["/etc/dconf/profile/user"], "user-db:user\nsystem-db:local\n")
+        self.assertIn("color-scheme='prefer-dark'", files["/etc/dconf/db/local.d/00-proxmox-controller"])
+        self.assertIn("gtk-theme='Yaru-dark'", files["/etc/dconf/db/local.d/00-proxmox-controller"])
+        self.assertIn("dconf-cli", cfg["packages"])
+        self.assertLess(cfg["runcmd"].index(["dconf", "update"]), len(cfg["runcmd"]) - 1)
+
+    def test_seed_files(self):
+        files = cloudseed.seed_files(vm_name="desk.lan", vmid=120, user="nikos", password="Pw 1234 ΑΒ", ssh_keys=[],
+                                     remote_desktop=True)
+        self.assertEqual(files["rdp-password"], "Pw 1234 ΑΒ\n".encode())
+        self.assertNotIn("Pw 1234".encode(), files["user-data"])
+        self.assertEqual(json.loads(files["meta-data"])["local-hostname"], "desk")
+        label, back = read_iso(isofs.make_iso(files, cloudseed.SEED_LABEL), joliet=True)
+        self.assertEqual((label, sorted(back)), ("cidata", ["meta-data", "rdp-password", "user-data"]))
+        self.assertNotIn("rdp-password", cloudseed.seed_files(vm_name="d", vmid=1, user="u", password="p",
+                                                              ssh_keys=[]))
 
     def test_place(self):
         cfg = self.config(time_zone="Europe/Athens", keyboard="gr")
@@ -2993,9 +3035,13 @@ class CloudSeedTest(unittest.TestCase):
 
     def test_without_remote_desktop(self):
         cfg = self.config()
-        self.assertNotIn("xrdp", cfg["packages"])
+        self.assertNotIn("gnome-remote-desktop", cfg["packages"])
+        self.assertNotIn("bootcmd", cfg)
         self.assertNotIn("write_files", cfg)
-        self.assertNotIn("power_state", self.config(desktop=False))
+        self.assertEqual(cfg["runcmd"][-1], ["systemctl", "start", "qemu-guest-agent"])
+        server = self.config(desktop=False)
+        self.assertNotIn("power_state", server)
+        self.assertEqual(server["runcmd"], [["systemctl", "start", "qemu-guest-agent"]])
         with self.assertRaises(ValueError):
             cloudseed.user_data(vm_name="d", user="u", password="", ssh_keys=[], remote_desktop=True)
         one, two = (json.loads(cloudseed.meta_data("desk.lan", 120)) for _ in range(2))

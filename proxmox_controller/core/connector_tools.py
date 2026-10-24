@@ -758,6 +758,8 @@ def _cloud_vm_params(ctx: Context, a: dict) -> tuple[str, dict, int]:
     desktop = edition == "desktop"
     if a.get("remote_desktop") and not desktop:
         raise ToolError("remote_desktop needs edition 'desktop' (a server has no desktop to show).")
+    if a.get("dark_theme") and not desktop:
+        raise ToolError("dark_theme needs edition 'desktop'.")
     storage = a.get("storage") or next((s["storage"] for s in (ctx.admin or ctx.pve).storages(node, content="images")),
                                        "")
     if not storage:
@@ -789,10 +791,12 @@ def _cloud_vm_words(ctx: Context, a: dict):
              (" and an SSH key" if a.get("ssh_public_key") else "")]
     if desktop:
         lines += [f"On the first start it installs Ubuntu Desktop and the QEMU guest agent" +
-                  (", and Remote Desktop (xrdp, an Xfce session: sign in with that user)" if a.get("remote_desktop")
-                   else "") + ", then restarts by itself",
-                  f"From a setup disc on {_seed_storage(ctx, node)} (the password as a hash), deleted by the app once "
-                  "the agent answers"]
+                  (", and turns on Ubuntu's own Remote Desktop (RDP, with that user and password)"
+                   if a.get("remote_desktop") else "") + (", with the dark theme" if a.get("dark_theme") else "") +
+                  ", then restarts by itself",
+                  f"From a setup disc on {_seed_storage(ctx, node)} (the password as a hash" +
+                  ("; for Remote Desktop the password itself too" if a.get("remote_desktop") else "") +
+                  "), deleted by the app once the agent answers"]
     else:
         lines.append("Ready about a minute after it starts")
     return f"Create VM {p['vmid']} ({p['name']}) — Ubuntu {'Desktop' if desktop else 'Server'} — on {node}", lines
@@ -805,10 +809,10 @@ def _cloud_vm(ctx: Context, a: dict):
     volid = ""
     if desktop:
         place = timezones.region(timezones.host_zone(ctx.admin or ctx.pve, node))
-        seed = {"user-data": cloudseed.user_data(vm_name=p["name"], user=user, password=ctx.secret,
-                                                 ssh_keys=[a.get("ssh_public_key", "")], remote_desktop=rdp,
-                                                 time_zone=place["iana"], keyboard=place["keyboard"]).encode(),
-                "meta-data": cloudseed.meta_data(p["name"], vmid).encode()}
+        seed = cloudseed.seed_files(vm_name=p["name"], vmid=vmid, user=user, password=ctx.secret,
+                                    ssh_keys=[a.get("ssh_public_key", "")], remote_desktop=rdp,
+                                    dark=bool(a.get("dark_theme")), time_zone=place["iana"],
+                                    keyboard=place["keyboard"])
         volid = setupdisc.upload(ctx.pve, node, _seed_storage(ctx, node), vmid, seed, cloudseed.SEED_LABEL)
         p["ide2"] = f"{volid},media=cdrom"
     elif ctx.secret:
@@ -838,9 +842,10 @@ def _cloud_vm(ctx: Context, a: dict):
                       "restarts by itself into the login screen. The app deletes the setup disc once the agent "
                       "answers; its address then shows in Proxmox Controller."]
         if rdp:
-            next_steps.append(f"Remote Desktop: connect to its address, port {cloudseed.RDP_PORT}, with the user and "
-                              "its password (an Xfce session). One user cannot be signed in at the console and over "
-                              "Remote Desktop at the same time.")
+            next_steps.append(f"Remote Desktop (Ubuntu's own, GNOME Remote Desktop): connect to its address, port "
+                              f"{cloudseed.RDP_PORT}, with any Remote Desktop app; accept its self-signed certificate "
+                              "and sign in with the user and its password, then once more at the Ubuntu login screen. "
+                              "Sound comes over it too (in Remmina: Audio output mode Local).")
     else:
         next_steps = ["It boots in about a minute; cloud-init sets the user, the password and the network on the first "
                       "start. Its console (console_screenshot) shows the address it got.",
@@ -1615,10 +1620,12 @@ def _tools() -> list[Tool]:
              "you never give or see a password), optionally an SSH public key, network by DHCP. edition 'desktop' "
              "adds a SPICE display, sound and a USB tablet, and installs Ubuntu Desktop and the QEMU guest agent by "
              "itself on the first start (from a setup disc the app makes and deletes afterwards); remote_desktop "
-             "adds Remote Desktop (xrdp, port 3389, an Xfce session) with the same user and password.",
+             "turns on Ubuntu's own Remote Desktop (GNOME Remote Desktop: RDP, port 3389, the Ubuntu desktop itself "
+             "with its sound) with the same user and password; dark_theme makes the desktop dark.",
              {**host, "name": {"type": "string"}, "image": {"type": "string", "description": "The image's volid."},
               "edition": {"type": "string", "enum": ["server", "desktop"]},
               "remote_desktop": {"type": "boolean", "description": "Desktop only."},
+              "dark_theme": {"type": "boolean", "description": "Desktop only."},
               "username": {"type": "string", "description": "Default: user."}, "vmid": {"type": "integer", "minimum": 100},
               "cores": {"type": "integer", "minimum": 1, "maximum": 512}, "memory_mib": {"type": "integer", "minimum": 512},
               "disk_gb": {"type": "integer", "minimum": 4}, "storage": {"type": "string"}, "bridge": {"type": "string"},

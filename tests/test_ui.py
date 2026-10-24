@@ -1307,7 +1307,9 @@ class VmDialogTest(UiCase):
         desk.cloud_edition.setCurrentIndex(desk.cloud_edition.findData("desktop"))
         self.assertEqual((desk.memory.value(), desk.disk.value()), (4096, 32))
         self.assertTrue(desk.rdp.isEnabled())
+        self.assertFalse(desk.dark.isHidden())  # the dark theme: Ubuntu Desktop too
         desk.rdp.setChecked(True)
+        desk.dark.setChecked(True)
         desk.name.setText("desk")
         desk.user.setText("Nikos")
         desk.password.setText("d-pw")
@@ -1322,8 +1324,11 @@ class VmDialogTest(UiCase):
         self.assertEqual((kept[0]["volid"], kept[0]["drive"], self.cluster().guests[104]["disk_gb"]),
                          (disc, "ide2", 32))
         self.assertNotIn("ciuser", cfg)
-        data = test_core_read_iso(self.cluster().files[disc.split("/")[1]])["user-data"].decode()
-        self.assertIn('"xrdp"', data)
+        files = test_core_read_iso(self.cluster().files[disc.split("/")[1]])
+        data = files["user-data"].decode()
+        self.assertIn('"gnome-remote-desktop"', data)
+        self.assertIn('"dconf-cli"', data)
+        self.assertEqual(files["rdp-password"], b"d-pw\n")
         self.assertIn('"timezone": "Europe/Athens"', data)
         self.assertNotIn("d-pw", data)
         self.assertEqual(desk.boot_keys, None)  # only Windows waits for a key
