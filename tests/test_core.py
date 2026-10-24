@@ -3000,6 +3000,21 @@ class SetupDiscTest(unittest.TestCase):
         for name in ("boot-logo.png", "boot-menu.png", "boot-too-late.png"):  # the firmware's logo, menu, messages
             self.assertFalse(setupdisc.boot_prompt_on(*screen_of(name)), name)
         self.assertFalse(setupdisc.boot_prompt_on(1280, 800, bytes(1280 * 800 * 4)))  # black
+        # QEMU's "Guest has not initialized the display (yet).": white words at the top, from the left edge — the
+        # first live test answered it and stopped watching (24/10)
+        w, h = 640, 480
+        qemu = bytearray(w * h * 4)
+        for y in range(8, 24):
+            for x in range(0, 360):
+                if (x // 3 + y) % 3 == 0:  # strokes of letters
+                    qemu[(y * w + x) * 4:(y * w + x) * 4 + 3] = b"\xff\xff\xff"
+        self.assertFalse(setupdisc.boot_prompt_on(w, h, bytes(qemu)))
+        moved = bytearray(w * h * 4)  # the same words set in, as Windows writes its question: recognised
+        for y in range(8, 24):
+            for x in range(80, 440):
+                if (x // 3 + y) % 3 == 0:
+                    moved[(y * w + x) * 4:(y * w + x) * 4 + 3] = b"\xff\xff\xff"
+        self.assertTrue(setupdisc.boot_prompt_on(w, h, bytes(moved)))
         self.assertFalse(setupdisc.boot_prompt_on(0, 0, b""))
 
     def test_enter_when_the_question_shows(self):

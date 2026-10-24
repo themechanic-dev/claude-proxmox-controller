@@ -1077,8 +1077,8 @@ class HostView(QWidget):
                             lambda answered, err: self.notify(
                                 f"VM {vmid}: Enter pressed at the installer's question — Windows Setup runs by itself "
                                 "now" if answered and err is None else
-                                f"VM {vmid}: the installer's question was not seen — if its Console shows “Press any "
-                                "key to boot from CD or DVD”, press a key there"))
+                                f"VM {vmid}: the installer's question was not seen" + (f" ({err})" if err else "") +
+                                " — if its Console shows “Press any key to boot from CD or DVD”, press a key there"))
         self.refresh()
 
     # -- setup discs of new VMs --------------------------------------------------------------------

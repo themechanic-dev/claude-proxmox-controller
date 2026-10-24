@@ -70,12 +70,16 @@ def entry(host_id: str, node: str, vmid: int, volid: str, drive: str, agent: boo
 
 def boot_prompt_on(w: int, h: int, bgra: bytes) -> bool:
     """Whether the screen shows Windows' "Press any key to boot from CD or DVD": white words near the top of an
-    otherwise black screen. The firmware's logo, its boot menu, its grey messages ("BdsDxe: No bootable option…",
-    which come once the question is gone) and Windows' own screens all look otherwise. Every 4th pixel each way."""
+    otherwise black screen, set in from the left edge (Windows indents its question). The firmware's logo, its boot
+    menu, its grey messages ("BdsDxe: No bootable option…", which come once the question is gone) and Windows' own
+    screens look otherwise — and QEMU's "Guest has not initialized the display (yet)." (white, at the top of a black
+    screen, before the firmware starts: the first live test took it for the question) begins at the edge. Every 4th
+    pixel each way."""
     if not w or not h or len(bgra) < w * h * 4:
         return False
     top, step = int(h * 0.09), 4
     words = elsewhere = samples = 0
+    left = w
     for y in range(0, h, step):
         row = y * w * 4
         for x in range(0, w, step):
@@ -83,10 +87,12 @@ def boot_prompt_on(w: int, h: int, bgra: bytes) -> bool:
             b, g, r = bgra[i], bgra[i + 1], bgra[i + 2]
             samples += 1
             if y < top:
-                words += min(r, g, b) >= 0xC8
+                if min(r, g, b) >= 0xC8:
+                    words += 1
+                    left = min(left, x)
             elif max(r, g, b) > 0x30:
                 elsewhere += 1
-    return words >= 20 and elsewhere <= samples * 0.0005
+    return words >= 20 and elsewhere <= samples * 0.0005 and left >= w * 0.06
 
 
 def answer_boot_prompt(pve: Pve, node: str, vmid: int, timeout: float | None = None) -> bool:
