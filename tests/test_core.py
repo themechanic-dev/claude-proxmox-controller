@@ -3017,6 +3017,13 @@ class CloudSeedTest(unittest.TestCase):
         self.assertNotIn("\\", cfg["write_files"][0]["content"])  # (agetty reads backslashes as escapes)
         self.assertTrue(cloudseed.SETUP_ISSUE.startswith("/etc/issue.d/") and cloudseed.SETUP_ISSUE.endswith(".issue"))
         self.assertEqual(run[-1], ["rm", "-f", cloudseed.SETUP_ISSUE])
+        # the network to NetworkManager after the restart, as on a normal desktop — only where netplan names it
+        handover = ["sh", "-c", cloudseed.NETWORK_HANDOVER]
+        self.assertIn(handover, run)
+        self.assertTrue(cloudseed.NETWORK_HANDOVER.startswith("grep -rqs 'renderer: NetworkManager' "))
+        self.assertIn("systemctl disable systemd-networkd.service systemd-networkd.socket "
+                      "systemd-networkd-wait-online.service", cloudseed.NETWORK_HANDOVER)
+        self.assertNotIn(handover, self.config(desktop=False)["runcmd"])
 
     def test_dark_theme(self):
         cfg = self.config(dark=True)

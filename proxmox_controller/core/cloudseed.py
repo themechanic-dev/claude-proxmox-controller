@@ -47,6 +47,13 @@ SETUP_ISSUE = "/etc/issue.d/90-proxmox-controller.issue"
 # and the desktop, once in, brings the network up with the MAC — the router then gave a new address (measured 24/10:
 # .122 on the first boot, .198 after it). net0 is always ens18 on Proxmox (its PCI slot 18).
 NETWORK_CONFIG = {"version": 2, "ethernets": {"ens18": {"dhcp4": True, "dhcp6": True, "dhcp-identifier": "mac"}}}
+# Then the network goes to NetworkManager, as on a normal Ubuntu Desktop: the desktop's netplan default names it, but
+# the cloud image's systemd-networkd, still enabled, brought the network up first and NetworkManager only watched it
+# ("connected (externally)": not changeable in Settings). From the restart on, and only where netplan names
+# NetworkManager — else nothing would bring the network up. NetworkManager asks DHCP with the MAC by itself
+# (dhcp-identifier is networkd's only): measured 24/10, the same address, booted in 10 s.
+NETWORK_HANDOVER = ("grep -rqs 'renderer: NetworkManager' /usr/lib/netplan /etc/netplan && systemctl disable "
+                    "systemd-networkd.service systemd-networkd.socket systemd-networkd-wait-online.service; true")
 SETUP_MESSAGE = ("Proxmox Controller is setting up this VM in the background: installing Ubuntu Desktop (10-20 min).\n"
                  "It restarts into the desktop by itself.\n"
                  "Please do not sign in here or turn it off.\n\n")
@@ -169,6 +176,7 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], de
         # too — with a privacy page that asked for the password every minute (measured 24/10; as a normal install
         # leaves them)
         home = f"/home/{user}"
+        cfg["runcmd"].append(["sh", "-c", NETWORK_HANDOVER])
         cfg["runcmd"].append(["runuser", "-u", user, "--", "sh", "-c",
                               f". /etc/os-release && mkdir -p {home}/.config/gnome-initial-setup && "
                               f"printf yes > {home}/.config/gnome-initial-setup-done && "
