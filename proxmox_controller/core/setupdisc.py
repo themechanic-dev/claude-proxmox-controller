@@ -13,7 +13,7 @@ import re
 import secrets
 import time
 
-from . import screen
+from . import screen, store
 from .isofs import make_iso
 from .pve import Pve, PveError
 
@@ -75,8 +75,15 @@ def boot_prompt_on(w: int, h: int, bgra: bytes) -> bool:
     screens look otherwise — and QEMU's "Guest has not initialized the display (yet)." (white, at the top of a black
     screen, before the firmware starts: the first live test took it for the question) begins at the edge. Every 4th
     pixel each way."""
+    m = prompt_measure(w, h, bgra)
+    return m["words"] >= 20 and m["elsewhere"] <= m["samples"] * 0.0005 and m["left"] >= w * 0.06
+
+
+def prompt_measure(w: int, h: int, bgra: bytes) -> dict:
+    """What boot_prompt_on decides by: white samples near the top (words) and how far left they start, and samples
+    that are not black below them (elsewhere)."""
     if not w or not h or len(bgra) < w * h * 4:
-        return False
+        return {"words": 0, "elsewhere": 0, "samples": 1, "left": 0}
     top, step = int(h * 0.09), 4
     words = elsewhere = samples = 0
     left = w
@@ -92,14 +99,37 @@ def boot_prompt_on(w: int, h: int, bgra: bytes) -> bool:
                     left = min(left, x)
             elif max(r, g, b) > 0x30:
                 elsewhere += 1
-    return words >= 20 and elsewhere <= samples * 0.0005 and left >= w * 0.06
+    return {"words": words, "elsewhere": elsewhere, "samples": samples, "left": left}
 
 
 def answer_boot_prompt(pve: Pve, node: str, vmid: int, timeout: float | None = None) -> bool:
     """Presses Enter at Windows' boot question of a VM that has just been started from its installer disc, the
-    moment it shows (screen.answer_prompt). True when answered."""
-    return screen.answer_prompt(lambda: pve.open_vnc(node, "qemu", vmid), boot_prompt_on, ("enter",),
-                                BOOT_PROMPT_WAIT_S if timeout is None else timeout)
+    moment it shows (screen.answer_prompt). True when answered. What it saw goes to boot-prompt.log in the app's
+    data folder (the last watch only)."""
+    path = store.data_dir() / "boot-prompt.log"
+    measured: list[dict] = [{}]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        out = open(path, "w", encoding="utf-8")
+    except OSError:
+        out = None
+
+    def judge(w: int, h: int, bgra: bytes) -> bool:
+        measured[0] = prompt_measure(w, h, bgra)
+        return boot_prompt_on(w, h, bgra)
+
+    def log(line: str) -> None:
+        if out is not None:
+            out.write(f"{time.strftime('%H:%M:%S')} VM {vmid}: {line}"
+                      + (f"  {measured[0]}" if line.startswith("update") else "") + "\n")
+            out.flush()
+
+    try:
+        return screen.answer_prompt(lambda: pve.open_vnc(node, "qemu", vmid), judge, ("enter",),
+                                    BOOT_PROMPT_WAIT_S if timeout is None else timeout, log=log)
+    finally:
+        if out is not None:
+            out.close()
 
 
 def ready(e: dict, g: dict | None, agent_answers) -> bool:

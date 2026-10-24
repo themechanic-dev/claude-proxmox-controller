@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import socket
 import struct
+import threading
 import time
 import zlib
 from typing import Callable
@@ -162,23 +163,39 @@ def send(open_console: Callable[[], tuple], text: str = "", keys: list[str] | tu
 
 
 def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, int, bytes], bool],
-                  keys: list[str] | tuple = ("enter",), timeout: float = 240.0, quiet: float = 15.0) -> bool:
+                  keys: list[str] | tuple = ("enter",), timeout: float = 240.0, quiet: float = 15.0,
+                  refresh: float = 2.0, log: Callable[[str], None] | None = None) -> bool:
     """Watches a guest's screen through one console connection and presses `keys` while `is_prompt(width, height,
     pixels)` finds the question on it — for a question that waits only seconds and comes after an unknown time
     (Windows' "Press any key to boot from CD or DVD": ~10 s after a restart, ~55 s after a cold start on the user's
     host). Keys pressed blind before it are thrown away by the guest, and after it they could reach the installer.
     True once answered (the question left the screen after the keys); False if it never came within `timeout`. A
-    screen that stays still for `quiet` seconds, or a console that drops (the guest restarting), is opened again."""
+    screen that stays still for `quiet` seconds, or a console that drops (the guest restarting), is opened again.
+    The whole screen is asked for every `refresh` seconds as well, in case changes are not sent by themselves (the
+    third live test, 24/10: connected all along, and the question came and went unseen). `log(line)` hears what was
+    seen, for the app's log file."""
     combos = [parse_combo(k) for k in keys]
     end = time.monotonic() + timeout
     answered = False
+    say = log or (lambda line: None)
+    last_said = 0.0
     while time.monotonic() < end:
-        ws = None
+        ws, done = None, threading.Event()
         try:
             ws, client, w, h = _connect(open_console, quiet)
+            say(f"connected: {w}×{h}")
             fb = bytearray(w * h * 4)
+
+            def ask_again(client=client):
+                while not done.wait(refresh):
+                    try:
+                        client.request_update(incremental=False)
+                    except OSError:
+                        return
+            threading.Thread(target=ask_again, daemon=True, name="prompt-refresh").start()
             while time.monotonic() < end:
-                for op in client.next_update():
+                ops = client.next_update()
+                for op in ops:
                     if op[0] == "size":
                         w, h = op[1], op[2]
                         fb = bytearray(w * h * 4)
@@ -194,7 +211,12 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
                         for r, data in enumerate(rows):
                             start = ((y + r) * w + x) * 4
                             fb[start:start + rw * 4] = data
-                if is_prompt(w, h, bytes(fb)):
+                seen = is_prompt(w, h, bytes(fb))
+                if seen or time.monotonic() - last_said >= 2.0:
+                    last_said = time.monotonic()
+                    say(f"update: {w}×{h}, {len(ops)} piece(s) "
+                        f"({','.join(sorted({op[0] for op in ops}))}) — question {'SEEN' if seen else 'not seen'}")
+                if seen:
                     for syms in combos:
                         for sym in syms:
                             client.key(True, sym)
@@ -202,13 +224,18 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
                             client.key(False, sym)
                         time.sleep(KEY_GAP_S)
                     answered = True
+                    say("pressed: " + ", ".join(keys))
                 elif answered:
+                    say("answered: the question left the screen")
                     return True
-        except (socket.timeout, OSError, ConnectionError, RfbError):
-            time.sleep(1.0)  # (and opened again)
+        except (socket.timeout, OSError, ConnectionError, RfbError) as e:
+            say(f"console dropped ({type(e).__name__}: {e}) — opening it again")
+            time.sleep(1.0)
         finally:
+            done.set()
             if ws is not None:
                 ws.close()
+    say(f"time is up: {'answered' if answered else 'the question was never seen'}")
     return answered
 
 
