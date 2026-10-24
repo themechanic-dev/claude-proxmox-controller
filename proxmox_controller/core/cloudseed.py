@@ -38,6 +38,14 @@ _B64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 # Dark as the default for every user (each can still change it): a system dconf database under the user's own
 DCONF_PROFILE = "user-db:user\nsystem-db:local\n"
 DARK_DEFAULTS = "[org/gnome/desktop/interface]\ncolor-scheme='prefer-dark'\ngtk-theme='Yaru-dark'\n"
+# Above the text login while the desktop installs: that login looks like a finished VM, but the work goes on behind it
+# (the user's request, 24/10). /etc/issue.d is read on 24.04 too (/run/issue.d only from util-linux 2.41); written
+# before the login starts (cloud-init's network stage comes before systemd-user-sessions) and removed at the end.
+# No backslashes: agetty reads them as escapes.
+SETUP_ISSUE = "/etc/issue.d/90-proxmox-controller.issue"
+SETUP_MESSAGE = ("Proxmox Controller is setting up this VM in the background: installing Ubuntu Desktop (10-20 min).\n"
+                 "It restarts into the desktop by itself.\n"
+                 "Please do not sign in here or turn it off.\n\n")
 
 
 def sha512_crypt(password: str, salt: str | None = None, rounds: int = 5000) -> str:
@@ -134,16 +142,22 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], de
     if remote_desktop:
         cfg["bootcmd"], rdp = _rdp_commands(host, user)
         cfg["runcmd"] += rdp
+    files = []
+    if desktop:
+        files.append({"path": SETUP_ISSUE, "content": SETUP_MESSAGE, "permissions": "0644"})
     if dark:
-        cfg["write_files"] = [{"path": "/etc/dconf/profile/user", "content": DCONF_PROFILE, "permissions": "0644"},
-                              {"path": "/etc/dconf/db/local.d/00-proxmox-controller", "content": DARK_DEFAULTS,
-                               "permissions": "0644"}]
+        files += [{"path": "/etc/dconf/profile/user", "content": DCONF_PROFILE, "permissions": "0644"},
+                  {"path": "/etc/dconf/db/local.d/00-proxmox-controller", "content": DARK_DEFAULTS,
+                   "permissions": "0644"}]
         cfg["runcmd"].append(["dconf", "update"])
+    if files:
+        cfg["write_files"] = files
     if desktop:
         # no "Welcome" wizard on the first sign-in: it is all set already, and it kept asking for the password
         home = f"/home/{user}"
         cfg["runcmd"].append(["runuser", "-u", user, "--", "sh", "-c", f"mkdir -p {home}/.config && "
                               f"printf yes > {home}/.config/gnome-initial-setup-done"])
+        cfg["runcmd"].append(["rm", "-f", SETUP_ISSUE])
         # the login screen starts with the next boot, once everything is in
         cfg["power_state"] = {"mode": "reboot", "condition": True, "timeout": 120,
                               "message": "Proxmox Controller: the desktop is installed, restarting"}

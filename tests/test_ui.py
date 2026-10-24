@@ -1120,13 +1120,23 @@ class SetupDiscViewTest(UiCase):
         other = {**setupdisc.entry("other-host", "pve", 160, "local:iso/pvc-setup-160-aaaaaa.iso", "ide3", True)}
         prefs = {"setup_discs": [setupdisc.entry("demo-pve", "pve", 160, volid, "ide3", True), other]}
         view = self.loaded_view(prefs=prefs)
+
+        def status() -> str:
+            t = view.table
+            row = next(r for r in range(t.rowCount()) if t.item(r, host_view.COL_ID).text() == "160")
+            return t.item(row, host_view.COL_STATUS).text()
+
         self.assertTrue(wait_until(lambda: not view.discs_inflight))
         self.assertIn(volid, self.cluster().isos)  # stopped: kept
+        self.assertEqual(status(), "Stopped")  # not setting itself up while it does not run
         self.cluster().guests[160]["status"] = "running"
         view.discs_at = 0.0
         view.refresh()
         self.assertTrue(wait_until(lambda: view.discs_at and not view.discs_inflight))
         self.assertIn(volid, self.cluster().isos)  # running, the agent silent: kept
+        self.assertEqual(status(), "Setting up…")  # it looks finished from outside: the list says it is not
+        row = next(r for r in range(view.table.rowCount()) if view.table.item(r, host_view.COL_ID).text() == "160")
+        self.assertIn("in the background", view.table.item(row, host_view.COL_STATUS).toolTip())
         self.cluster().guests[160]["agent_down"] = False  # the guest tools are in: Windows is ready
         view.discs_at = 0.0
         view.refresh()
@@ -1135,6 +1145,8 @@ class SetupDiscViewTest(UiCase):
         self.assertTrue(self.saved_prefs)
         self.assertTrue(any("setup finished" in n for n in self.notes))
         self.assertEqual(self.guest_cfg(160)["ide3"], "none,media=cdrom")
+        view.refresh()
+        self.assertTrue(wait_until(lambda: status() == "Running"))
 
     def test_enter_after_windows_starts(self):
         view = self.loaded_view(prefs={})

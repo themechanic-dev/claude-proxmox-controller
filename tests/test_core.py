@@ -3003,7 +3003,12 @@ class CloudSeedTest(unittest.TestCase):
         self.assertEqual(run[-1], ["systemctl", "start", "qemu-guest-agent"])  # last: the app reads it as set up
         self.assertEqual(cfg["power_state"]["mode"], "reboot")
         self.assertTrue(cfg["package_upgrade"])  # the image on the host ages: the VM starts up to date
-        self.assertNotIn("write_files", cfg)
+        # the text login says the work goes on behind it, until the end
+        self.assertEqual([f["path"] for f in cfg["write_files"]], [cloudseed.SETUP_ISSUE])
+        self.assertIn("in the background", cfg["write_files"][0]["content"])
+        self.assertNotIn("\\", cfg["write_files"][0]["content"])  # (agetty reads backslashes as escapes)
+        self.assertTrue(cloudseed.SETUP_ISSUE.startswith("/etc/issue.d/") and cloudseed.SETUP_ISSUE.endswith(".issue"))
+        self.assertEqual(run[-2], ["rm", "-f", cloudseed.SETUP_ISSUE])
 
     def test_dark_theme(self):
         cfg = self.config(dark=True)
@@ -3037,10 +3042,11 @@ class CloudSeedTest(unittest.TestCase):
         cfg = self.config()
         self.assertNotIn("gnome-remote-desktop", cfg["packages"])
         self.assertNotIn("bootcmd", cfg)
-        self.assertNotIn("write_files", cfg)
+        self.assertEqual([f["path"] for f in cfg["write_files"]], [cloudseed.SETUP_ISSUE])
         self.assertEqual(cfg["runcmd"][-1], ["systemctl", "start", "qemu-guest-agent"])
         server = self.config(desktop=False)
         self.assertNotIn("power_state", server)
+        self.assertNotIn("write_files", server)
         self.assertEqual(server["runcmd"], [["systemctl", "start", "qemu-guest-agent"]])
         with self.assertRaises(ValueError):
             cloudseed.user_data(vm_name="d", user="u", password="", ssh_keys=[], remote_desktop=True)

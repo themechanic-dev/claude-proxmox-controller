@@ -36,6 +36,11 @@ COLUMNS = ["", "ID", "Name", "Type", "Status", "Boot", "CPU", "Memory", "Disk", 
 (COL_DOT, COL_ID, COL_NAME, COL_TYPE, COL_STATUS, COL_BOOT, COL_CPU, COL_MEM, COL_DISK, COL_IP, COL_UPTIME,
  COL_FILL) = range(len(COLUMNS))
 RIGHT_ALIGNED = (COL_CPU, COL_MEM, COL_DISK, COL_UPTIME)  # numbers line up on the right
+# A new VM that installs itself looks finished from outside (Ubuntu's text login, Windows' setup screens) while the
+# work goes on behind it: until its guest agent answers and the app takes its setup disc away, the list says so
+SETTING_UP = "Setting up…"
+SETTING_UP_TIP = ("It installs itself in the background — the app's setup disc goes once its guest agent answers. "
+                  "Leave it running: it restarts by itself when done.")
 BOOT_TIP = "Starts when the host starts (Start at boot)"
 HEADER_PAD, ARROW_ROOM = 8, 18
 NAME_MIN_W = 150  # the Name column shrinks to this before the table needs a horizontal scroll bar  # the column titles' side padding (theme) and the sort arrow's room
@@ -564,16 +569,18 @@ class HostView(QWidget):
         t = self.table
         t.setSortingEnabled(False)  # rows must not move while they are being filled
         t.setRowCount(len(self.guests))
+        setting_up = self.setting_up()
         for r, g in enumerate(self.guests):
             running = g.get("status") == "running"
             vmid = g["vmid"]
+            status = SETTING_UP if running and vmid in setting_up else g.get("status", "?").capitalize()
             mem, maxmem = g.get("mem") or 0, g.get("maxmem") or 0
             cells = [
                 ("", [0 if running else 1, vmid]),
                 (str(vmid), vmid),
                 (g.get("name", ""), g.get("name", "").lower()),
                 (kind_label(g), kind_label(g)),
-                (g.get("status", "?").capitalize(), [0 if running else 1, g.get("status", "")]),
+                (status, [0 if running else 1, g.get("status", "")]),
                 ("", [1, vmid]),  # Boot: arrives with the details (it is in the config, not in the list)
                 (f"{g.get('cpu', 0) * 100:.0f} % of {g.get('maxcpu', 0)}" if running else "—",
                  float(g.get("cpu", 0)) if running else -1.0),
@@ -592,6 +599,7 @@ class HostView(QWidget):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 t.setItem(r, col, item)
             t.item(r, COL_DOT).setIcon(dot_icon(c.success if running else c.dim))  # keeps its colour when selected
+            t.item(r, COL_STATUS).setToolTip(SETTING_UP_TIP if status == SETTING_UP else "")
             t.item(r, COL_NAME).setData(TAGS_ROLE, split_tags(g.get("tags", "")))
             self._show_details(r, g)
         t.setSortingEnabled(True)
@@ -1082,6 +1090,10 @@ class HostView(QWidget):
         self.refresh()
 
     # -- setup discs of new VMs --------------------------------------------------------------------
+
+    def setting_up(self) -> set[int]:
+        """This host's VMs that still have their setup disc: they install themselves in the background."""
+        return {d["vmid"] for d in self.prefs.get("setup_discs") or [] if d.get("host") == self.host.id}
 
     def remember_setup_disc(self, disc: dict) -> None:
         """Keeps a new VM's setup disc in the settings until it is taken away (it holds the user's password)."""
