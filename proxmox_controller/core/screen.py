@@ -166,7 +166,8 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
                   keys: list[str] | tuple = ("enter",), timeout: float = 240.0, quiet: float = 15.0,
                   refresh: float = 0.5, top: float | None = None,
                   missed: Callable[[int, int, bytes], bool] | None = None, recovery: tuple = (),
-                  settle: float = 20.0, log: Callable[[str], None] | None = None) -> bool:
+                  settle: float = 12.0, first_after: float = 0.8, again_after: float = 0.6,
+                  log: Callable[[str], None] | None = None) -> bool:
     """Watches a guest's screen through one console connection and presses `keys` while `is_prompt(width, height,
     pixels)` finds the question on it — for a question that waits only seconds and comes after an unknown time
     (Windows' "Press any key to boot from CD or DVD": ~5 s long, ~10 s after a restart, ~55 s after a cold start on the
@@ -179,14 +180,18 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
     `missed(width, height, pixels)` recognises the screen that says the question went unanswered; then `recovery` is
     played — steps of (key, seconds to wait before it) — at most 3 times, and the question is watched for again.
 
-    True once answered: the question left the screen after the keys and no `missed` screen followed — or, after a
-    recovery, nothing more to answer came for `settle` seconds. False if it never came within `timeout`. A console
-    that drops (the guest restarting) or stays silent for `quiet` seconds is opened again. `log(line)` hears what was
-    seen, for the app's log file."""
+    The keys go `first_after` seconds after the question shows, then every `again_after` seconds while it stays:
+    Windows writes the question first and throws away the keys already pressed just after (the fifth live test,
+    24/10: two Enters at once, both lost) — and it may ask twice in a row, so one answer is not the end.
+
+    True once answered: after keys (or a recovery), neither the question nor the `missed` screen for `settle` seconds.
+    False if it never came within `timeout`. A console that drops (the guest restarting) or stays silent for `quiet`
+    seconds is opened again. `log(line)` hears what was seen, for the app's log file."""
     combos = [parse_combo(k) for k in keys]
     steps = [(parse_combo(k), wait) for k, wait in recovery]  # (every name checked before anything is pressed)
     end = time.monotonic() + timeout
     answered, recoveries, recovered_at = False, 0, 0.0
+    shown_at = pressed_at = quiet_since = 0.0  # when the question showed, the keys went, the screen went quiet
     say = log or (lambda line: None)
     last_said = 0.0
 
@@ -240,10 +245,14 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
                     say(f"update: {w}×{h}, {len(ops)} piece(s) ({','.join(sorted({op[0] for op in ops}))}) — "
                         f"question {'SEEN' if seen else 'MISSED' if lost else 'not seen'}")
                 if seen:
-                    press(client, combos)
-                    answered = True
-                    say("pressed: " + ", ".join(keys))
+                    shown_at = shown_at or now
+                    quiet_since = 0.0
+                    if now - shown_at >= first_after and now - pressed_at >= again_after:
+                        press(client, combos)
+                        answered, pressed_at = True, now
+                        say("pressed: " + ", ".join(keys))
                 elif lost:
+                    shown_at = 0.0
                     if recoveries >= 3 or not recovery:
                         say("the question was missed, and no more tries are left")
                         return False
@@ -252,13 +261,14 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
                     for syms, wait in steps:
                         time.sleep(wait)
                         press(client, [syms])
-                    answered, recovered_at = False, time.monotonic()
-                elif answered:
-                    say("answered: the question left the screen")
-                    return True
-                elif recovered_at and now - recovered_at > settle:
-                    say(f"answered: nothing more to answer {settle:g} s after the try")
-                    return True
+                    answered, recovered_at, quiet_since = True, time.monotonic(), time.monotonic()
+                else:
+                    shown_at = 0.0
+                    if answered:
+                        quiet_since = quiet_since or now
+                        if now - quiet_since >= settle:
+                            say(f"answered: no question for {settle:g} s after the keys")
+                            return True
         except (socket.timeout, OSError, ConnectionError, RfbError) as e:
             say(f"console dropped ({type(e).__name__}: {e}) — opening it again")
             time.sleep(1.0)

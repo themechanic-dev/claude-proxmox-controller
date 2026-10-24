@@ -3044,7 +3044,8 @@ class SetupDiscTest(unittest.TestCase):
             return WebSocket(mine), "pw"
 
         threading.Timer(0.4, lambda: servers[0].show(prompt)).start()  # the logo first, then the question
-        self.assertTrue(screen.answer_prompt(open_console, setupdisc.boot_prompt_on, timeout=10))
+        self.assertTrue(screen.answer_prompt(open_console, setupdisc.boot_prompt_on, timeout=10, settle=1,
+                                             first_after=0.1))
         downs = [k for k in servers[0].keys if k[1]]
         self.assertTrue(downs and all(k[2] == 0xFF0D for k in downs))  # Enter, and nothing else
         # missed: through the Boot Manager — Enter (the menu), Down (the DVD), Enter; then the question again, answered
@@ -3071,9 +3072,44 @@ class SetupDiscTest(unittest.TestCase):
 
         steps = (("enter", 0.0), ("down", 0.2), ("enter", 0.2))
         self.assertTrue(screen.answer_prompt(open_missed, setupdisc.boot_prompt_on, timeout=10, top=0.16,
-                                             missed=setupdisc.boot_prompt_missed, recovery=steps, settle=3))
+                                             missed=setupdisc.boot_prompt_missed, recovery=steps, settle=1,
+                                             first_after=0.1))
         self.assertEqual(pressed[:3], ["enter", "down", "enter"])
         self.assertEqual(servers[0].image, logo[2])  # it booted
+        # Windows throws away keys pressed just after it writes the question, and may ask twice in a row (the fifth
+        # live test, 24/10): the first question ignores everything and times out, the second takes keys only after
+        # half a second
+        servers.clear()
+        log, shown = [], {}
+
+        def picky(srv, keysym):
+            if keysym != 0xFF0D or srv.image != prompt[2]:
+                return
+            if shown.get("round") == 1 or time.monotonic() - shown["at"] < 0.5:
+                log.append(("thrown away", round(time.monotonic() - shown["at"], 2)))
+                return
+            log.append(("taken", round(time.monotonic() - shown["at"], 2)))
+            srv.show(logo)
+
+        def ask(srv, round_):
+            shown.update(round=round_, at=time.monotonic())
+            srv.show(prompt)
+
+        def open_picky():
+            mine, theirs = socket.socketpair()
+            srv = ScreenVnc(WebSocket(theirs, client=False), "pw", logo, on_key=picky).start()
+            servers.append(srv)
+            threading.Timer(0.3, lambda: ask(srv, 1)).start()        # the first question …
+            threading.Timer(1.5, lambda: srv.show(logo)).start()      # … times out
+            threading.Timer(2.0, lambda: ask(srv, 2)).start()         # … and it asks again
+            return WebSocket(mine), "pw"
+
+        self.assertTrue(screen.answer_prompt(open_picky, setupdisc.boot_prompt_on, timeout=10, refresh=0.1,
+                                             settle=1.5, first_after=0.6, again_after=0.3))
+        self.assertEqual(servers[0].image, logo[2])
+        self.assertEqual(len(servers), 1)  # one watch for both questions
+        self.assertEqual(log[-1][0], "taken")  # the second question answered
+        self.assertTrue(all(t >= 0.5 for what, t in log if what == "taken"))
         # it never comes: no key at all, and False when the time is up
         servers.clear()
         self.assertFalse(screen.answer_prompt(open_console, setupdisc.boot_prompt_on, timeout=1.0, quiet=0.3))
