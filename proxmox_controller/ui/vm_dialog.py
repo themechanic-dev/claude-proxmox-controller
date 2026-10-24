@@ -13,7 +13,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QLineEdit, QProgressDialog, QRadioButton, QSpinBox, QVBoxLayout, QWidget)
 
-from ..core import cloudseed, cloudvm, setupdisc, winsetup
+from ..core import cloudseed, cloudvm, setupdisc, timezones, winsetup
 from ..core.pve import Pve, PveError, q, upload_name
 from ..core.vmspec import (PROFILES, VIRTIO_AS_SYSTEM, VMNAME, WINDOWS, is_virtio_disc,  # noqa: F401 (tests too)
                            iso_name_from_url, looks_like_windows, vm_params)
@@ -796,7 +796,7 @@ class CreateVmDialog(_Busy, QDialog):
                     "computer": winsetup.computer_name(name), "edition": self.edition.currentText().strip(),
                     "uefi": params.get("bios") == "ovmf", "language": self.language.currentText().strip(),
                     "virtio": virtio, "remote_desktop": self.rdp.isChecked(), "dark": self.dark.isChecked(),
-                    "guest_tools": agent}
+                    "guest_tools": agent, "time_zone": timezones.windows_zone_here()}
         storage = setupdisc.storage_of(self.iso.currentData())
         self.done_text = (f"Created VM {vmid} ({name}) — Windows installs itself" +
                           (": watch it in its Console" if start else ": start it, and press a key in its Console "

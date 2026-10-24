@@ -18,7 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import claude_policy, cloudseed, cloudvm, guestfiles, screen, setupdisc, ssh, startup, tasks, vmhw, winsetup, wol
+from . import (claude_policy, cloudseed, cloudvm, guestfiles, screen, setupdisc, ssh, startup, tasks, timezones, vmhw,
+               winsetup, wol)
 from .cloudvm import CLOUD_IMAGES, CLOUD_URL, USERNAME
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
@@ -632,7 +633,7 @@ def _create_vm(ctx: Context, a: dict):
     if not ctx.secret:
         raise ToolError("No password was typed.")
     xml = winsetup.answer_file(password=ctx.secret, computer=winsetup.computer_name(p["name"]),
-                               uefi=p.get("bios") == "ovmf", **win)
+                               uefi=p.get("bios") == "ovmf", time_zone=timezones.windows_zone_here(), **win)
     vmid, start = p["vmid"], p.pop("start")
     drive = setupdisc.free_slot(p)
     volid = setupdisc.upload(ctx.pve, node, setupdisc.storage_of(a["iso"]), vmid, {winsetup.ANSWER_NAME: xml.encode()},

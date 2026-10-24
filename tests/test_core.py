@@ -23,7 +23,7 @@ from unittest import mock
 from proxmox_controller.core import apt, ssh as sshmod
 from proxmox_controller.core import (autostart, claude_access, claude_policy, connector_link, connector_tools, jobs,
                                      mcp, netinfo, screen, sounds, spice, startup, store, tasks, vault, vmhw, wol)
-from proxmox_controller.core import cloudseed, guestfiles, isofs, setupdisc, winsetup
+from proxmox_controller.core import cloudseed, guestfiles, isofs, setupdisc, timezones, winsetup
 from proxmox_controller.core.des import encrypt_block, vnc_response
 from proxmox_controller.core.fakevnc import FakeVncServer
 from proxmox_controller.core.rfb import RfbClient, RfbError, qnum_from_evdev, qnum_from_windows
@@ -2862,6 +2862,22 @@ class WinSetupTest(unittest.TestCase):
         orders = [int(c.find("u:Order", self.NS).text) for c in shell.findall(".//u:SynchronousCommand", self.NS)]
         self.assertEqual(orders, list(range(1, len(orders) + 1)))
 
+    def test_time_zone(self):
+        text, root = self.xml(time_zone="GTB Standard Time")
+        shell = self.component(root, "oobeSystem", "Microsoft-Windows-Shell-Setup")
+        self.assertEqual(shell.find("u:TimeZone", self.NS).text, "GTB Standard Time")
+        _, root = self.xml()
+        self.assertIsNone(self.component(root, "oobeSystem", "Microsoft-Windows-Shell-Setup").find("u:TimeZone", self.NS))
+        # this computer's zone by Windows' name (CLDR's table): the user's Athens, renamed zones, the unknown
+        self.assertEqual(timezones.windows_zone("Europe/Athens"), "GTB Standard Time")
+        self.assertEqual(timezones.windows_zone("Europe/Kyiv"), "FLE Standard Time")
+        self.assertEqual(timezones.windows_zone("America/Los_Angeles"), "Pacific Standard Time")
+        self.assertEqual(timezones.windows_zone("Mars/Base"), "")
+        if not sys.platform.startswith("win"):
+            with mock.patch.dict(os.environ, {"TZ": "Asia/Manila"}):
+                self.assertEqual(timezones.windows_zone_here(), "Singapore Standard Time")
+        self.assertEqual(len({n for v in timezones.WINDOWS_ZONES.values() for n in v.split()}), 445)  # all of CLDR's
+
     def test_bios_server_and_no_virtio(self):
         text, root = self.xml(uefi=False, virtio=False, edition="Windows Server 2022 Standard (Desktop Experience)")
         setup = self.component(root, "windowsPE", "Microsoft-Windows-Setup")
@@ -2966,7 +2982,7 @@ class SetupDiscTest(unittest.TestCase):
 
     def vm_with_disc(self, vmid=150, agent=True, status="running", uptime=600):
         volid = setupdisc.upload(self.pve, "pve", "local", vmid, {"autounattend.xml": b"<x/>"}, "autounattend")
-        self.pve.create_vm("pve", {"vmid": vmid, "name": f"vm{vmid}", "scsi0": "local-lvm:8",
+        self.pve.create_vm("pve", {"vmid": vmid, "name": f"vm{vmid}", "scsi0": "local-lvm:8", "boot": "order=scsi0;ide2",
                                    "ide3": f"{volid},media=cdrom", "agent": "1" if agent else "0"})
         g = self.cluster.guests[vmid]
         g.update(status=status, uptime=uptime)
@@ -2999,7 +3015,9 @@ class SetupDiscTest(unittest.TestCase):
             self.assertNotIn(e["volid"], self.cluster.isos)  # the file is deleted
         for e in (stopped, silent, young):
             self.assertIn(e["volid"], self.cluster.isos)
-        self.assertEqual(self.pve.guest_config("pve", "qemu", 150)["ide3"], "none,media=cdrom")  # the drive emptied
+        cfg = self.pve.guest_config("pve", "qemu", 150)
+        self.assertEqual(cfg["ide3"], "none,media=cdrom")  # the drive emptied …
+        self.assertEqual(cfg["boot"], "order=scsi0;ide2")  # … and not left in the boot order, where Proxmox puts it
         self.assertIn("VM 150 (vm150): setup finished", said[0])
         self.assertTrue(any("VM 156 is gone" in t for t in said))
         self.assertEqual(setupdisc.tidy(self.pve, [ready], self.pve.guests())[0], {ready["volid"]})  # gone already

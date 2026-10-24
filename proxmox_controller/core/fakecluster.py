@@ -377,12 +377,17 @@ class FakeCluster:
             g.get("cfg", {}).pop(key, None)
             g.get("extra", {}).pop(key, None)
         for key, value in p.items():
-            if re.fullmatch(r"vga|audio\d|usb\d+|startup|tablet|hotplug|ide\d|sata\d+|scsi\d+", key):
+            if re.fullmatch(r"vga|audio\d|usb\d+|startup|tablet|hotplug|boot|ide\d|sata\d+|scsi\d+", key):
                 before = self.guest_config({}, node, kind, vmid)
                 was = vmhw.tablet_of(before) if key == "tablet" else None
                 if re.fullmatch(r"ide\d|sata\d+|scsi\d+", key) and key not in before and g["status"] == "running":
                     self.pending_keys.setdefault(int(vmid), set()).add(key)  # a new drive: at the next start
                 (g["cfg"] if "cfg" in g else g.setdefault("extra", {}))[key] = value
+                cfg_now = g.get("cfg", g.get("extra", {}))
+                boot = str(cfg_now.get("boot", ""))
+                order = boot.split("=", 1)[1].split(";") if boot.startswith("order=") else None
+                if "media=cdrom" in str(value) and order is not None and key not in order:
+                    cfg_now["boot"] = f"{boot};{key}"  # (measured 24/10: Proxmox appends the drive given)
                 if g["status"] == "running" and re.fullmatch(r"vga|audio\d", key):
                     self.pending_keys.setdefault(int(vmid), set()).add(key)  # display and sound wait for a restart
                 hotplug = str(self.guest_config({}, node, kind, vmid).get("hotplug", "network,disk,usb"))

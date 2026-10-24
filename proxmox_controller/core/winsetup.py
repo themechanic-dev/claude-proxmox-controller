@@ -166,9 +166,11 @@ def first_logon_commands(*, remote_desktop: bool, dark: bool, guest_tools: bool)
 
 def answer_file(*, user: str, password: str, computer: str, edition: str, uefi: bool, language: str = DEFAULT_LANGUAGE,
                 virtio: bool = True, remote_desktop: bool = False, dark: bool = False,
-                guest_tools: bool = True) -> str:
+                guest_tools: bool = True, time_zone: str = "") -> str:
     """autounattend.xml for a new VM. `uefi`: the VM boots UEFI (GPT disk) or BIOS (MBR); `virtio`: the VirtIO disc
-    is attached (drivers loaded from it in Setup, and its guest tools installed at the end when `guest_tools`)."""
+    is attached (drivers loaded from it in Setup, and its guest tools installed at the end when `guest_tools`).
+    `time_zone`: Windows' name of it ("GTB Standard Time") — the app gives this computer's (core/timezones.py); without
+    one Windows keeps Pacific time (the first live test showed 10:38 AM at 20:38 in Athens)."""
     problem = check_user(user, password, remote_desktop, edition)
     if problem:
         raise ValueError(problem)
@@ -208,6 +210,7 @@ def answer_file(*, user: str, password: str, computer: str, edition: str, uefi: 
              "        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>\n"
              "        <HideLocalAccountScreen>true</HideLocalAccountScreen>\n"
              "        <ProtectYourPC>3</ProtectYourPC>\n      </OOBE>\n"
+             + (f"      <TimeZone>{escape(time_zone)}</TimeZone>\n" if time_zone else "") +
              "      <UserAccounts>\n" + admin + "        <LocalAccounts>\n"
              '          <LocalAccount wcm:action="add"><Name>' + escape(user) + "</Name><DisplayName>" + escape(user) +
              f"</DisplayName><Group>Administrators</Group><Password>{secret}</Password></LocalAccount>\n"

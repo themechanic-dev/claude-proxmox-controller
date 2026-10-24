@@ -174,12 +174,20 @@ def ready(e: dict, g: dict | None, agent_answers) -> bool:
 
 
 def take_away(pve: Pve, e: dict, exists: bool) -> None:
-    """Empties the VM's CD drive (if it still holds the disc) and deletes the file."""
+    """Empties the VM's CD drive (if it still holds the disc) and deletes the file. Proxmox puts a drive it is given
+    into the boot order (the first live test: order=scsi0;ide2;net0;ide3, waiting for the next start): taken out
+    again, as it was."""
     node, vmid, volid, drive = e["node"], int(e["vmid"]), e["volid"], e["drive"]
     if exists:
         cfg = pve.guest_config(node, "qemu", vmid)
         if str(cfg.get(drive, "")).split(",")[0] == volid:
             pve.update_config(node, "qemu", vmid, {drive: "none,media=cdrom"})
+            boot = str(pve.guest_config(node, "qemu", vmid).get("boot", ""))
+            if boot.startswith("order="):
+                order = [d for d in boot[len("order="):].split(";") if d]
+                if drive in order:
+                    pve.update_config(node, "qemu", vmid,
+                                      {"boot": "order=" + ";".join(d for d in order if d != drive)})
     delete(pve, node, volid)
 
 
