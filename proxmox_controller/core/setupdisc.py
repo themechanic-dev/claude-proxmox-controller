@@ -13,6 +13,7 @@ import re
 import secrets
 import time
 
+from . import screen
 from .isofs import make_iso
 from .pve import Pve, PveError
 
@@ -20,8 +21,8 @@ PREFIX = "pvc-setup-"
 SLOTS = ("ide3", "ide1", "ide0", "sata5", "sata4", "sata3")  # CD drives a new VM may take: the first one free
 READY_UPTIME_S = 30 * 60      # no agent will tell: by then the installer has long read the disc
 AGENT_GIVE_UP_S = 3 * 3600    # the agent never answered (its install failed): the disc has done its part anyway
-BOOT_KEY_S = 40               # Windows' "Press any key to boot from CD or DVD…" comes ~10 s after the start, for ~5 s
-BOOT_KEY_EVERY_S = 1.0
+BOOT_PROMPT_WAIT_S = 300  # Windows' "Press any key to boot from CD or DVD…" stays ~5 s: ~55 s after a cold start on
+                          # the user's host (24/10), ~10 s after a restart — watched for, not guessed
 
 
 def disc_name(vmid: int) -> str:
@@ -67,23 +68,32 @@ def entry(host_id: str, node: str, vmid: int, volid: str, drive: str, agent: boo
             "made": int(time.time())}
 
 
-def press_boot_key(pve: Pve, node: str, vmid: int, seconds: float | None = None, every: float | None = None,
-                   sleep=time.sleep) -> int:
-    """Presses Enter in a VM that has just started, every `every` seconds for `seconds` (BOOT_KEY_EVERY_S,
-    BOOT_KEY_S): Windows' installer disc asks for a key before it boots, and without one the VM goes on to the network
-    boot. Enter before or after that question does nothing (the firmware's logo, the installer loading). Returns how
-    many went through."""
-    seconds = BOOT_KEY_S if seconds is None else seconds
-    every = BOOT_KEY_EVERY_S if every is None else every
-    done, end = 0, time.monotonic() + seconds
-    while time.monotonic() < end:
-        try:
-            pve.send_key(node, vmid, "ret")
-            done += 1
-        except PveError:
-            pass  # not running yet, or no longer: the next one may go through
-        sleep(every)
-    return done
+def boot_prompt_on(w: int, h: int, bgra: bytes) -> bool:
+    """Whether the screen shows Windows' "Press any key to boot from CD or DVD": white words near the top of an
+    otherwise black screen. The firmware's logo, its boot menu, its grey messages ("BdsDxe: No bootable option…",
+    which come once the question is gone) and Windows' own screens all look otherwise. Every 4th pixel each way."""
+    if not w or not h or len(bgra) < w * h * 4:
+        return False
+    top, step = int(h * 0.09), 4
+    words = elsewhere = samples = 0
+    for y in range(0, h, step):
+        row = y * w * 4
+        for x in range(0, w, step):
+            i = row + x * 4
+            b, g, r = bgra[i], bgra[i + 1], bgra[i + 2]
+            samples += 1
+            if y < top:
+                words += min(r, g, b) >= 0xC8
+            elif max(r, g, b) > 0x30:
+                elsewhere += 1
+    return words >= 20 and elsewhere <= samples * 0.0005
+
+
+def answer_boot_prompt(pve: Pve, node: str, vmid: int, timeout: float | None = None) -> bool:
+    """Presses Enter at Windows' boot question of a VM that has just been started from its installer disc, the
+    moment it shows (screen.answer_prompt). True when answered."""
+    return screen.answer_prompt(lambda: pve.open_vnc(node, "qemu", vmid), boot_prompt_on, ("enter",),
+                                BOOT_PROMPT_WAIT_S if timeout is None else timeout)
 
 
 def ready(e: dict, g: dict | None, agent_answers) -> bool:

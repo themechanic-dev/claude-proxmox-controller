@@ -10,7 +10,7 @@ import time
 import zlib
 from typing import Callable
 
-from .rfb import RfbClient
+from .rfb import RfbClient, RfbError
 
 MAX_WIDTH = 1280  # wider screens are halved (or more): enough to read, and lighter for Claude to look at
 KEY_GAP_S = 0.012  # between keys, so a busy guest misses none
@@ -159,6 +159,57 @@ def send(open_console: Callable[[], tuple], text: str = "", keys: list[str] | tu
     finally:
         if ws is not None:
             ws.close()
+
+
+def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, int, bytes], bool],
+                  keys: list[str] | tuple = ("enter",), timeout: float = 240.0, quiet: float = 15.0) -> bool:
+    """Watches a guest's screen through one console connection and presses `keys` while `is_prompt(width, height,
+    pixels)` finds the question on it — for a question that waits only seconds and comes after an unknown time
+    (Windows' "Press any key to boot from CD or DVD": ~10 s after a restart, ~55 s after a cold start on the user's
+    host). Keys pressed blind before it are thrown away by the guest, and after it they could reach the installer.
+    True once answered (the question left the screen after the keys); False if it never came within `timeout`. A
+    screen that stays still for `quiet` seconds, or a console that drops (the guest restarting), is opened again."""
+    combos = [parse_combo(k) for k in keys]
+    end = time.monotonic() + timeout
+    answered = False
+    while time.monotonic() < end:
+        ws = None
+        try:
+            ws, client, w, h = _connect(open_console, quiet)
+            fb = bytearray(w * h * 4)
+            while time.monotonic() < end:
+                for op in client.next_update():
+                    if op[0] == "size":
+                        w, h = op[1], op[2]
+                        fb = bytearray(w * h * 4)
+                        client.request_update(incremental=False)
+                    elif op[0] == "raw":
+                        _, x, y, rw, rh, data = op
+                        for row in range(rh):
+                            start = ((y + row) * w + x) * 4
+                            fb[start:start + rw * 4] = data[row * rw * 4:(row + 1) * rw * 4]
+                    elif op[0] == "copy":
+                        _, sx, sy, x, y, rw, rh = op
+                        rows = [bytes(fb[((sy + r) * w + sx) * 4:((sy + r) * w + sx + rw) * 4]) for r in range(rh)]
+                        for r, data in enumerate(rows):
+                            start = ((y + r) * w + x) * 4
+                            fb[start:start + rw * 4] = data
+                if is_prompt(w, h, bytes(fb)):
+                    for syms in combos:
+                        for sym in syms:
+                            client.key(True, sym)
+                        for sym in reversed(syms):
+                            client.key(False, sym)
+                        time.sleep(KEY_GAP_S)
+                    answered = True
+                elif answered:
+                    return True
+        except (socket.timeout, OSError, ConnectionError, RfbError):
+            time.sleep(1.0)  # (and opened again)
+        finally:
+            if ws is not None:
+                ws.close()
+    return answered
 
 
 def mark(w: int, h: int, bgra: bytes, x: int, y: int) -> bytes:

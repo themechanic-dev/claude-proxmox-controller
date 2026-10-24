@@ -1139,11 +1139,15 @@ class SetupDiscViewTest(UiCase):
     def test_enter_after_windows_starts(self):
         view = self.loaded_view(prefs={})
         done = types.SimpleNamespace(created=(201, "win"), done_text="Created VM 201 (win)", boot_keys=("pve", 201))
-        with mock.patch.object(setupdisc, "BOOT_KEY_S", 0.05), mock.patch.object(setupdisc, "BOOT_KEY_EVERY_S", 0.01):
+        watched = []
+        with mock.patch.object(setupdisc, "answer_boot_prompt", lambda pve, node, vmid: watched.append(vmid) or True):
             view._after_new_vm(done)
             self.assertTrue(wait_until(lambda: any("Enter pressed" in n for n in self.notes)))
         self.assertIn("Created VM 201 (win)", self.notes)
-        self.assertIn((201, "ret"), self.cluster().keys)
+        self.assertEqual(watched, [201])
+        with mock.patch.object(setupdisc, "answer_boot_prompt", lambda pve, node, vmid: False):
+            view._after_new_vm(done)
+            self.assertTrue(wait_until(lambda: any("was not seen" in n for n in self.notes)))
         view.remember_setup_disc({"node": "pve", "vmid": 201, "volid": "local:iso/x.iso"})
         self.assertEqual(view.prefs["setup_discs"][0]["host"], "demo-pve")
 

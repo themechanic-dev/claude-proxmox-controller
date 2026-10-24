@@ -1343,8 +1343,11 @@ class ConnectorToolsTest(unittest.TestCase):
         what, lines = self.words("create_vm", **args)
         self.assertIn("Windows installs itself: Windows 11 Pro, el-GR, user 'nikos'", " ".join(lines))
         self.assertIn("Remote Desktop on, dark theme", " ".join(lines))
-        with mock.patch.object(setupdisc, "BOOT_KEY_S", 0.05), mock.patch.object(setupdisc, "BOOT_KEY_EVERY_S", 0.01):
+        watched = []
+        with mock.patch.object(setupdisc, "answer_boot_prompt", lambda pve, node, vmid: watched.append(vmid)):
             out, kept = self.run_with("create_vm", secret="Win-Pass-77", **args)
+            for t in [t for t in threading.enumerate() if t.name.startswith("boot-prompt-")]:
+                t.join(5)
         vmid = out["vmid"]
         self.assertNotIn("Win-Pass-77", json.dumps(out))
         cfg = self.pve.guest_config("pve", "qemu", vmid)
@@ -1359,14 +1362,14 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertIn("<UILanguage>el-GR</UILanguage>", xml)
         self.assertNotIn("Win-Pass-77", xml)
         self.assertEqual(self.status(vmid), "running")
-        self.assertTrue(self.cluster.keys and set(self.cluster.keys) == {(vmid, "ret")})
-        self.assertIn("Enter pressed", out["boot_key"])
-        # Console Off: not pressed, and said so
-        self.cluster.keys.clear()
-        out, _ = self.run_with("create_vm", secret="pw", kinds=("read", "change", "power"),
-                               **{**args, "name": "win-2"})
+        self.assertEqual(watched, [vmid])  # its screen watched (in the background) for the boot question
+        self.assertIn("watches its screen", out["boot_key"])
+        # Console Off: not watched, and said so
+        with mock.patch.object(setupdisc, "answer_boot_prompt", lambda pve, node, vmid: watched.append(vmid)):
+            out, _ = self.run_with("create_vm", secret="pw", kinds=("read", "change", "power"),
+                                   **{**args, "name": "win-2"})
         self.assertIn("not pressed", out["boot_key"])
-        self.assertEqual(self.cluster.keys, [])
+        self.assertEqual(len(watched), 1)
         out = self.run_tool("list_install_media", host="demo-pve")
         self.assertFalse([i for i in out["isos"] if "pvc-setup" in i])  # the answer disc is not one to install from
         for bad, words in (({"iso": virtio}, "VirtIO drivers disc"),
@@ -2675,6 +2678,56 @@ class GuestFilesTest(unittest.TestCase):
 
 
 
+DATA = Path(__file__).resolve().parent / "data"
+
+
+def screen_of(name: str) -> tuple[int, int, bytes]:
+    """A saved console picture (the app's own PNG: RGB, no filters) as the console sends it: width, height, BGRA."""
+    png = (DATA / name).read_bytes()
+    w, h = struct.unpack(">II", png[16:24])
+    data, pos = b"", 8
+    while pos < len(png):
+        n = struct.unpack(">I", png[pos:pos + 4])[0]
+        if png[pos + 4:pos + 8] == b"IDAT":
+            data += png[pos + 8:pos + 8 + n]
+        pos += 12 + n
+    raw, stride, out = zlib.decompress(data), w * 3 + 1, bytearray(w * h * 4)
+    for y in range(h):
+        row = raw[y * stride + 1:(y + 1) * stride]
+        out[y * w * 4:(y + 1) * w * 4:4], out[y * w * 4 + 1:(y + 1) * w * 4:4] = row[2::3], row[1::3]
+        out[y * w * 4 + 2:(y + 1) * w * 4:4] = row[0::3]
+    return w, h, bytes(out)
+
+
+class ScreenVnc(FakeVncServer):
+    """The pretend console showing a given screen, and another one whenever show() is called."""
+
+    def __init__(self, ws, password, screen_, after_enter=None):
+        w, h, self.image = screen_
+        self.after_enter = after_enter  # what the guest shows once Enter reaches it
+        super().__init__(ws, password, width=w, height=h)
+
+    def show(self, screen_):
+        _, _, self.image = screen_
+        with self.lock:
+            self.dirty = [None]
+        self._flush()
+
+    def _full_screen(self):
+        self._send(struct.pack(">BxH", 0, 1) + struct.pack(">HHHHi", 0, 0, self.width, self.height, 0) + self.image)
+
+    def _typed(self, down, keysym):
+        if down and keysym == 0xFF0D and self.after_enter is not None:
+            self.show(self.after_enter)
+
+    def _flush(self):
+        with self.lock:
+            if not (self.wants_update and self.dirty):
+                return
+            self.dirty, self.wants_update = [], False
+        self._full_screen()
+
+
 def read_iso(image: bytes, joliet: bool) -> tuple[str, dict[str, bytes]]:
     """The volume name and the root folder's files of an ISO image, read as a CD reader would (the primary tree's
     names or the Joliet tree's)."""
@@ -2941,12 +2994,30 @@ class SetupDiscTest(unittest.TestCase):
         self.assertTrue(any("VM 156 is gone" in t for t in said))
         self.assertEqual(setupdisc.tidy(self.pve, [ready], self.pve.guests())[0], {ready["volid"]})  # gone already
 
-    def test_boot_key(self):
-        self.vm_with_disc(150)
-        naps = []
-        self.assertEqual(setupdisc.press_boot_key(self.pve, "pve", 150, seconds=0.05, every=0.01,
-                                                  sleep=lambda s: (naps.append(s), time.sleep(0.01))),
-                         len(naps))
-        self.assertTrue(naps and all(k == (150, "ret") for k in self.cluster.keys))
-        self.cluster.guests[150]["status"] = "stopped"
-        self.assertEqual(setupdisc.press_boot_key(self.pve, "pve", 150, seconds=0.03, every=0.01), 0)  # no error
+    def test_the_boot_question_is_recognised(self):
+        """On the real screens of the user's first test (VM 102, 24/10): only the question itself."""
+        self.assertTrue(setupdisc.boot_prompt_on(*screen_of("boot-prompt.png")))
+        for name in ("boot-logo.png", "boot-menu.png", "boot-too-late.png"):  # the firmware's logo, menu, messages
+            self.assertFalse(setupdisc.boot_prompt_on(*screen_of(name)), name)
+        self.assertFalse(setupdisc.boot_prompt_on(1280, 800, bytes(1280 * 800 * 4)))  # black
+        self.assertFalse(setupdisc.boot_prompt_on(0, 0, b""))
+
+    def test_enter_when_the_question_shows(self):
+        """One console kept open: Enter only while the question is on the screen, then done."""
+        logo, prompt = screen_of("boot-logo.png"), screen_of("boot-prompt.png")
+        servers = []
+
+        def open_console():
+            mine, theirs = socket.socketpair()
+            srv = ScreenVnc(WebSocket(theirs, client=False), "pw", logo, after_enter=logo).start()
+            servers.append(srv)
+            return WebSocket(mine), "pw"
+
+        threading.Timer(0.4, lambda: servers[0].show(prompt)).start()  # the logo first, then the question
+        self.assertTrue(screen.answer_prompt(open_console, setupdisc.boot_prompt_on, timeout=10))
+        downs = [k for k in servers[0].keys if k[1]]
+        self.assertTrue(downs and all(k[2] == 0xFF0D for k in downs))  # Enter, and nothing else
+        # it never comes: no key at all, and False when the time is up
+        servers.clear()
+        self.assertFalse(screen.answer_prompt(open_console, setupdisc.boot_prompt_on, timeout=1.0, quiet=0.3))
+        self.assertTrue(servers and not any(s.keys for s in servers))

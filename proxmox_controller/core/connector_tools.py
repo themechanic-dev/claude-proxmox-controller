@@ -13,6 +13,7 @@ import base64
 import math
 import re
 import shlex
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -660,9 +661,13 @@ def _create_vm(ctx: Context, a: dict):
         return out
     if start:
         out["started"] = finish(ctx, node, ctx.pve.guest_action(node, "qemu", vmid, "start"))["status"]
-        if "console" in ctx.kinds:
-            presses = setupdisc.press_boot_key(ctx.pve, node, vmid)
-            out["boot_key"] = f"Enter pressed {presses} times in the first {setupdisc.BOOT_KEY_S} s"
+        if "console" in ctx.kinds:  # (it may come a minute later: watched in the background, the answer not waited for)
+            pve = ctx.pve
+            threading.Thread(target=lambda: setupdisc.answer_boot_prompt(pve, node, vmid), daemon=True,
+                             name=f"boot-prompt-{vmid}").start()
+            out["boot_key"] = ("the app watches its screen and presses Enter when 'Press any key to boot from CD or "
+                               f"DVD' shows (within {setupdisc.BOOT_PROMPT_WAIT_S // 60} minutes); check with "
+                               "console_screenshot")
         else:
             out["boot_key"] = "not pressed (Console requests are Off): press Enter in its console at 'Press any " \
                               "key to boot from CD or DVD' — or restart it and do so"

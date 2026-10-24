@@ -1069,14 +1069,16 @@ class HostView(QWidget):
         if dlg.created:
             self.notify(dlg.done_text)
             self.details_at = 0.0
-        if dlg.boot_keys:  # Windows' installer disc asks for a key before it boots: pressed here, not in the window
+        if dlg.boot_keys:  # Windows' installer disc asks for a key before it boots: answered here, not in the window
             node, vmid = dlg.boot_keys
             pve = self.client()
-            self.runner.run(lambda: setupdisc.press_boot_key(pve, node, vmid),
-                            lambda n, err: self.notify(f"VM {vmid}: Enter pressed at the installer's question — "
-                                                       "Windows Setup runs by itself now" if n else
-                                                       f"VM {vmid}: Enter could not be pressed — press a key in its "
-                                                       "Console at “Press any key to boot from CD”"))
+            self.notify(f"VM {vmid}: watching its screen for “Press any key to boot from CD or DVD”…")
+            self.runner.run(lambda: setupdisc.answer_boot_prompt(pve, node, vmid),
+                            lambda answered, err: self.notify(
+                                f"VM {vmid}: Enter pressed at the installer's question — Windows Setup runs by itself "
+                                "now" if answered and err is None else
+                                f"VM {vmid}: the installer's question was not seen — if its Console shows “Press any "
+                                "key to boot from CD or DVD”, press a key there"))
         self.refresh()
 
     # -- setup discs of new VMs --------------------------------------------------------------------
