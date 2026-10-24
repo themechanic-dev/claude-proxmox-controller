@@ -3035,6 +3035,45 @@ class SetupDiscTest(unittest.TestCase):
         self.assertTrue(setupdisc.boot_prompt_on(w, h, bytes(moved)))
         self.assertFalse(setupdisc.boot_prompt_on(0, 0, b""))
 
+    def test_setup_product_key_page(self):
+        """Windows Setup's product key page (25H2, the user's test of 24/10): known by its key field, in any language;
+        Tab while the field has the focus, then Enter on "I don't have a product key" — looked at each time."""
+        for name in ("setup-product-key.png", "setup-product-key-pointer.png", "setup-product-key-link.png"):
+            self.assertTrue(setupdisc.product_key_page(*screen_of(name)), name)
+        for name in ("setup-getting-ready.png", "setup-license.png", "setup-installing.png", "boot-prompt.png",
+                     "boot-logo.png", "boot-menu.png", "boot-too-late.png"):
+            self.assertFalse(setupdisc.product_key_page(*screen_of(name)), name)
+        self.assertEqual(setupdisc.product_key_keys(*screen_of("setup-product-key.png")), ("tab",))
+        self.assertEqual(setupdisc.product_key_keys(*screen_of("setup-product-key-link.png")), ("enter",))
+        field, link, ready = (screen_of(n) for n in ("setup-product-key.png", "setup-product-key-link.png",
+                                                      "setup-getting-ready.png"))
+        pressed, lost = [], [True]  # the first Tab is lost: the page must look again, not press on blind
+
+        def setup(srv, keysym):
+            name = {0xFF09: "tab", 0xFF0D: "enter"}.get(keysym)
+            pressed.append(name)
+            if name == "tab" and srv.image == field[2]:
+                if lost[0]:
+                    lost[0] = False
+                    return
+                srv.show(link)
+            elif name == "enter" and srv.image == link[2]:
+                srv.show(ready)
+
+        servers = []
+
+        def open_console():
+            mine, theirs = socket.socketpair()
+            srv = ScreenVnc(WebSocket(theirs, client=False), "pw", field, on_key=setup).start()
+            servers.append(srv)
+            return WebSocket(mine), "pw"
+
+        self.assertTrue(screen.answer_prompt(open_console, setupdisc.product_key_page, setupdisc.product_key_keys,
+                                             timeout=10, refresh=0.1, top=setupdisc.KEY_PAGE_ROWS, first_after=0.2,
+                                             again_after=0.3, settle=1))
+        self.assertEqual(pressed, ["tab", "tab", "enter"])  # never a blind second Tab after the focus moved
+        self.assertEqual(servers[0].image, ready[2])
+
     def test_enter_when_the_question_shows(self):
         """One console kept open: Enter only while the question is on the screen, then done."""
         logo, prompt = screen_of("boot-logo.png"), screen_of("boot-prompt.png")

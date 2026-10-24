@@ -74,6 +74,7 @@ BELOW_BAND = 0.16      # … and the firmware its "No bootable option" lines rig
 # disk first (order=scsi0;ide2) — and Enter at once and again for a few seconds, as the user found works (24/10: the
 # question comes ~2 s after the DVD is chosen and waits ~5 s)
 BOOT_MANAGER_STEPS = (("enter", 0.0), ("down", 2.5), ("enter", 0.8)) + (("enter", 0.5),) * 7
+KEY_PAGE_WAIT_S = 480  # Setup's product key page came ~1 min after the boot question was answered (24/10)
 
 
 def prompt_measure(w: int, h: int, bgra: bytes) -> dict:
@@ -122,7 +123,8 @@ def boot_prompt_missed(w: int, h: int, bgra: bytes) -> bool:
 
 def answer_boot_prompt(pve: Pve, node: str, vmid: int, timeout: float | None = None) -> bool:
     """Presses Enter at Windows' boot question of a VM that has just been started from its installer disc, the
-    moment it shows; if it was missed, through the firmware's Boot Manager (screen.answer_prompt). True when
+    moment it shows; if it was missed, through the firmware's Boot Manager (screen.answer_prompt). Then answers
+    Setup's product key page, which an answer file without a key does not skip. True when the boot question was
     answered. What it saw goes to boot-prompt.log in the app's data folder (the last watch only)."""
     path = store.data_dir() / "boot-prompt.log"
     measured: list[dict] = [{}]
@@ -142,10 +144,18 @@ def answer_boot_prompt(pve: Pve, node: str, vmid: int, timeout: float | None = N
                       + (f"  {measured[0]}" if line.startswith("update") else "") + "\n")
             out.flush()
 
+    def open_console():
+        return pve.open_vnc(node, "qemu", vmid)
+
     try:
-        return screen.answer_prompt(lambda: pve.open_vnc(node, "qemu", vmid), judge, ("enter",),
-                                    BOOT_PROMPT_WAIT_S if timeout is None else timeout, top=BELOW_BAND,
-                                    missed=boot_prompt_missed, recovery=BOOT_MANAGER_STEPS, log=log)
+        answered = screen.answer_prompt(open_console, judge, ("enter",),
+                                        BOOT_PROMPT_WAIT_S if timeout is None else timeout, top=BELOW_BAND,
+                                        missed=boot_prompt_missed, recovery=BOOT_MANAGER_STEPS, log=log)
+        if answered:  # then Setup's product key page, answered as the user would: "I don't have a product key"
+            log("watching for Setup's product key page")
+            screen.answer_prompt(open_console, product_key_page, product_key_keys, KEY_PAGE_WAIT_S, refresh=1.0,
+                                 top=KEY_PAGE_ROWS, first_after=1.5, again_after=1.0, settle=8.0, log=log)
+        return answered
     finally:
         if out is not None:
             out.close()
@@ -195,3 +205,58 @@ def tidy(pve: Pve, entries: list[dict], guests: list[dict]) -> tuple[set[str], l
 
 def is_setup_disc(volid: str) -> bool:
     return bool(re.search(rf"[:/]{PREFIX}\d+-[0-9a-f]+\.iso$", volid))
+
+
+KEY_PAGE_ROWS = 0.45  # the part of the screen watched for Setup's product key page (its dialog's top and the field)
+
+
+def product_key_page(w: int, h: int, bgra: bytes) -> bool:
+    """Whether the screen shows Windows Setup's "Product key" page, which Setup shows even with an answer file when it
+    names no key (measured on Windows 11 25H2, 24/10; the user wants no key in it, not even Microsoft's generic one).
+    Known by its place, not its words (they follow the ISO's language): the white dialog on Setup's purple and, in
+    it, the one-line field the key goes in — its top and bottom border, two rows across the field's width about 20
+    rows apart. Only the top KEY_PAGE_ROWS of the screen are looked at."""
+    if w < 800 or h < 600 or len(bgra) < w * h * 4:
+        return False
+
+    def at(x: int, y: int) -> tuple[int, int, int]:
+        i = (y * w + x) * 4
+        return bgra[i + 2], bgra[i + 1], bgra[i]
+
+    r, g, b = at(8, int(h * 0.3))  # beside the dialog: Setup's purple
+    if not (r < 60 and g < 30 and 60 <= b <= 120):
+        return False
+    limit = int(h * KEY_PAGE_ROWS)
+    # the dialog's body: white for rows on end (its frame has a white edge of one row above the title bar)
+    top = next((y for y in range(int(h * 0.05), limit) if all(min(at(w // 2, y + k)) >= 0xF0 for k in range(6))),
+               None)
+    if top is None:
+        return False
+    left = next((x for x in range(0, w // 2) if min(at(x, top + 60)) >= 0xF0), None)
+    if left is None:
+        return False
+    x0, x1 = left + 42, left + 392
+    if x1 >= w:
+        return False
+    span = len(range(x0, x1, 2))
+    borders = [y for y in range(top + 140, min(top + 185, limit))
+               if sum(1 for x in range(x0, x1, 2) if min(at(x, y)) < 0xF0) >= 0.95 * span]
+    return len(borders) >= 2 and 15 <= borders[-1] - borders[0] <= 25
+
+
+def product_key_keys(w: int, h: int, bgra: bytes) -> tuple:
+    """On the product key page: Tab while the key field has the focus (its bottom border blue), then Enter on what
+    has it next — "I don't have a product key" (the border grey). Looking first, each time: a Tab pressed again blind
+    would move on to "Privacy statement"."""
+    limit = int(h * KEY_PAGE_ROWS)
+
+    def at(x: int, y: int) -> tuple[int, int, int]:
+        i = (y * w + x) * 4
+        return bgra[i + 2], bgra[i + 1], bgra[i]
+
+    top = next((y for y in range(int(h * 0.05), limit) if all(min(at(w // 2, y + k)) >= 0xF0 for k in range(6))), 0)
+    left = next((x for x in range(0, w // 2) if min(at(x, top + 60)) >= 0xF0), 0)
+    x = left + 210
+    bottom = [at(x, y) for y in range(top + 160, min(top + 185, limit)) if min(at(x, y)) < 0xF0]
+    focused = any(b > 150 and r < 60 for r, g, b in bottom)
+    return ("tab",) if focused else ("enter",)

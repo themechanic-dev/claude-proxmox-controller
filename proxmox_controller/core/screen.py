@@ -169,7 +169,8 @@ def send(open_console: Callable[[], tuple], text: str = "", keys: list[str] | tu
 
 
 def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, int, bytes], bool],
-                  keys: list[str] | tuple = ("enter",), timeout: float = 240.0, quiet: float = 15.0,
+                  keys: list[str] | tuple | Callable[[int, int, bytes], tuple] = ("enter",), timeout: float = 240.0,
+                  quiet: float = 15.0,
                   refresh: float = 0.5, top: float | None = None,
                   missed: Callable[[int, int, bytes], bool] | None = None, recovery: tuple = (),
                   settle: float = 12.0, first_after: float = 0.8, again_after: float = 0.6,
@@ -186,6 +187,8 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
     `missed(width, height, pixels)` recognises the screen that says the question went unanswered; then `recovery` is
     played — steps of (key, seconds to wait before it) — at most 3 times, and the question is watched for again.
 
+    `keys` may also be chosen by the picture: keys(width, height, pixels) → the names to press now.
+
     The keys go `first_after` seconds after the question shows, then every `again_after` seconds while it stays:
     Windows writes the question first and throws away the keys already pressed just after (the fifth live test,
     24/10: two Enters at once, both lost) — and it may ask twice in a row, so one answer is not the end.
@@ -199,7 +202,7 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
             return [(syms[0], qnum_from_evdev(EVDEV[name.lower()]))]
         return [(sym, 0) for sym in syms]
 
-    combos = [scancoded(k) for k in keys]
+    combos = None if callable(keys) else [scancoded(k) for k in keys]
     steps = [(scancoded(k), wait) for k, wait in recovery]  # (every name checked before anything is pressed)
     end = time.monotonic() + timeout
     answered, recoveries, recovered_at = False, 0, 0.0
@@ -261,9 +264,10 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
                     shown_at = shown_at or now
                     quiet_since = 0.0
                     if now - shown_at >= first_after and now - pressed_at >= again_after:
-                        press(client, combos)
+                        names = tuple(keys(w, h, picture)) if callable(keys) else tuple(keys)
+                        press(client, combos if combos is not None else [scancoded(k) for k in names])
                         answered, pressed_at = True, now
-                        say("pressed: " + ", ".join(keys))
+                        say("pressed: " + ", ".join(names))
                 elif lost:
                     shown_at = 0.0
                     if recoveries >= 3 or not recovery:
