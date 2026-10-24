@@ -87,6 +87,7 @@ class FakeCluster:
         self.uploaded: dict[str, int] = {}  # file name → bytes received, for the tests
         self.files: dict[str, bytes] = {}  # a small uploaded file's contents (an answer disc), for the tests
         self.keys: list[tuple[int, str]] = []  # (vmid, key) pressed with sendkey, for the tests
+        self.timezone = "Europe/Athens"  # the node's, as /nodes/{node}/time says it
         self.templates = ["local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst",
                           "local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst"]
         self.appliances = [
@@ -192,6 +193,10 @@ class FakeCluster:
     def nodes(self, p):
         return [{"node": NODE, "status": "online", "cpu": 0.07, "maxcpu": self.cpus, "mem": 9 << 30,
                  "maxmem": self.mem_total, "uptime": 4 * 3600}]
+
+    def node_time(self, p, node):
+        now = int(time.time())
+        return {"timezone": self.timezone, "time": now, "localtime": now + 3 * 3600}
 
     def node_status(self, p, node):
         running = [g for g in self.guests.values() if g["status"] == "running"]
@@ -1071,6 +1076,7 @@ ROUTES = [
     (("GET", r"/version"), FakeCluster.version),
     (("GET", r"/nodes"), FakeCluster.nodes),
     (("GET", rf"/nodes/{_N}/status"), FakeCluster.node_status),
+    (("GET", rf"/nodes/{_N}/time"), FakeCluster.node_time),
     (("POST", rf"/nodes/{_N}/status"), FakeCluster.node_command),
     (("GET", rf"/nodes/{_N}/storage"), FakeCluster.storages),
     (("GET", rf"/nodes/{_N}/storage/{_N}/content"), FakeCluster.storage_content),
@@ -1143,6 +1149,7 @@ _G = r"/nodes/[^/]+/(?:lxc|qemu)/\d+"
 # are open to every user (the version, the node list, the guest list filtered by VM.Audit, own tasks)
 REQUIRES = [
     (("GET", r"/nodes/[^/]+/status"), [("Sys.Audit",)]),
+    (("GET", r"/nodes/[^/]+/time"), [("Sys.Audit",)]),
     (("POST", r"/nodes/[^/]+/status"), [("Sys.PowerMgmt",)]),
     (("GET", r"/nodes/[^/]+/apt/update"), [("Sys.Modify",)]),
     (("POST", r"/nodes/[^/]+/apt/update"), [("Sys.Modify",)]),

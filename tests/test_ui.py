@@ -1240,6 +1240,8 @@ class VmDialogTest(UiCase):
         xml = test_core_read_iso(self.cluster().files[disc.split("/")[1]])["autounattend.xml"].decode()
         self.assertIn("fDenyTSConnections", xml)
         self.assertIn("AppsUseLightTheme", xml)
+        self.assertIn("<TimeZone>GTB Standard Time</TimeZone>", xml)  # the Proxmox host's place
+        self.assertIn("<UserLocale>el-GR</UserLocale>", xml)
         self.assertNotIn("Pw-1<", xml)
         self.assertIn("Windows installs itself", dlg.done_text)
         again = self.dialog()  # the answer disc is not offered as an ISO to install from
@@ -1322,6 +1324,7 @@ class VmDialogTest(UiCase):
         self.assertNotIn("ciuser", cfg)
         data = test_core_read_iso(self.cluster().files[disc.split("/")[1]])["user-data"].decode()
         self.assertIn('"xrdp"', data)
+        self.assertIn('"timezone": "Europe/Athens"', data)
         self.assertNotIn("d-pw", data)
         self.assertEqual(desk.boot_keys, None)  # only Windows waits for a key
 

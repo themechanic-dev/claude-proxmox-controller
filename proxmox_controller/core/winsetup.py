@@ -35,7 +35,7 @@ ISO_LANGUAGE_WORDS = {
     "hungarian": "hu-HU", "romanian": "ro-RO", "bulgarian": "bg-BG", "ukrainian": "uk-UA", "japanese": "ja-JP",
     "korean": "ko-KR", "chnsimp": "zh-CN", "chntrad": "zh-TW", "arabic": "ar-SA", "hebrew": "he-IL",
 }
-US_KEYBOARD = "0409:00000409"  # the console types as a US keyboard: Windows gets that one first
+US_KEYBOARD = "en-US"  # the console types as a US keyboard: Windows gets that one first
 USERNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,19}$")
 RESERVED_USERS = ("administrator", "guest", "defaultaccount", "wdagutilityaccount", "system", "none")
 LETTERS = "DEFGHIJ"  # where Windows Setup may put the VirtIO disc: each is tried
@@ -115,10 +115,13 @@ def _component(name: str, body: str) -> str:
             f'language="neutral" versionScope="nonSxS">\n{body}    </component>\n')
 
 
-def _locale(lang: str, pe: bool) -> str:
+def _locale(lang: str, pe: bool, region: str = "") -> str:
+    """Windows' language (the ISO's) — and, for the new Windows, the place's formats and keyboard after the US one."""
     setup = f"      <SetupUILanguage><UILanguage>{lang}</UILanguage></SetupUILanguage>\n" if pe else ""
-    return (f"{setup}      <InputLocale>{US_KEYBOARD}</InputLocale>\n      <SystemLocale>{lang}</SystemLocale>\n"
-            f"      <UILanguage>{lang}</UILanguage>\n      <UserLocale>{lang}</UserLocale>\n")
+    keyboards = US_KEYBOARD + (f";{region}" if region and region != US_KEYBOARD else "")
+    formats = region or lang
+    return (f"{setup}      <InputLocale>{keyboards}</InputLocale>\n      <SystemLocale>{formats}</SystemLocale>\n"
+            f"      <UILanguage>{lang}</UILanguage>\n      <UserLocale>{formats}</UserLocale>\n")
 
 
 def _disks(uefi: bool) -> tuple[str, int]:
@@ -166,16 +169,18 @@ def first_logon_commands(*, remote_desktop: bool, dark: bool, guest_tools: bool)
 
 def answer_file(*, user: str, password: str, computer: str, edition: str, uefi: bool, language: str = DEFAULT_LANGUAGE,
                 virtio: bool = True, remote_desktop: bool = False, dark: bool = False,
-                guest_tools: bool = True, time_zone: str = "") -> str:
+                guest_tools: bool = True, time_zone: str = "", region: str = "") -> str:
     """autounattend.xml for a new VM. `uefi`: the VM boots UEFI (GPT disk) or BIOS (MBR); `virtio`: the VirtIO disc
     is attached (drivers loaded from it in Setup, and its guest tools installed at the end when `guest_tools`).
     `time_zone`: Windows' name of it ("GTB Standard Time") — the app gives this computer's (core/timezones.py); without
-    one Windows keeps Pacific time (the first live test showed 10:38 AM at 20:38 in Athens)."""
+    one Windows keeps Pacific time (the first live test showed 10:38 AM at 20:38 in Athens). `region`: the place's
+    language and country ("el-GR", from the Proxmox host's zone): the regional formats and a second keyboard."""
     problem = check_user(user, password, remote_desktop, edition)
     if problem:
         raise ValueError(problem)
-    if language not in LANGUAGES and not re.fullmatch(r"[a-z]{2,3}-[A-Z]{2}", language):
-        raise ValueError(f"language {language!r}")
+    for code in (language, region):
+        if code and code not in LANGUAGES and not re.fullmatch(r"[a-z]{2,3}-[A-Z]{2}", code):
+            raise ValueError(f"language {code!r}")
     pe = _component("Microsoft-Windows-International-Core-WinPE", _locale(language, True))
     if virtio:
         paths, n = "", 0
@@ -218,7 +223,7 @@ def answer_file(*, user: str, password: str, computer: str, edition: str, uefi: 
              f"      <AutoLogon><Enabled>true</Enabled><LogonCount>1</LogonCount><Username>{escape(user)}</Username>"
              f"<Password>{secret}</Password></AutoLogon>\n"
              + (f"      <FirstLogonCommands>\n{commands}      </FirstLogonCommands>\n" if commands else ""))
-    oobe = _component("Microsoft-Windows-International-Core", _locale(language, False)) + \
+    oobe = _component("Microsoft-Windows-International-Core", _locale(language, False, region)) + \
         _component("Microsoft-Windows-Shell-Setup", shell)
     return ('<?xml version="1.0" encoding="utf-8"?>\n'
             '<unattend xmlns="urn:schemas-microsoft-com:unattend" '

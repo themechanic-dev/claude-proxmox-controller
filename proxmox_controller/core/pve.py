@@ -271,6 +271,10 @@ class Pve:
     def nodes(self) -> list[dict]:
         return self.get("/nodes") or []
 
+    def node_time(self, node: str) -> dict:
+        """A node's clock and time zone: {"timezone": "Europe/Athens", "localtime", "time"}."""
+        return self.get(f"/nodes/{q(node)}/time") or {}
+
     def node_status(self, node: str) -> dict:
         return self.get(f"/nodes/{q(node)}/status") or {}
 

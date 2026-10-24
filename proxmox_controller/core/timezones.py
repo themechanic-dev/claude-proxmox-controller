@@ -1,215 +1,286 @@
-"""Time zones by their Windows names — for a new Windows VM's answer file, which takes only those — with the IANA
-zones (what Linux and macOS name) each one covers, the main one first: Unicode CLDR's windowsZones.xml (typeVersion
-2021a, otherVersion 7e11800) made into a table by a one-off script, not edited by hand — plus the newer IANA names
-CLDR still lists by their old ones."""
+"""Time zones, countries and languages for a new VM, from Unicode CLDR: windowsZones.xml (typeVersion 2021a,
+otherVersion 7e11800) — each Windows time zone with the IANA zones it covers, the main one first, and each zone's
+country — and likelySubtags.xml — each country's main language. Made into tables by a one-off script, not edited by
+hand.
+
+The app sets a new VM's time zone, regional formats and second keyboard from the time zone of the Proxmox host it runs
+on (the user's choice, 24/10, for a project published for everyone: Athens → Greek formats and keyboard), else of this
+computer — the first keyboard staying US English, as the console types."""
 
 from __future__ import annotations
 
 import os
 import sys
 
+# Windows time zone → its IANA zones, the main one first; "@XX": the zone's country
 WINDOWS_ZONES = {
-    "AUS Central Standard Time": "Australia/Darwin",
-    "AUS Eastern Standard Time": "Australia/Sydney Australia/Melbourne",
-    "Afghanistan Standard Time": "Asia/Kabul",
-    "Alaskan Standard Time": ("America/Anchorage America/Juneau America/Metlakatla America/Nome America/Sitka "
-                              "America/Yakutat"),
-    "Alberta Standard Time": "America/Edmonton America/Inuvik",
-    "Aleutian Standard Time": "America/Adak",
-    "Altai Standard Time": "Asia/Barnaul",
-    "Arab Standard Time": "Asia/Riyadh Asia/Bahrain Asia/Kuwait Asia/Qatar Asia/Aden",
-    "Arabian Standard Time": "Asia/Dubai Asia/Muscat Etc/GMT-4",
-    "Arabic Standard Time": "Asia/Baghdad",
-    "Argentina Standard Time": ("America/Buenos_Aires America/Argentina/La_Rioja America/Argentina/Rio_Gallegos "
-                                "America/Argentina/Salta America/Argentina/San_Juan America/Argentina/San_Luis "
-                                "America/Argentina/Tucuman America/Argentina/Ushuaia America/Catamarca "
-                                "America/Cordoba America/Jujuy America/Mendoza"),
-    "Astrakhan Standard Time": "Europe/Astrakhan Europe/Ulyanovsk",
-    "Atlantic Standard Time": ("America/Halifax Atlantic/Bermuda America/Glace_Bay America/Goose_Bay "
-                               "America/Moncton America/Thule"),
-    "Aus Central W. Standard Time": "Australia/Eucla",
-    "Azerbaijan Standard Time": "Asia/Baku",
-    "Azores Standard Time": "Atlantic/Azores America/Scoresbysund",
-    "Bahia Standard Time": "America/Bahia",
-    "Bangladesh Standard Time": "Asia/Dhaka Asia/Thimphu",
-    "Belarus Standard Time": "Europe/Minsk",
-    "Bougainville Standard Time": "Pacific/Bougainville",
-    "British Columbia Standard Time": "America/Vancouver",
-    "Canada Central Standard Time": "America/Regina America/Swift_Current",
-    "Cape Verde Standard Time": "Atlantic/Cape_Verde Etc/GMT+1",
-    "Caucasus Standard Time": "Asia/Yerevan",
-    "Cen. Australia Standard Time": "Australia/Adelaide Australia/Broken_Hill",
-    "Central America Standard Time": ("America/Guatemala America/Belize America/Costa_Rica Pacific/Galapagos "
-                                      "America/Tegucigalpa America/Managua America/El_Salvador Etc/GMT+6"),
-    "Central Asia Standard Time": "Asia/Bishkek Antarctica/Vostok Asia/Urumqi Indian/Chagos Etc/GMT-6",
-    "Central Brazilian Standard Time": "America/Cuiaba America/Campo_Grande",
-    "Central Europe Standard Time": ("Europe/Budapest Europe/Tirane Europe/Prague Europe/Podgorica "
-                                     "Europe/Belgrade Europe/Ljubljana Europe/Bratislava"),
-    "Central European Standard Time": "Europe/Warsaw Europe/Sarajevo Europe/Zagreb Europe/Skopje",
-    "Central Pacific Standard Time": ("Pacific/Guadalcanal Antarctica/Casey Pacific/Ponape Pacific/Kosrae "
-                                      "Pacific/Noumea Pacific/Efate Etc/GMT-11"),
-    "Central Standard Time": ("America/Chicago America/Rankin_Inlet America/Resolute America/Matamoros "
-                              "America/Ojinaga America/Indiana/Knox America/Indiana/Tell_City America/Menominee "
-                              "America/North_Dakota/Beulah America/North_Dakota/Center "
-                              "America/North_Dakota/New_Salem"),
-    "Central Standard Time (Mexico)": ("America/Mexico_City America/Bahia_Banderas America/Merida "
-                                       "America/Monterrey America/Chihuahua"),
-    "Chatham Islands Standard Time": "Pacific/Chatham",
-    "China Standard Time": "Asia/Shanghai Asia/Hong_Kong Asia/Macau",
-    "Cuba Standard Time": "America/Havana",
+    "AUS Central Standard Time": "Australia/Darwin@AU",
+    "AUS Eastern Standard Time": "Australia/Sydney@AU Australia/Melbourne@AU",
+    "Afghanistan Standard Time": "Asia/Kabul@AF",
+    "Alaskan Standard Time": ("America/Anchorage@US America/Juneau@US America/Metlakatla@US America/Nome@US "
+                              "America/Sitka@US America/Yakutat@US"),
+    "Alberta Standard Time": "America/Edmonton@CA America/Inuvik@CA",
+    "Aleutian Standard Time": "America/Adak@US",
+    "Altai Standard Time": "Asia/Barnaul@RU",
+    "Arab Standard Time": "Asia/Riyadh@SA Asia/Bahrain@BH Asia/Kuwait@KW Asia/Qatar@QA Asia/Aden@YE",
+    "Arabian Standard Time": "Asia/Dubai@AE Asia/Muscat@OM Etc/GMT-4",
+    "Arabic Standard Time": "Asia/Baghdad@IQ",
+    "Argentina Standard Time": ("America/Buenos_Aires@AR America/Argentina/La_Rioja@AR "
+                                "America/Argentina/Rio_Gallegos@AR America/Argentina/Salta@AR "
+                                "America/Argentina/San_Juan@AR America/Argentina/San_Luis@AR "
+                                "America/Argentina/Tucuman@AR America/Argentina/Ushuaia@AR America/Catamarca@AR "
+                                "America/Cordoba@AR America/Jujuy@AR America/Mendoza@AR"),
+    "Astrakhan Standard Time": "Europe/Astrakhan@RU Europe/Ulyanovsk@RU",
+    "Atlantic Standard Time": ("America/Halifax@CA Atlantic/Bermuda@BM America/Glace_Bay@CA America/Goose_Bay@CA "
+                               "America/Moncton@CA America/Thule@GL"),
+    "Aus Central W. Standard Time": "Australia/Eucla@AU",
+    "Azerbaijan Standard Time": "Asia/Baku@AZ",
+    "Azores Standard Time": "Atlantic/Azores@PT America/Scoresbysund@GL",
+    "Bahia Standard Time": "America/Bahia@BR",
+    "Bangladesh Standard Time": "Asia/Dhaka@BD Asia/Thimphu@BT",
+    "Belarus Standard Time": "Europe/Minsk@BY",
+    "Bougainville Standard Time": "Pacific/Bougainville@PG",
+    "British Columbia Standard Time": "America/Vancouver@CA",
+    "Canada Central Standard Time": "America/Regina@CA America/Swift_Current@CA",
+    "Cape Verde Standard Time": "Atlantic/Cape_Verde@CV Etc/GMT+1",
+    "Caucasus Standard Time": "Asia/Yerevan@AM",
+    "Cen. Australia Standard Time": "Australia/Adelaide@AU Australia/Broken_Hill@AU",
+    "Central America Standard Time": ("America/Guatemala@GT America/Belize@BZ America/Costa_Rica@CR "
+                                      "Pacific/Galapagos@EC America/Tegucigalpa@HN America/Managua@NI "
+                                      "America/El_Salvador@SV Etc/GMT+6"),
+    "Central Asia Standard Time": "Asia/Bishkek@KG Antarctica/Vostok@AQ Asia/Urumqi@CN Indian/Chagos@IO Etc/GMT-6",
+    "Central Brazilian Standard Time": "America/Cuiaba@BR America/Campo_Grande@BR",
+    "Central Europe Standard Time": ("Europe/Budapest@HU Europe/Tirane@AL Europe/Prague@CZ Europe/Podgorica@ME "
+                                     "Europe/Belgrade@RS Europe/Ljubljana@SI Europe/Bratislava@SK"),
+    "Central European Standard Time": "Europe/Warsaw@PL Europe/Sarajevo@BA Europe/Zagreb@HR Europe/Skopje@MK",
+    "Central Pacific Standard Time": ("Pacific/Guadalcanal@SB Antarctica/Casey@AQ Pacific/Ponape@FM "
+                                      "Pacific/Kosrae@FM Pacific/Noumea@NC Pacific/Efate@VU Etc/GMT-11"),
+    "Central Standard Time": ("America/Chicago@US America/Rankin_Inlet@CA America/Resolute@CA "
+                              "America/Matamoros@MX America/Ojinaga@MX America/Indiana/Knox@US "
+                              "America/Indiana/Tell_City@US America/Menominee@US America/North_Dakota/Beulah@US "
+                              "America/North_Dakota/Center@US America/North_Dakota/New_Salem@US"),
+    "Central Standard Time (Mexico)": ("America/Mexico_City@MX America/Bahia_Banderas@MX America/Merida@MX "
+                                       "America/Monterrey@MX America/Chihuahua@MX"),
+    "Chatham Islands Standard Time": "Pacific/Chatham@NZ",
+    "China Standard Time": "Asia/Shanghai@CN Asia/Hong_Kong@HK Asia/Macau@MO",
+    "Cuba Standard Time": "America/Havana@CU",
     "Dateline Standard Time": "Etc/GMT+12",
-    "E. Africa Standard Time": ("Africa/Nairobi Antarctica/Syowa Africa/Djibouti Africa/Asmera Africa/Addis_Ababa "
-                                "Indian/Comoro Indian/Antananarivo Africa/Mogadishu Africa/Dar_es_Salaam "
-                                "Africa/Kampala Indian/Mayotte Etc/GMT-3"),
-    "E. Australia Standard Time": "Australia/Brisbane Australia/Lindeman",
-    "E. Europe Standard Time": "Europe/Chisinau",
-    "E. South America Standard Time": "America/Sao_Paulo",
-    "Easter Island Standard Time": "Pacific/Easter",
-    "Eastern Standard Time": ("America/New_York America/Nassau America/Toronto America/Iqaluit America/Detroit "
-                              "America/Indiana/Petersburg America/Indiana/Vincennes America/Indiana/Winamac "
-                              "America/Kentucky/Monticello America/Louisville"),
-    "Eastern Standard Time (Mexico)": "America/Cancun",
-    "Egypt Standard Time": "Africa/Cairo",
-    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
-    "FLE Standard Time": ("Europe/Kiev Europe/Mariehamn Europe/Sofia Europe/Tallinn Europe/Helsinki "
-                          "Europe/Vilnius Europe/Riga"),
-    "Fiji Standard Time": "Pacific/Fiji",
-    "GMT Standard Time": ("Europe/London Atlantic/Canary Atlantic/Faeroe Europe/Guernsey Europe/Dublin "
-                          "Europe/Isle_of_Man Europe/Jersey Europe/Lisbon Atlantic/Madeira"),
-    "GTB Standard Time": "Europe/Bucharest Asia/Nicosia Asia/Famagusta Europe/Athens",
-    "Georgian Standard Time": "Asia/Tbilisi",
-    "Greenland Standard Time": "America/Godthab",
-    "Greenwich Standard Time": ("Atlantic/Reykjavik Africa/Ouagadougou Africa/Abidjan Africa/Accra "
-                                "America/Danmarkshavn Africa/Banjul Africa/Conakry Africa/Bissau Africa/Monrovia "
-                                "Africa/Bamako Africa/Nouakchott Atlantic/St_Helena Africa/Freetown Africa/Dakar "
-                                "Africa/Lome"),
-    "Haiti Standard Time": "America/Port-au-Prince",
-    "Hawaiian Standard Time": "Pacific/Honolulu Pacific/Rarotonga Pacific/Tahiti Etc/GMT+10",
-    "India Standard Time": "Asia/Calcutta",
-    "Iran Standard Time": "Asia/Tehran",
-    "Israel Standard Time": "Asia/Jerusalem",
-    "Jordan Standard Time": "Asia/Amman",
-    "Kaliningrad Standard Time": "Europe/Kaliningrad",
-    "Korea Standard Time": "Asia/Seoul",
-    "Libya Standard Time": "Africa/Tripoli",
-    "Line Islands Standard Time": "Pacific/Kiritimati Etc/GMT-14",
-    "Lord Howe Standard Time": "Australia/Lord_Howe",
-    "Magadan Standard Time": "Asia/Magadan",
-    "Magallanes Standard Time": "America/Punta_Arenas America/Coyhaique",
-    "Manitoba Standard Time": "America/Winnipeg",
-    "Marquesas Standard Time": "Pacific/Marquesas",
-    "Mauritius Standard Time": "Indian/Mauritius Indian/Reunion Indian/Mahe",
-    "Middle East Standard Time": "Asia/Beirut",
-    "Montevideo Standard Time": "America/Montevideo",
-    "Morocco Standard Time": "Africa/Casablanca Africa/El_Aaiun",
-    "Mountain Standard Time": "America/Denver America/Cambridge_Bay America/Ciudad_Juarez America/Boise",
-    "Mountain Standard Time (Mexico)": "America/Mazatlan",
-    "Myanmar Standard Time": "Asia/Rangoon Indian/Cocos",
-    "N. Central Asia Standard Time": "Asia/Novosibirsk",
-    "Namibia Standard Time": "Africa/Windhoek",
-    "Nepal Standard Time": "Asia/Katmandu",
-    "New Zealand Standard Time": "Pacific/Auckland Antarctica/McMurdo",
-    "Newfoundland Standard Time": "America/St_Johns",
-    "Norfolk Standard Time": "Pacific/Norfolk",
-    "North Asia East Standard Time": "Asia/Irkutsk",
-    "North Asia Standard Time": "Asia/Krasnoyarsk Asia/Novokuznetsk",
-    "North Korea Standard Time": "Asia/Pyongyang",
-    "Omsk Standard Time": "Asia/Omsk",
-    "Pacific SA Standard Time": "America/Santiago",
-    "Pacific Standard Time": "America/Los_Angeles",
-    "Pacific Standard Time (Mexico)": "America/Tijuana",
-    "Pakistan Standard Time": "Asia/Karachi",
-    "Paraguay Standard Time": "America/Asuncion",
-    "Qyzylorda Standard Time": "Asia/Qyzylorda",
-    "Romance Standard Time": "Europe/Paris Europe/Brussels Europe/Copenhagen Europe/Madrid Africa/Ceuta",
-    "Russia Time Zone 10": "Asia/Srednekolymsk",
-    "Russia Time Zone 11": "Asia/Kamchatka Asia/Anadyr",
-    "Russia Time Zone 3": "Europe/Samara",
-    "Russian Standard Time": "Europe/Moscow Europe/Kirov Europe/Simferopol",
-    "SA Eastern Standard Time": ("America/Cayenne Antarctica/Rothera Antarctica/Palmer America/Fortaleza "
-                                 "America/Belem America/Maceio America/Recife America/Santarem Atlantic/Stanley "
-                                 "America/Paramaribo Etc/GMT+3"),
-    "SA Pacific Standard Time": ("America/Bogota America/Rio_Branco America/Eirunepe America/Coral_Harbour "
-                                 "America/Guayaquil America/Jamaica America/Cayman America/Panama America/Lima "
-                                 "Etc/GMT+5"),
-    "SA Western Standard Time": ("America/La_Paz America/Antigua America/Anguilla America/Aruba America/Barbados "
-                                 "America/St_Barthelemy America/Kralendijk America/Manaus America/Boa_Vista "
-                                 "America/Porto_Velho America/Blanc-Sablon America/Curacao America/Dominica "
-                                 "America/Santo_Domingo America/Grenada America/Guadeloupe America/Guyana "
-                                 "America/St_Kitts America/St_Lucia America/Marigot America/Martinique "
-                                 "America/Montserrat America/Puerto_Rico America/Lower_Princes "
-                                 "America/Port_of_Spain America/St_Vincent America/Tortola America/St_Thomas "
-                                 "Etc/GMT+4"),
-    "SE Asia Standard Time": ("Asia/Bangkok Antarctica/Davis Indian/Christmas Asia/Jakarta Asia/Pontianak "
-                              "Asia/Phnom_Penh Asia/Vientiane Asia/Saigon Etc/GMT-7"),
-    "Saint Pierre Standard Time": "America/Miquelon",
-    "Sakhalin Standard Time": "Asia/Sakhalin",
-    "Samoa Standard Time": "Pacific/Apia",
-    "Sao Tome Standard Time": "Africa/Sao_Tome",
-    "Saratov Standard Time": "Europe/Saratov",
-    "Singapore Standard Time": ("Asia/Singapore Asia/Brunei Asia/Makassar Asia/Kuala_Lumpur Asia/Kuching "
-                                "Asia/Manila Etc/GMT-8"),
-    "South Africa Standard Time": ("Africa/Johannesburg Africa/Bujumbura Africa/Gaborone Africa/Lubumbashi "
-                                   "Africa/Maseru Africa/Blantyre Africa/Maputo Africa/Kigali Africa/Mbabane "
-                                   "Africa/Lusaka Africa/Harare Etc/GMT-2"),
-    "South Sudan Standard Time": "Africa/Juba",
-    "Sri Lanka Standard Time": "Asia/Colombo",
-    "Sudan Standard Time": "Africa/Khartoum",
-    "Syria Standard Time": "Asia/Damascus",
-    "Taipei Standard Time": "Asia/Taipei",
-    "Tasmania Standard Time": "Australia/Hobart Antarctica/Macquarie",
-    "Tocantins Standard Time": "America/Araguaina",
-    "Tokyo Standard Time": "Asia/Tokyo Asia/Jayapura Pacific/Palau Asia/Dili Etc/GMT-9",
-    "Tomsk Standard Time": "Asia/Tomsk",
-    "Tonga Standard Time": "Pacific/Tongatapu",
-    "Transbaikal Standard Time": "Asia/Chita",
-    "Turkey Standard Time": "Europe/Istanbul",
-    "Turks And Caicos Standard Time": "America/Grand_Turk",
-    "US Eastern Standard Time": "America/Indianapolis America/Indiana/Marengo America/Indiana/Vevay",
-    "US Mountain Standard Time": ("America/Phoenix America/Creston America/Dawson_Creek America/Fort_Nelson "
-                                  "America/Hermosillo Etc/GMT+7"),
+    "E. Africa Standard Time": ("Africa/Nairobi@KE Antarctica/Syowa@AQ Africa/Djibouti@DJ Africa/Asmera@ER "
+                                "Africa/Addis_Ababa@ET Indian/Comoro@KM Indian/Antananarivo@MG "
+                                "Africa/Mogadishu@SO Africa/Dar_es_Salaam@TZ Africa/Kampala@UG Indian/Mayotte@YT "
+                                "Etc/GMT-3"),
+    "E. Australia Standard Time": "Australia/Brisbane@AU Australia/Lindeman@AU",
+    "E. Europe Standard Time": "Europe/Chisinau@MD",
+    "E. South America Standard Time": "America/Sao_Paulo@BR",
+    "Easter Island Standard Time": "Pacific/Easter@CL",
+    "Eastern Standard Time": ("America/New_York@US America/Nassau@BS America/Toronto@CA America/Iqaluit@CA "
+                              "America/Detroit@US America/Indiana/Petersburg@US America/Indiana/Vincennes@US "
+                              "America/Indiana/Winamac@US America/Kentucky/Monticello@US America/Louisville@US"),
+    "Eastern Standard Time (Mexico)": "America/Cancun@MX",
+    "Egypt Standard Time": "Africa/Cairo@EG",
+    "Ekaterinburg Standard Time": "Asia/Yekaterinburg@RU",
+    "FLE Standard Time": ("Europe/Kiev@UA Europe/Mariehamn@AX Europe/Sofia@BG Europe/Tallinn@EE "
+                          "Europe/Helsinki@FI Europe/Vilnius@LT Europe/Riga@LV"),
+    "Fiji Standard Time": "Pacific/Fiji@FJ",
+    "GMT Standard Time": ("Europe/London@GB Atlantic/Canary@ES Atlantic/Faeroe@FO Europe/Guernsey@GG "
+                          "Europe/Dublin@IE Europe/Isle_of_Man@IM Europe/Jersey@JE Europe/Lisbon@PT "
+                          "Atlantic/Madeira@PT"),
+    "GTB Standard Time": "Europe/Bucharest@RO Asia/Nicosia@CY Asia/Famagusta@CY Europe/Athens@GR",
+    "Georgian Standard Time": "Asia/Tbilisi@GE",
+    "Greenland Standard Time": "America/Godthab@GL",
+    "Greenwich Standard Time": ("Atlantic/Reykjavik@IS Africa/Ouagadougou@BF Africa/Abidjan@CI Africa/Accra@GH "
+                                "America/Danmarkshavn@GL Africa/Banjul@GM Africa/Conakry@GN Africa/Bissau@GW "
+                                "Africa/Monrovia@LR Africa/Bamako@ML Africa/Nouakchott@MR Atlantic/St_Helena@SH "
+                                "Africa/Freetown@SL Africa/Dakar@SN Africa/Lome@TG"),
+    "Haiti Standard Time": "America/Port-au-Prince@HT",
+    "Hawaiian Standard Time": "Pacific/Honolulu@US Pacific/Rarotonga@CK Pacific/Tahiti@PF Etc/GMT+10",
+    "India Standard Time": "Asia/Calcutta@IN",
+    "Iran Standard Time": "Asia/Tehran@IR",
+    "Israel Standard Time": "Asia/Jerusalem@IL",
+    "Jordan Standard Time": "Asia/Amman@JO",
+    "Kaliningrad Standard Time": "Europe/Kaliningrad@RU",
+    "Korea Standard Time": "Asia/Seoul@KR",
+    "Libya Standard Time": "Africa/Tripoli@LY",
+    "Line Islands Standard Time": "Pacific/Kiritimati@KI Etc/GMT-14",
+    "Lord Howe Standard Time": "Australia/Lord_Howe@AU",
+    "Magadan Standard Time": "Asia/Magadan@RU",
+    "Magallanes Standard Time": "America/Punta_Arenas@CL America/Coyhaique@CL",
+    "Manitoba Standard Time": "America/Winnipeg@CA",
+    "Marquesas Standard Time": "Pacific/Marquesas@PF",
+    "Mauritius Standard Time": "Indian/Mauritius@MU Indian/Reunion@RE Indian/Mahe@SC",
+    "Middle East Standard Time": "Asia/Beirut@LB",
+    "Montevideo Standard Time": "America/Montevideo@UY",
+    "Morocco Standard Time": "Africa/Casablanca@MA Africa/El_Aaiun@EH",
+    "Mountain Standard Time": "America/Denver@US America/Cambridge_Bay@CA America/Ciudad_Juarez@MX America/Boise@US",
+    "Mountain Standard Time (Mexico)": "America/Mazatlan@MX",
+    "Myanmar Standard Time": "Asia/Rangoon@MM Indian/Cocos@CC",
+    "N. Central Asia Standard Time": "Asia/Novosibirsk@RU",
+    "Namibia Standard Time": "Africa/Windhoek@NA",
+    "Nepal Standard Time": "Asia/Katmandu@NP",
+    "New Zealand Standard Time": "Pacific/Auckland@NZ Antarctica/McMurdo@AQ",
+    "Newfoundland Standard Time": "America/St_Johns@CA",
+    "Norfolk Standard Time": "Pacific/Norfolk@NF",
+    "North Asia East Standard Time": "Asia/Irkutsk@RU",
+    "North Asia Standard Time": "Asia/Krasnoyarsk@RU Asia/Novokuznetsk@RU",
+    "North Korea Standard Time": "Asia/Pyongyang@KP",
+    "Omsk Standard Time": "Asia/Omsk@RU",
+    "Pacific SA Standard Time": "America/Santiago@CL",
+    "Pacific Standard Time": "America/Los_Angeles@US",
+    "Pacific Standard Time (Mexico)": "America/Tijuana@MX",
+    "Pakistan Standard Time": "Asia/Karachi@PK",
+    "Paraguay Standard Time": "America/Asuncion@PY",
+    "Qyzylorda Standard Time": "Asia/Qyzylorda@KZ",
+    "Romance Standard Time": ("Europe/Paris@FR Europe/Brussels@BE Europe/Copenhagen@DK Europe/Madrid@ES "
+                              "Africa/Ceuta@ES"),
+    "Russia Time Zone 10": "Asia/Srednekolymsk@RU",
+    "Russia Time Zone 11": "Asia/Kamchatka@RU Asia/Anadyr@RU",
+    "Russia Time Zone 3": "Europe/Samara@RU",
+    "Russian Standard Time": "Europe/Moscow@RU Europe/Kirov@RU Europe/Simferopol@UA",
+    "SA Eastern Standard Time": ("America/Cayenne@GF Antarctica/Rothera@AQ Antarctica/Palmer@AQ "
+                                 "America/Fortaleza@BR America/Belem@BR America/Maceio@BR America/Recife@BR "
+                                 "America/Santarem@BR Atlantic/Stanley@FK America/Paramaribo@SR Etc/GMT+3"),
+    "SA Pacific Standard Time": ("America/Bogota@CO America/Rio_Branco@BR America/Eirunepe@BR "
+                                 "America/Coral_Harbour@CA America/Guayaquil@EC America/Jamaica@JM "
+                                 "America/Cayman@KY America/Panama@PA America/Lima@PE Etc/GMT+5"),
+    "SA Western Standard Time": ("America/La_Paz@BO America/Antigua@AG America/Anguilla@AI America/Aruba@AW "
+                                 "America/Barbados@BB America/St_Barthelemy@BL America/Kralendijk@BQ "
+                                 "America/Manaus@BR America/Boa_Vista@BR America/Porto_Velho@BR "
+                                 "America/Blanc-Sablon@CA America/Curacao@CW America/Dominica@DM "
+                                 "America/Santo_Domingo@DO America/Grenada@GD America/Guadeloupe@GP "
+                                 "America/Guyana@GY America/St_Kitts@KN America/St_Lucia@LC America/Marigot@MF "
+                                 "America/Martinique@MQ America/Montserrat@MS America/Puerto_Rico@PR "
+                                 "America/Lower_Princes@SX America/Port_of_Spain@TT America/St_Vincent@VC "
+                                 "America/Tortola@VG America/St_Thomas@VI Etc/GMT+4"),
+    "SE Asia Standard Time": ("Asia/Bangkok@TH Antarctica/Davis@AQ Indian/Christmas@CX Asia/Jakarta@ID "
+                              "Asia/Pontianak@ID Asia/Phnom_Penh@KH Asia/Vientiane@LA Asia/Saigon@VN Etc/GMT-7"),
+    "Saint Pierre Standard Time": "America/Miquelon@PM",
+    "Sakhalin Standard Time": "Asia/Sakhalin@RU",
+    "Samoa Standard Time": "Pacific/Apia@WS",
+    "Sao Tome Standard Time": "Africa/Sao_Tome@ST",
+    "Saratov Standard Time": "Europe/Saratov@RU",
+    "Singapore Standard Time": ("Asia/Singapore@SG Asia/Brunei@BN Asia/Makassar@ID Asia/Kuala_Lumpur@MY "
+                                "Asia/Kuching@MY Asia/Manila@PH Etc/GMT-8"),
+    "South Africa Standard Time": ("Africa/Johannesburg@ZA Africa/Bujumbura@BI Africa/Gaborone@BW "
+                                   "Africa/Lubumbashi@CD Africa/Maseru@LS Africa/Blantyre@MW Africa/Maputo@MZ "
+                                   "Africa/Kigali@RW Africa/Mbabane@SZ Africa/Lusaka@ZM Africa/Harare@ZW "
+                                   "Etc/GMT-2"),
+    "South Sudan Standard Time": "Africa/Juba@SS",
+    "Sri Lanka Standard Time": "Asia/Colombo@LK",
+    "Sudan Standard Time": "Africa/Khartoum@SD",
+    "Syria Standard Time": "Asia/Damascus@SY",
+    "Taipei Standard Time": "Asia/Taipei@TW",
+    "Tasmania Standard Time": "Australia/Hobart@AU Antarctica/Macquarie@AU",
+    "Tocantins Standard Time": "America/Araguaina@BR",
+    "Tokyo Standard Time": "Asia/Tokyo@JP Asia/Jayapura@ID Pacific/Palau@PW Asia/Dili@TL Etc/GMT-9",
+    "Tomsk Standard Time": "Asia/Tomsk@RU",
+    "Tonga Standard Time": "Pacific/Tongatapu@TO",
+    "Transbaikal Standard Time": "Asia/Chita@RU",
+    "Turkey Standard Time": "Europe/Istanbul@TR",
+    "Turks And Caicos Standard Time": "America/Grand_Turk@TC",
+    "US Eastern Standard Time": "America/Indianapolis@US America/Indiana/Marengo@US America/Indiana/Vevay@US",
+    "US Mountain Standard Time": ("America/Phoenix@US America/Creston@CA America/Dawson_Creek@CA "
+                                  "America/Fort_Nelson@CA America/Hermosillo@MX Etc/GMT+7"),
     "UTC": "Etc/UTC Etc/GMT",
-    "UTC+12": ("Etc/GMT-12 Pacific/Tarawa Pacific/Majuro Pacific/Kwajalein Pacific/Nauru Pacific/Funafuti "
-               "Pacific/Wake Pacific/Wallis"),
-    "UTC+13": "Etc/GMT-13 Pacific/Enderbury Pacific/Fakaofo",
-    "UTC-02": "Etc/GMT+2 America/Noronha Atlantic/South_Georgia",
-    "UTC-08": "Etc/GMT+8 Pacific/Pitcairn",
-    "UTC-09": "Etc/GMT+9 Pacific/Gambier",
-    "UTC-11": "Etc/GMT+11 Pacific/Pago_Pago Pacific/Niue Pacific/Midway",
-    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar",
-    "Venezuela Standard Time": "America/Caracas",
-    "Vladivostok Standard Time": "Asia/Vladivostok Asia/Ust-Nera",
-    "Volgograd Standard Time": "Europe/Volgograd",
-    "W. Australia Standard Time": "Australia/Perth",
-    "W. Central Africa Standard Time": ("Africa/Lagos Africa/Luanda Africa/Porto-Novo Africa/Kinshasa "
-                                        "Africa/Bangui Africa/Brazzaville Africa/Douala Africa/Algiers "
-                                        "Africa/Libreville Africa/Malabo Africa/Niamey Africa/Ndjamena "
-                                        "Africa/Tunis Etc/GMT-1"),
-    "W. Europe Standard Time": ("Europe/Berlin Europe/Andorra Europe/Vienna Europe/Zurich Europe/Busingen "
-                                "Europe/Gibraltar Europe/Rome Europe/Vaduz Europe/Luxembourg Europe/Monaco "
-                                "Europe/Malta Europe/Amsterdam Europe/Oslo Europe/Stockholm Arctic/Longyearbyen "
-                                "Europe/San_Marino Europe/Vatican"),
-    "W. Mongolia Standard Time": "Asia/Hovd",
-    "West Asia Standard Time": ("Asia/Tashkent Antarctica/Mawson Asia/Oral Asia/Almaty Asia/Aqtau Asia/Aqtobe "
-                                "Asia/Atyrau Asia/Qostanay Indian/Maldives Indian/Kerguelen Asia/Dushanbe "
-                                "Asia/Ashgabat Asia/Samarkand Etc/GMT-5"),
-    "West Bank Standard Time": "Asia/Hebron Asia/Gaza",
-    "West Pacific Standard Time": ("Pacific/Port_Moresby Antarctica/DumontDUrville Pacific/Truk Pacific/Guam "
-                                   "Pacific/Saipan Etc/GMT-10"),
-    "Yakutsk Standard Time": "Asia/Yakutsk Asia/Khandyga",
-    "Yukon Standard Time": "America/Whitehorse America/Dawson",
+    "UTC+12": ("Etc/GMT-12 Pacific/Tarawa@KI Pacific/Majuro@MH Pacific/Kwajalein@MH Pacific/Nauru@NR "
+               "Pacific/Funafuti@TV Pacific/Wake@UM Pacific/Wallis@WF"),
+    "UTC+13": "Etc/GMT-13 Pacific/Enderbury@KI Pacific/Fakaofo@TK",
+    "UTC-02": "Etc/GMT+2 America/Noronha@BR Atlantic/South_Georgia@GS",
+    "UTC-08": "Etc/GMT+8 Pacific/Pitcairn@PN",
+    "UTC-09": "Etc/GMT+9 Pacific/Gambier@PF",
+    "UTC-11": "Etc/GMT+11 Pacific/Pago_Pago@AS Pacific/Niue@NU Pacific/Midway@UM",
+    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar@MN",
+    "Venezuela Standard Time": "America/Caracas@VE",
+    "Vladivostok Standard Time": "Asia/Vladivostok@RU Asia/Ust-Nera@RU",
+    "Volgograd Standard Time": "Europe/Volgograd@RU",
+    "W. Australia Standard Time": "Australia/Perth@AU",
+    "W. Central Africa Standard Time": ("Africa/Lagos@NG Africa/Luanda@AO Africa/Porto-Novo@BJ Africa/Kinshasa@CD "
+                                        "Africa/Bangui@CF Africa/Brazzaville@CG Africa/Douala@CM "
+                                        "Africa/Algiers@DZ Africa/Libreville@GA Africa/Malabo@GQ Africa/Niamey@NE "
+                                        "Africa/Ndjamena@TD Africa/Tunis@TN Etc/GMT-1"),
+    "W. Europe Standard Time": ("Europe/Berlin@DE Europe/Andorra@AD Europe/Vienna@AT Europe/Zurich@CH "
+                                "Europe/Busingen@DE Europe/Gibraltar@GI Europe/Rome@IT Europe/Vaduz@LI "
+                                "Europe/Luxembourg@LU Europe/Monaco@MC Europe/Malta@MT Europe/Amsterdam@NL "
+                                "Europe/Oslo@NO Europe/Stockholm@SE Arctic/Longyearbyen@SJ Europe/San_Marino@SM "
+                                "Europe/Vatican@VA"),
+    "W. Mongolia Standard Time": "Asia/Hovd@MN",
+    "West Asia Standard Time": ("Asia/Tashkent@UZ Antarctica/Mawson@AQ Asia/Oral@KZ Asia/Almaty@KZ Asia/Aqtau@KZ "
+                                "Asia/Aqtobe@KZ Asia/Atyrau@KZ Asia/Qostanay@KZ Indian/Maldives@MV "
+                                "Indian/Kerguelen@TF Asia/Dushanbe@TJ Asia/Ashgabat@TM Asia/Samarkand@UZ "
+                                "Etc/GMT-5"),
+    "West Bank Standard Time": "Asia/Hebron@PS Asia/Gaza@PS",
+    "West Pacific Standard Time": ("Pacific/Port_Moresby@PG Antarctica/DumontDUrville@AQ Pacific/Truk@FM "
+                                   "Pacific/Guam@GU Pacific/Saipan@MP Etc/GMT-10"),
+    "Yakutsk Standard Time": "Asia/Yakutsk@RU Asia/Khandyga@RU",
+    "Yukon Standard Time": "America/Whitehorse@CA America/Dawson@CA",
+}
+# country → its main language (CLDR's likely subtags)
+LANGUAGES = {
+    "AD": "ca", "AE": "ar", "AF": "fa", "AL": "sq", "AM": "hy", "AO": "pt", "AR": "es", "AS": "sm", "AT": "de",
+    "AW": "nl", "AX": "sv", "AZ": "az", "BA": "bs", "BD": "bn", "BE": "nl", "BF": "fr", "BG": "bg", "BH": "ar",
+    "BI": "rn", "BJ": "fr", "BL": "fr", "BN": "ms", "BO": "es", "BQ": "pap", "BR": "pt", "BT": "dz", "BY": "ru",
+    "CC": "ms", "CD": "fr", "CF": "sg", "CG": "fr", "CH": "de", "CI": "fr", "CL": "es", "CM": "fr", "CN": "zh",
+    "CO": "es", "CR": "es", "CU": "es", "CV": "pt", "CW": "pap", "CY": "el", "CZ": "cs", "DE": "de", "DJ": "fr",
+    "DK": "da", "DO": "es", "DZ": "ar", "EC": "es", "EE": "et", "EG": "ar", "EH": "ar", "ER": "ti", "ES": "es",
+    "ET": "am", "FI": "fi", "FO": "fo", "FR": "fr", "GA": "fr", "GE": "ka", "GF": "fr", "GH": "ak", "GL": "kl",
+    "GN": "fr", "GP": "fr", "GQ": "es", "GR": "el", "GT": "es", "GW": "pt", "HK": "zh", "HN": "es", "HR": "hr",
+    "HT": "ht", "HU": "hu", "ID": "id", "IL": "he", "IN": "hi", "IQ": "ar", "IR": "fa", "IS": "is", "IT": "it",
+    "JO": "ar", "JP": "ja", "KE": "sw", "KG": "ky", "KH": "km", "KM": "ar", "KP": "ko", "KR": "ko", "KW": "ar",
+    "KZ": "ru", "LA": "lo", "LB": "ar", "LI": "de", "LK": "si", "LS": "st", "LT": "lt", "LU": "fr", "LV": "lv",
+    "LY": "ar", "MA": "ar", "MC": "fr", "MD": "ro", "ME": "sr", "MF": "fr", "MG": "mg", "MK": "mk", "ML": "bm",
+    "MM": "my", "MN": "mn", "MO": "zh", "MQ": "fr", "MR": "ar", "MT": "mt", "MU": "fr", "MV": "dv", "MX": "es",
+    "MY": "ms", "MZ": "pt", "NA": "af", "NC": "fr", "NE": "ha", "NI": "es", "NL": "nl", "NO": "nb", "NP": "ne",
+    "OM": "ar", "PA": "es", "PE": "es", "PF": "fr", "PG": "tpi", "PH": "fil", "PK": "ur", "PL": "pl", "PM": "fr",
+    "PR": "es", "PS": "ar", "PT": "pt", "PW": "pau", "PY": "gn", "QA": "ar", "RE": "fr", "RO": "ro", "RS": "sr",
+    "RU": "ru", "RW": "rw", "SA": "ar", "SC": "fr", "SD": "ar", "SE": "sv", "SI": "sl", "SJ": "nb", "SK": "sk",
+    "SM": "it", "SN": "wo", "SO": "so", "SR": "nl", "SS": "ar", "ST": "pt", "SV": "es", "SY": "ar", "TD": "ar",
+    "TF": "fr", "TG": "fr", "TH": "th", "TJ": "tg", "TK": "tkl", "TL": "pt", "TM": "tk", "TN": "ar", "TO": "to",
+    "TR": "tr", "TV": "tvl", "TW": "zh", "TZ": "sw", "UA": "uk", "UG": "sw", "UY": "es", "UZ": "uz", "VA": "it",
+    "VE": "es", "VN": "vi", "VU": "bi", "WF": "fr", "WS": "sm", "YE": "ar", "YT": "fr", "ZW": "sn",
 }
 # newer IANA names (tzdata renames) → the name CLDR lists
 RENAMED = {"Europe/Kyiv": "Europe/Kiev", "America/Nuuk": "America/Godthab", "Asia/Kolkata": "Asia/Calcutta",
            "Asia/Kathmandu": "Asia/Katmandu", "Asia/Ho_Chi_Minh": "Asia/Saigon", "Asia/Yangon": "Asia/Rangoon",
            "Atlantic/Faroe": "Atlantic/Faeroe", "Pacific/Kanton": "Pacific/Enderbury", "Europe/Uzhgorod": "Europe/Kiev",
            "Europe/Zaporozhye": "Europe/Kiev", "America/Ciudad_Juarez": "America/Ojinaga"}
-_BY_IANA = {name: win for win, names in WINDOWS_ZONES.items() for name in names.split()}
+# keyboard layouts X11 (and so Ubuntu) has by the country's code — most countries; others get none added
+XKB_LAYOUTS = set("al am ara at az ba bd be bg br by ca ch cn cz de dk ee es fi fo fr gb ge gh gr hr hu ie il in iq "
+                  "ir is it jp ke kg kh kr kz la lk lt lv ma md me mk ml mm mn mt mv my ng nl no np ph pk pl pt ro rs "
+                  "ru se si sk sn sy th tj tm tr tw tz ua us uz vn za".split())
+_BY_IANA: dict[str, str] = {}
+_COUNTRY: dict[str, str] = {}
+for _win, _names in WINDOWS_ZONES.items():
+    for _entry in _names.split():
+        _name, _, _country = _entry.partition("@")
+        _BY_IANA.setdefault(_name, _win)
+        if _country:
+            _COUNTRY.setdefault(_name, _country)
+
+
+def _known(iana: str) -> str:
+    return iana if iana in _BY_IANA else RENAMED.get(iana, iana)
 
 
 def windows_zone(iana: str) -> str:
     """The Windows name of an IANA zone ("Europe/Athens" → "GTB Standard Time"), or ""."""
-    return _BY_IANA.get(iana) or _BY_IANA.get(RENAMED.get(iana, ""), "")
+    return _BY_IANA.get(_known(iana), "")
+
+
+def country(iana: str) -> str:
+    """The country of an IANA zone ("Europe/Athens" → "GR"), or ""."""
+    return _COUNTRY.get(_known(iana), "")
+
+
+def locale(iana: str) -> str:
+    """The language and country of an IANA zone's place ("Europe/Athens" → "el-GR"), or ""."""
+    c = country(iana)
+    # (CLDR leaves out the countries whose likely language is English: "und" alone is en_Latn_US)
+    return f"{LANGUAGES.get(c, 'en')}-{c}" if c and c != "AQ" else ""
+
+
+def keyboard(iana: str) -> str:
+    """The X11 keyboard layout of an IANA zone's country ("Europe/Athens" → "gr"), or ""."""
+    c = country(iana).lower()
+    return c if c in XKB_LAYOUTS else ""
 
 
 def local_iana() -> str:
@@ -234,7 +305,7 @@ def local_iana() -> str:
 
 def windows_zone_here() -> str:
     """This computer's time zone by its Windows name: Windows says it itself; elsewhere from the IANA zone. ""
-    when unknown (the new Windows then keeps its own default)."""
+    when unknown."""
     if sys.platform.startswith("win"):
         try:
             import winreg
@@ -244,3 +315,19 @@ def windows_zone_here() -> str:
         except OSError:
             return ""
     return windows_zone(local_iana())
+
+
+def host_zone(pve, node: str) -> str:
+    """The Proxmox node's IANA time zone, or "" if it cannot be read."""
+    try:
+        return str(pve.node_time(node).get("timezone") or "")
+    except Exception:  # (a token without Sys.Audit, an old host: this computer's zone instead)
+        return ""
+
+
+def region(host_zone: str) -> dict:
+    """A new VM's place: the Proxmox host's IANA zone (else this computer's) — its Windows name, its country's
+    language and country ("el-GR": regional formats, a second keyboard), and X11 keyboard layout."""
+    iana = host_zone or local_iana()
+    win = windows_zone(iana) or ("" if host_zone else windows_zone_here())
+    return {"iana": iana, "windows": win, "locale": locale(iana), "keyboard": keyboard(iana)}

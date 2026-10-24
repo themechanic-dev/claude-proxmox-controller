@@ -85,9 +85,11 @@ def hostname_of(vm_name: str) -> str:
 
 
 def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], desktop: bool = True,
-              remote_desktop: bool = False) -> str:
+              remote_desktop: bool = False, time_zone: str = "", keyboard: str = "") -> str:
     """The cloud-config: Proxmox's own user settings (the user as the image's default user, its password, SSH keys),
-    then the packages and what turns them on. Written as JSON, which is YAML too: nothing to quote by hand."""
+    then the packages and what turns them on. Written as JSON, which is YAML too: nothing to quote by hand.
+    `time_zone` (IANA) and `keyboard` (an X11 layout, after US English) come from the Proxmox host's place; the menus
+    stay in English (the user's choice, 24/10)."""
     if remote_desktop and not password:
         raise ValueError("Remote Desktop needs a password: xrdp signs in with the VM user's own.")
     host = hostname_of(vm_name)
@@ -99,6 +101,10 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], de
                  "runcmd": [["systemctl", "start", "qemu-guest-agent"]]}
     if password:
         cfg["password"] = sha512_crypt(password)
+    if time_zone:
+        cfg["timezone"] = time_zone
+    if keyboard and keyboard != "us":
+        cfg["keyboard"] = {"layout": f"us,{keyboard}", "options": "grp:alt_shift_toggle"}
     keys = [k.strip() for k in ssh_keys if k.strip()]
     if keys:
         cfg["ssh_authorized_keys"] = keys

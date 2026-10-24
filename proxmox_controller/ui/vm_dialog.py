@@ -796,14 +796,15 @@ class CreateVmDialog(_Busy, QDialog):
                     "computer": winsetup.computer_name(name), "edition": self.edition.currentText().strip(),
                     "uefi": params.get("bios") == "ovmf", "language": self.language.currentText().strip(),
                     "virtio": virtio, "remote_desktop": self.rdp.isChecked(), "dark": self.dark.isChecked(),
-                    "guest_tools": agent, "time_zone": timezones.windows_zone_here()}
+                    "guest_tools": agent}
         storage = setupdisc.storage_of(self.iso.currentData())
         self.done_text = (f"Created VM {vmid} ({name}) — Windows installs itself" +
                           (": watch it in its Console" if start else ": start it, and press a key in its Console "
                            "at “Press any key to boot from CD”"))
 
         def job():
-            xml = winsetup.answer_file(**settings)
+            place = timezones.region(timezones.host_zone(pve, node))
+            xml = winsetup.answer_file(**settings, time_zone=place["windows"], region=place["locale"])
             drive = setupdisc.free_slot(params)
             volid = setupdisc.upload(pve, node, storage, vmid, {winsetup.ANSWER_NAME: xml.encode()}, "autounattend")
             params[drive] = f"{volid},media=cdrom"
@@ -839,8 +840,10 @@ class CreateVmDialog(_Busy, QDialog):
         def job():
             disc = None
             if desktop:
+                place = timezones.region(timezones.host_zone(pve, node))
                 files = {"user-data": cloudseed.user_data(vm_name=name, user=user, password=password, ssh_keys=[key],
-                                                          remote_desktop=rdp).encode(),
+                                                          remote_desktop=rdp, time_zone=place["iana"],
+                                                          keyboard=place["keyboard"]).encode(),
                          "meta-data": cloudseed.meta_data(name, vmid).encode()}
                 volid = setupdisc.upload(pve, node, seed_storage, vmid, files, cloudseed.SEED_LABEL)
                 params["ide2"] = f"{volid},media=cdrom"

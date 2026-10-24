@@ -632,8 +632,9 @@ def _create_vm(ctx: Context, a: dict):
         return out
     if not ctx.secret:
         raise ToolError("No password was typed.")
+    place = timezones.region(timezones.host_zone(ctx.admin or ctx.pve, node))
     xml = winsetup.answer_file(password=ctx.secret, computer=winsetup.computer_name(p["name"]),
-                               uefi=p.get("bios") == "ovmf", time_zone=timezones.windows_zone_here(), **win)
+                               uefi=p.get("bios") == "ovmf", time_zone=place["windows"], region=place["locale"], **win)
     vmid, start = p["vmid"], p.pop("start")
     drive = setupdisc.free_slot(p)
     volid = setupdisc.upload(ctx.pve, node, setupdisc.storage_of(a["iso"]), vmid, {winsetup.ANSWER_NAME: xml.encode()},
@@ -803,8 +804,10 @@ def _cloud_vm(ctx: Context, a: dict):
     user = a.get("username", "user")
     volid = ""
     if desktop:
+        place = timezones.region(timezones.host_zone(ctx.admin or ctx.pve, node))
         seed = {"user-data": cloudseed.user_data(vm_name=p["name"], user=user, password=ctx.secret,
-                                                 ssh_keys=[a.get("ssh_public_key", "")], remote_desktop=rdp).encode(),
+                                                 ssh_keys=[a.get("ssh_public_key", "")], remote_desktop=rdp,
+                                                 time_zone=place["iana"], keyboard=place["keyboard"]).encode(),
                 "meta-data": cloudseed.meta_data(p["name"], vmid).encode()}
         volid = setupdisc.upload(ctx.pve, node, _seed_storage(ctx, node), vmid, seed, cloudseed.SEED_LABEL)
         p["ide2"] = f"{volid},media=cdrom"

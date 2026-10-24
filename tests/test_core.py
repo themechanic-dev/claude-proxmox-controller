@@ -1362,6 +1362,8 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertIn(winsetup.hidden("Win-Pass-77", "Password"), xml)
         self.assertIn("<UILanguage>el-GR</UILanguage>", xml)
         self.assertNotIn("Win-Pass-77", xml)
+        self.assertIn("<TimeZone>GTB Standard Time</TimeZone>", xml)  # the Proxmox host's (Europe/Athens here)
+        self.assertIn("<InputLocale>en-US;el-GR</InputLocale>", xml)
         self.assertEqual(self.status(vmid), "running")
         self.assertEqual([v for _p, v in watched], [vmid])  # its screen watched (in the background) …
         self.assertIs(watched[0][0], self.pve)  # … with the app's own token (ctx.admin; the same client here)
@@ -1401,6 +1403,7 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertEqual(label, "cidata")
         data = json.loads(files["user-data"].decode().split("\n", 1)[1])
         self.assertIn("xrdp", data["packages"])
+        self.assertEqual((data["timezone"], data["keyboard"]["layout"]), ("Europe/Athens", "us,gr"))  # the host's
         self.assertEqual(data["password"], cloudseed.sha512_crypt("Lnx-Pass-9", data["password"].split("$")[2]))
         self.assertNotIn(out["vmid"], self.cluster.secrets)  # not through Proxmox's cloud-init this time
         self.assertIn("Remote Desktop: connect to its address, port 3389", " ".join(out["next_steps"]))
@@ -2877,6 +2880,24 @@ class WinSetupTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"TZ": "Asia/Manila"}):
                 self.assertEqual(timezones.windows_zone_here(), "Singapore Standard Time")
         self.assertEqual(len({n for v in timezones.WINDOWS_ZONES.values() for n in v.split()}), 445)  # all of CLDR's
+        # the place: the Proxmox host's zone → formats and a second keyboard (the user's choice, 24/10)
+        _, root = self.xml(region="el-GR")
+        intl = self.component(root, "oobeSystem", "Microsoft-Windows-International-Core")
+        self.assertEqual([intl.find(f"u:{k}", self.NS).text for k in ("InputLocale", "SystemLocale", "UILanguage",
+                                                                       "UserLocale")],
+                         ["en-US;el-GR", "el-GR", "en-US", "el-GR"])  # US keyboard first; Windows' language: the ISO's
+        _, root = self.xml(region="en-US")
+        self.assertEqual(self.component(root, "oobeSystem", "Microsoft-Windows-International-Core")
+                         .find("u:InputLocale", self.NS).text, "en-US")
+        self.assertEqual(timezones.region("Europe/Athens"), {"iana": "Europe/Athens", "windows": "GTB Standard Time",
+                                                              "locale": "el-GR", "keyboard": "gr"})
+        self.assertEqual(timezones.locale("Europe/London"), "en-GB")  # (CLDR leaves English countries out)
+        self.assertEqual(timezones.locale("America/Sao_Paulo"), "pt-BR")
+
+        class Silent:
+            def node_time(self, node):
+                raise PveError("403")
+        self.assertEqual(timezones.host_zone(Silent(), "pve"), "")  # then this computer's
 
     def test_bios_server_and_no_virtio(self):
         text, root = self.xml(uefi=False, virtio=False, edition="Windows Server 2022 Standard (Desktop Experience)")
@@ -2961,6 +2982,14 @@ class CloudSeedTest(unittest.TestCase):
         self.assertEqual(cfg["power_state"]["mode"], "reboot")
         self.assertTrue(cfg["package_upgrade"])  # the image on the host ages: the VM starts up to date
         self.assertIn("color-manager", cfg["write_files"][0]["content"])
+
+    def test_place(self):
+        cfg = self.config(time_zone="Europe/Athens", keyboard="gr")
+        self.assertEqual(cfg["timezone"], "Europe/Athens")
+        self.assertEqual(cfg["keyboard"], {"layout": "us,gr", "options": "grp:alt_shift_toggle"})
+        cfg = self.config(keyboard="us")
+        self.assertNotIn("keyboard", cfg)  # nothing to add to US English
+        self.assertNotIn("timezone", cfg)
 
     def test_without_remote_desktop(self):
         cfg = self.config()
