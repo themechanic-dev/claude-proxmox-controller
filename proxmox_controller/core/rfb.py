@@ -135,8 +135,10 @@ class RfbClient:
 
     # -- the screen --------------------------------------------------------------------------------
 
-    def request_update(self, incremental: bool = True) -> None:
-        self._send(struct.pack(">BBHHHH", 3, 1 if incremental else 0, 0, 0, self.width, self.height))
+    def request_update(self, incremental: bool = True, height: int | None = None) -> None:
+        """Asks for the screen — or only its top `height` rows (a part watched often, cheaply)."""
+        rows = self.height if height is None else max(1, min(int(height), self.height))
+        self._send(struct.pack(">BBHHHH", 3, 1 if incremental else 0, 0, 0, self.width, rows))
 
     def next_update(self) -> list[tuple]:
         """Waits for the next screen update and returns its pieces:

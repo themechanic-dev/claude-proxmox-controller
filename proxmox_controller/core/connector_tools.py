@@ -601,12 +601,6 @@ def _windows_setup(a: dict) -> dict | None:
             "guest_tools": a.get("guest_agent", True)}
 
 
-def _create_vm_also(a: dict) -> tuple:
-    """Starting it is a power request; a Windows that installs itself also gets Enter pressed at its installer's
-    question (console) — each only where its switch is not Off."""
-    return _power_for_start(a) + (("console",) if a.get("start") and a.get("windows_user") else ())
-
-
 def _create_vm_words(ctx: Context, a: dict):
     node, p = _vm_params(ctx, a)
     lines = [f"{PROFILES[a.get('profile', 'linux')]['label']}: {p['cores']} cores, {p['memory']} MiB, disk "
@@ -620,8 +614,8 @@ def _create_vm_words(ctx: Context, a: dict):
                   "password you type below (Claude does not see it)" + (f"; {', '.join(extras)}" if extras else ""),
                   "Its answer disc (with that password) is deleted by the app as soon as Windows is ready"]
         if a.get("start") and _start(ctx, a):
-            lines.append("The app presses Enter at the installer's 'Press any key to boot from CD'" +
-                         ("" if "console" in ctx.kinds else " — not here: Console requests are Off"))
+            lines.append("The app itself presses Enter at the installer's 'Press any key to boot from CD or DVD' "
+                         "(it waits only ~5 s: no second approval, whatever the Console switch says)")
     return f"Create VM {p['vmid']} ({p['name']}) on {node}", lines
 
 
@@ -661,16 +655,15 @@ def _create_vm(ctx: Context, a: dict):
         return out
     if start:
         out["started"] = finish(ctx, node, ctx.pve.guest_action(node, "qemu", vmid, "start"))["status"]
-        if "console" in ctx.kinds:  # (it may come a minute later: watched in the background, the answer not waited for)
-            pve = ctx.pve
-            threading.Thread(target=lambda: setupdisc.answer_boot_prompt(pve, node, vmid), daemon=True,
-                             name=f"boot-prompt-{vmid}").start()
-            out["boot_key"] = ("the app watches its screen and presses Enter when 'Press any key to boot from CD or "
-                               f"DVD' shows (within {setupdisc.BOOT_PROMPT_WAIT_S // 60} minutes); check with "
-                               "console_screenshot")
-        else:
-            out["boot_key"] = "not pressed (Console requests are Off): press Enter in its console at 'Press any " \
-                              "key to boot from CD or DVD' — or restart it and do so"
+        # The app answers the boot question itself, with the user's token: it waits only ~5 s, so no approval could
+        # come in time (the user's exception, 24/10) — part of this approved request. In the background: it may
+        # come a minute later, and a missed one is retried through the firmware's Boot Manager.
+        pve = ctx.admin or ctx.pve
+        threading.Thread(target=lambda: setupdisc.answer_boot_prompt(pve, node, vmid), daemon=True,
+                         name=f"boot-prompt-{vmid}").start()
+        out["boot_key"] = ("the app watches its screen and presses Enter when 'Press any key to boot from CD or DVD' "
+                           f"shows (within {setupdisc.BOOT_PROMPT_WAIT_S // 60} minutes; if missed, it tries again "
+                           "through the firmware's Boot Manager); check with console_screenshot")
     elif a.get("start"):
         out["started"] = NOT_STARTED
     out["next"] = ("Windows installs itself (about 15–30 minutes, with restarts); watch it with console_screenshot. "
@@ -1590,7 +1583,7 @@ def _tools() -> list[Tool]:
              "own — VirtIO drivers from virtio_iso, the edition, no setup questions, that user with a password the "
              "USER types in Proxmox Controller's window (you never give or see it), optionally Remote Desktop and the "
              "dark theme, and the VirtIO guest tools with the QEMU guest agent last; with start, the app presses "
-             "Enter at the installer's 'Press any key to boot from CD' (a Console request in passing). The disc is "
+             "Enter at the installer's 'Press any key to boot from CD' itself (it waits only seconds). The disc is "
              "deleted once Windows is ready.",
              {**host, "name": {"type": "string"}, "iso": {"type": "string", "description": "An ISO's volid."},
               "profile": {"type": "string", "enum": list(PROFILES)}, "vmid": {"type": "integer", "minimum": 100},
@@ -1606,7 +1599,7 @@ def _tools() -> list[Tool]:
               "language": {"type": "string", "description": "Such as en-US or el-GR. Default: from the ISO's name, "
                            "else en-US. The keyboard is English (US)."},
               "remote_desktop": {"type": "boolean"}, "dark_theme": {"type": "boolean"}},
-             ("host", "name", "iso"), _create_vm, _create_vm_words, also=_create_vm_also,
+             ("host", "name", "iso"), _create_vm, _create_vm_words, also=_power_for_start,
              secret=lambda a: f"Password for the Windows user '{a['windows_user']}' in the new VM {a.get('name', '')}"
              if a.get("windows_user") else ""),
         Tool("get_cloud_image", "change", "Have the host download Ubuntu Server's official cloud image (24.04 or "

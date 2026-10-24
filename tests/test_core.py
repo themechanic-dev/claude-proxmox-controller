@@ -1339,12 +1339,13 @@ class ConnectorToolsTest(unittest.TestCase):
         tool = connector_tools.TOOLS["create_vm"]
         self.assertEqual(tool.secret_prompt(args), "Password for the Windows user 'nikos' in the new VM win-desk")
         self.assertEqual(tool.secret_prompt({"name": "x"}), "")  # no Windows setup: no password asked
-        self.assertEqual(tool.also_of(args), ("power", "console"))  # the start, and Enter at the installer's question
+        self.assertEqual(tool.also_of(args), ("power",))  # the start (Enter at the boot question: the app's own)
         what, lines = self.words("create_vm", **args)
         self.assertIn("Windows installs itself: Windows 11 Pro, el-GR, user 'nikos'", " ".join(lines))
         self.assertIn("Remote Desktop on, dark theme", " ".join(lines))
+        self.assertIn("no second approval", " ".join(lines))
         watched = []
-        with mock.patch.object(setupdisc, "answer_boot_prompt", lambda pve, node, vmid: watched.append(vmid)):
+        with mock.patch.object(setupdisc, "answer_boot_prompt", lambda pve, node, vmid: watched.append((pve, vmid))):
             out, kept = self.run_with("create_vm", secret="Win-Pass-77", **args)
             for t in [t for t in threading.enumerate() if t.name.startswith("boot-prompt-")]:
                 t.join(5)
@@ -1362,14 +1363,17 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertIn("<UILanguage>el-GR</UILanguage>", xml)
         self.assertNotIn("Win-Pass-77", xml)
         self.assertEqual(self.status(vmid), "running")
-        self.assertEqual(watched, [vmid])  # its screen watched (in the background) for the boot question
+        self.assertEqual([v for _p, v in watched], [vmid])  # its screen watched (in the background) …
+        self.assertIs(watched[0][0], self.pve)  # … with the app's own token (ctx.admin; the same client here)
         self.assertIn("watches its screen", out["boot_key"])
-        # Console Off: not watched, and said so
-        with mock.patch.object(setupdisc, "answer_boot_prompt", lambda pve, node, vmid: watched.append(vmid)):
+        # Console Off: the app answers it all the same (the user's exception: it waits only seconds)
+        with mock.patch.object(setupdisc, "answer_boot_prompt", lambda pve, node, vmid: watched.append((pve, vmid))):
             out, _ = self.run_with("create_vm", secret="pw", kinds=("read", "change", "power"),
                                    **{**args, "name": "win-2"})
-        self.assertIn("not pressed", out["boot_key"])
-        self.assertEqual(len(watched), 1)
+            for t in [t for t in threading.enumerate() if t.name.startswith("boot-prompt-")]:
+                t.join(5)
+        self.assertIn("watches its screen", out["boot_key"])
+        self.assertEqual(len(watched), 2)
         out = self.run_tool("list_install_media", host="demo-pve")
         self.assertFalse([i for i in out["isos"] if "pvc-setup" in i])  # the answer disc is not one to install from
         for bad, words in (({"iso": virtio}, "VirtIO drivers disc"),
@@ -2702,9 +2706,10 @@ def screen_of(name: str) -> tuple[int, int, bytes]:
 class ScreenVnc(FakeVncServer):
     """The pretend console showing a given screen, and another one whenever show() is called."""
 
-    def __init__(self, ws, password, screen_, after_enter=None):
+    def __init__(self, ws, password, screen_, after_enter=None, on_key=None):
         w, h, self.image = screen_
         self.after_enter = after_enter  # what the guest shows once Enter reaches it
+        self.on_key = on_key            # or a whole flow: on_key(server, keysym) for each key pressed
         super().__init__(ws, password, width=w, height=h)
 
     def show(self, screen_):
@@ -2717,7 +2722,9 @@ class ScreenVnc(FakeVncServer):
         self._send(struct.pack(">BxH", 0, 1) + struct.pack(">HHHHi", 0, 0, self.width, self.height, 0) + self.image)
 
     def _typed(self, down, keysym):
-        if down and keysym == 0xFF0D and self.after_enter is not None:
+        if down and self.on_key is not None:
+            self.on_key(self, keysym)
+        elif down and keysym == 0xFF0D and self.after_enter is not None:
             self.show(self.after_enter)
 
     def _flush(self):
@@ -2995,10 +3002,18 @@ class SetupDiscTest(unittest.TestCase):
         self.assertEqual(setupdisc.tidy(self.pve, [ready], self.pve.guests())[0], {ready["volid"]})  # gone already
 
     def test_the_boot_question_is_recognised(self):
-        """On the real screens of the user's first test (VM 102, 24/10): only the question itself."""
+        """On the real screens of the user's first test (VM 102, 24/10): only the question itself — and the missed
+        one only by the firmware's grey lines under it."""
         self.assertTrue(setupdisc.boot_prompt_on(*screen_of("boot-prompt.png")))
         for name in ("boot-logo.png", "boot-menu.png", "boot-too-late.png"):  # the firmware's logo, menu, messages
             self.assertFalse(setupdisc.boot_prompt_on(*screen_of(name)), name)
+        self.assertTrue(setupdisc.boot_prompt_missed(*screen_of("boot-too-late.png")))
+        for name in ("boot-prompt.png", "boot-logo.png", "boot-menu.png"):
+            self.assertFalse(setupdisc.boot_prompt_missed(*screen_of(name)), name)
+        w, h, prompt = screen_of("boot-prompt.png")
+        _, _, logo = screen_of("boot-logo.png")
+        top = w * int(h * setupdisc.BELOW_BAND) * 4  # only the watched top counts: the rest of the picture may be old
+        self.assertTrue(setupdisc.boot_prompt_on(w, h, prompt[:top] + logo[top:]))
         self.assertFalse(setupdisc.boot_prompt_on(1280, 800, bytes(1280 * 800 * 4)))  # black
         # QEMU's "Guest has not initialized the display (yet).": white words at the top, from the left edge — the
         # first live test answered it and stopped watching (24/10)
@@ -3032,6 +3047,33 @@ class SetupDiscTest(unittest.TestCase):
         self.assertTrue(screen.answer_prompt(open_console, setupdisc.boot_prompt_on, timeout=10))
         downs = [k for k in servers[0].keys if k[1]]
         self.assertTrue(downs and all(k[2] == 0xFF0D for k in downs))  # Enter, and nothing else
+        # missed: through the Boot Manager — Enter (the menu), Down (the DVD), Enter; then the question again, answered
+        too_late, menu = screen_of("boot-too-late.png"), screen_of("boot-menu.png")
+        servers.clear()
+
+        def flow(srv, keysym):
+            name = {0xFF0D: "enter", 0xFF54: "down"}.get(keysym)
+            pressed.append(name)
+            if srv.image == too_late[2] and name == "enter":
+                srv.show(menu)
+            elif srv.image == menu[2] and pressed[-2:] == ["down", "enter"]:
+                threading.Timer(0.3, lambda: srv.show(prompt)).start()  # the question ~2 s after the DVD is chosen
+            elif srv.image == prompt[2] and name == "enter":
+                srv.show(logo)
+
+        pressed = []
+
+        def open_missed():
+            mine, theirs = socket.socketpair()
+            srv = ScreenVnc(WebSocket(theirs, client=False), "pw", too_late, on_key=flow).start()
+            servers.append(srv)
+            return WebSocket(mine), "pw"
+
+        steps = (("enter", 0.0), ("down", 0.2), ("enter", 0.2))
+        self.assertTrue(screen.answer_prompt(open_missed, setupdisc.boot_prompt_on, timeout=10, top=0.16,
+                                             missed=setupdisc.boot_prompt_missed, recovery=steps, settle=3))
+        self.assertEqual(pressed[:3], ["enter", "down", "enter"])
+        self.assertEqual(servers[0].image, logo[2])  # it booted
         # it never comes: no key at all, and False when the time is up
         servers.clear()
         self.assertFalse(screen.answer_prompt(open_console, setupdisc.boot_prompt_on, timeout=1.0, quiet=0.3))

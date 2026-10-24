@@ -68,44 +68,62 @@ def entry(host_id: str, node: str, vmid: int, volid: str, drive: str, agent: boo
             "made": int(time.time())}
 
 
-def boot_prompt_on(w: int, h: int, bgra: bytes) -> bool:
-    """Whether the screen shows Windows' "Press any key to boot from CD or DVD": white words near the top of an
-    otherwise black screen, set in from the left edge (Windows indents its question). The firmware's logo, its boot
-    menu, its grey messages ("BdsDxe: No bootable option…", which come once the question is gone) and Windows' own
-    screens look otherwise — and QEMU's "Guest has not initialized the display (yet)." (white, at the top of a black
-    screen, before the firmware starts: the first live test took it for the question) begins at the edge. Every 4th
-    pixel each way."""
-    m = prompt_measure(w, h, bgra)
-    return m["words"] >= 20 and m["elsewhere"] <= m["samples"] * 0.0005 and m["left"] >= w * 0.06
+QUESTION_BAND = 0.09   # Windows writes its question in the top 9% of the screen …
+BELOW_BAND = 0.16      # … and the firmware its "No bootable option" lines right under it: the part watched
+# Windows' question missed: the firmware's Boot Manager, then the DVD — second in its list, as the app's VMs boot their
+# disk first (order=scsi0;ide2) — and Enter at once and again for a few seconds, as the user found works (24/10: the
+# question comes ~2 s after the DVD is chosen and waits ~5 s)
+BOOT_MANAGER_STEPS = (("enter", 0.0), ("down", 2.5), ("enter", 0.8)) + (("enter", 0.5),) * 7
 
 
 def prompt_measure(w: int, h: int, bgra: bytes) -> dict:
-    """What boot_prompt_on decides by: white samples near the top (words) and how far left they start, and samples
-    that are not black below them (elsewhere)."""
+    """What the screen's top shows, every 4th pixel each way: white samples in the question's band (words) and how far
+    left they start; samples under it that are not black (below), and of those the grey ones and how far left they
+    start (the firmware's own messages)."""
+    out = {"words": 0, "left": w, "below": 0, "grey": 0, "grey_left": w}
     if not w or not h or len(bgra) < w * h * 4:
-        return {"words": 0, "elsewhere": 0, "samples": 1, "left": 0}
-    top, step = int(h * 0.09), 4
-    words = elsewhere = samples = 0
-    left = w
-    for y in range(0, h, step):
+        return out
+    band, under, step = int(h * QUESTION_BAND), int(h * BELOW_BAND), 4
+    for y in range(0, under, step):
         row = y * w * 4
         for x in range(0, w, step):
             i = row + x * 4
             b, g, r = bgra[i], bgra[i + 1], bgra[i + 2]
-            samples += 1
-            if y < top:
-                if min(r, g, b) >= 0xC8:
-                    words += 1
-                    left = min(left, x)
-            elif max(r, g, b) > 0x30:
-                elsewhere += 1
-    return {"words": words, "elsewhere": elsewhere, "samples": samples, "left": left}
+            hi, lo = max(r, g, b), min(r, g, b)
+            if y < band:
+                if lo >= 0xC8:
+                    out["words"] += 1
+                    out["left"] = min(out["left"], x)
+            elif hi > 0x30:
+                out["below"] += 1
+                if 0x60 <= hi < 0xC8 and hi - lo < 0x20:
+                    out["grey"] += 1
+                    out["grey_left"] = min(out["grey_left"], x)
+    return out
+
+
+def boot_prompt_on(w: int, h: int, bgra: bytes) -> bool:
+    """Whether the screen shows Windows' "Press any key to boot from CD or DVD": white words at the top, set in from
+    the left edge (Windows indents its question), with nothing under them. Only the top of the screen counts — the
+    part asked for often (the rest may be old). The firmware's logo and boot menu leave the top empty; its grey "No
+    bootable option…" lines come under the question once it is gone; QEMU's "Guest has not initialized the display
+    (yet)." (white, at the top, before the firmware starts — taken for the question in the first live test) begins at
+    the edge."""
+    m = prompt_measure(w, h, bgra)
+    return m["words"] >= 20 and m["below"] <= 3 and m["left"] >= w * 0.06
+
+
+def boot_prompt_missed(w: int, h: int, bgra: bytes) -> bool:
+    """Whether the firmware says the question went unanswered: grey lines from the left edge under the question
+    ("BdsDxe: No bootable option or device was found." / "Press any key to enter the Boot Manager Menu.")."""
+    m = prompt_measure(w, h, bgra)
+    return m["grey"] >= 15 and m["grey_left"] <= w * 0.02
 
 
 def answer_boot_prompt(pve: Pve, node: str, vmid: int, timeout: float | None = None) -> bool:
     """Presses Enter at Windows' boot question of a VM that has just been started from its installer disc, the
-    moment it shows (screen.answer_prompt). True when answered. What it saw goes to boot-prompt.log in the app's
-    data folder (the last watch only)."""
+    moment it shows; if it was missed, through the firmware's Boot Manager (screen.answer_prompt). True when
+    answered. What it saw goes to boot-prompt.log in the app's data folder (the last watch only)."""
     path = store.data_dir() / "boot-prompt.log"
     measured: list[dict] = [{}]
     try:
@@ -126,7 +144,8 @@ def answer_boot_prompt(pve: Pve, node: str, vmid: int, timeout: float | None = N
 
     try:
         return screen.answer_prompt(lambda: pve.open_vnc(node, "qemu", vmid), judge, ("enter",),
-                                    BOOT_PROMPT_WAIT_S if timeout is None else timeout, log=log)
+                                    BOOT_PROMPT_WAIT_S if timeout is None else timeout, top=BELOW_BAND,
+                                    missed=boot_prompt_missed, recovery=BOOT_MANAGER_STEPS, log=log)
     finally:
         if out is not None:
             out.close()
