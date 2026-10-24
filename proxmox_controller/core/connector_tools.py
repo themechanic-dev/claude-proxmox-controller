@@ -21,7 +21,7 @@ from . import claude_policy, cloudseed, cloudvm, guestfiles, screen, setupdisc, 
 from .cloudvm import CLOUD_IMAGES, CLOUD_URL, USERNAME
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
-from .vmspec import PROFILES, VMNAME, WINDOWS, iso_name_from_url, vm_params
+from .vmspec import PROFILES, VIRTIO_AS_SYSTEM, VMNAME, WINDOWS, is_virtio_disc, iso_name_from_url, vm_params
 
 WAIT_S = 60          # a request waits this long for its Proxmox task; longer ones are followed with task_log
 LOG_LINES = 200      # the most lines task_log returns at a time
@@ -320,7 +320,7 @@ def _usage(ctx: Context, a: dict):
 def _media(ctx: Context, a: dict):
     node = ctx.node(a.get("node", ""))
     return {"node": node, "next_free_vmid": ctx.pve.next_id(),
-            "isos": [i["volid"] for i in ctx.pve.isos(node)],
+            "isos": [i["volid"] for i in ctx.pve.isos(node) if not setupdisc.is_setup_disc(i["volid"] or "")],
             "cloud_images": [i["volid"] for i in ctx.pve.images(node)],
             "cloud_images_offered": {v: CLOUD_URL.format(v=v) for v in CLOUD_IMAGES},
             "container_templates": [t["volid"] for t in ctx.pve.templates(node)],
@@ -560,6 +560,8 @@ def _vm_params(ctx: Context, a: dict) -> tuple[str, dict]:
         raise ToolError("name: letters, digits, '-' and '.'.")
     profile = a.get("profile", "linux")
     prof = PROFILES[profile]
+    if profile in WINDOWS and is_virtio_disc(a["iso"]):
+        raise ToolError(VIRTIO_AS_SYSTEM)
     storage = a.get("storage") or next((s["storage"] for s in (ctx.admin or ctx.pve).storages(node, content="images")),
                                        "")
     if not storage:

@@ -1367,7 +1367,10 @@ class ConnectorToolsTest(unittest.TestCase):
                                **{**args, "name": "win-2"})
         self.assertIn("not pressed", out["boot_key"])
         self.assertEqual(self.cluster.keys, [])
-        for bad, words in (({"profile": "linux"}, "only with the win11 or win10"),
+        out = self.run_tool("list_install_media", host="demo-pve")
+        self.assertFalse([i for i in out["isos"] if "pvc-setup" in i])  # the answer disc is not one to install from
+        for bad, words in (({"iso": virtio}, "VirtIO drivers disc"),
+                           ({"profile": "linux"}, "only with the win11 or win10"),
                            ({"windows_user": None, "remote_desktop": True}, "give windows_user too"),
                            ({"edition": "Windows 11 Home"}, "Home"),
                            ({"windows_user": "Guest"}, "Windows' own")):

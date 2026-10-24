@@ -1243,6 +1243,22 @@ class VmDialogTest(UiCase):
                           if "pvc-setup" in again.iso.itemData(i)])
         again.close()
 
+    def test_windows_never_installs_from_the_virtio_disc(self):
+        """The user's test, 24/10: the VirtIO disc landed in ISO image (the list right above VirtIO drivers) and the VM
+        booted nothing. Windows now picks a Windows ISO by itself, and Create refuses the VirtIO disc there."""
+        self.client()
+        self.cluster().isos += ["local:iso/virtio-win-0.1.285.iso", "local:iso/Win11_25H2_English_x64.iso"]
+        dlg = self.dialog()
+        self.assertEqual(dlg.iso.currentData(), ISO)  # Linux: the first one, as before
+        dlg.profile.setCurrentIndex(dlg.profile.findData("win11"))
+        self.assertEqual(dlg.iso.currentData(), "local:iso/Win11_25H2_English_x64.iso")
+        self.assertEqual(dlg.virtio.currentData(), "local:iso/virtio-win-0.1.285.iso")
+        dlg.iso.setCurrentIndex(dlg.iso.findData("local:iso/virtio-win-0.1.285.iso"))
+        dlg.name.setText("win-test")
+        dlg.create()
+        self.assertEqual(self.errors[-1][1], vm_dialog.VIRTIO_AS_SYSTEM)
+        self.assertNotIn(103, self.cluster().guests)
+
     def test_windows_by_hand(self):
         dlg = self.dialog()
         dlg.profile.setCurrentIndex(dlg.profile.findData("win10"))

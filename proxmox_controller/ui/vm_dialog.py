@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDia
 
 from ..core import cloudseed, cloudvm, setupdisc, winsetup
 from ..core.pve import Pve, PveError, q, upload_name
-from ..core.vmspec import PROFILES, VMNAME, WINDOWS, iso_name_from_url, vm_params  # noqa: F401 (used here and by tests)
+from ..core.vmspec import (PROFILES, VIRTIO_AS_SYSTEM, VMNAME, WINDOWS, is_virtio_disc,  # noqa: F401 (tests too)
+                           iso_name_from_url, looks_like_windows, vm_params)
 from .startup_fields import StartupFields
 from .vm_hardware import HardwareFields
 from .widgets import button, confirm, error, fit_to_width, gib, label
@@ -425,6 +426,8 @@ class CreateVmDialog(_Busy, QDialog):
             self.from_iso.setChecked(True)
         self.idle("" if data["isos"] or not self.from_iso.isChecked()
                   else "There are no ISO images on this host yet: use Download… or Upload… first.")
+        if self.profile.currentData() in WINDOWS and not select_iso:
+            self._pick_windows_iso()
         self._iso_changed()
         self._mode_changed()
         if self.from_template.isChecked():
@@ -439,7 +442,18 @@ class CreateVmDialog(_Busy, QDialog):
         self.disk.setValue(prof["disk"])
         if self.profile.currentData() in WINDOWS:
             self.edition.setCurrentText(winsetup.default_edition(self.profile.currentData()))
+            self._pick_windows_iso()
         self._mode_changed()
+
+    def _pick_windows_iso(self) -> None:
+        """Windows: the ISO image moves to a Windows ISO on the host, where the one chosen is not one (the VirtIO disc
+        was once picked by mistake there, in the user's test of 24/10 — the two lists sit one above the other)."""
+        current = self.iso.currentData() or ""
+        if looks_like_windows(current):
+            return
+        found = next((n for n in range(self.iso.count()) if looks_like_windows(self.iso.itemData(n) or "")), -1)
+        if found >= 0:
+            self.iso.setCurrentIndex(found)
 
     def _iso_changed(self) -> None:
         if self.iso.currentData():
@@ -686,6 +700,8 @@ class CreateVmDialog(_Busy, QDialog):
             return "Choose an ISO image (or get one with Download… or Upload…)."
         if self.from_template.isChecked() and self.template.currentData() is None:
             return "Choose a template."
+        if self.from_iso.isChecked() and self.profile.currentData() in WINDOWS and is_virtio_disc(self.iso.currentData() or ""):
+            return VIRTIO_AS_SYSTEM
         password, again = self.password.text(), self.password2.text()
         if self.windows_setup():
             problem = winsetup.check_user(self.user.text(), password, self.rdp.isChecked(),

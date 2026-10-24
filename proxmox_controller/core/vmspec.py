@@ -46,6 +46,21 @@ def vm_params(*, vmid: int, name: str, profile: str, iso: str, virtio_iso: str, 
     return p
 
 
+def is_virtio_disc(volid: str) -> bool:
+    """Red Hat's VirtIO drivers disc (virtio-win-0.1.285.iso): drivers for Windows, not a system to install."""
+    return "virtio" in volid.rsplit("/", 1)[-1].lower()
+
+
+def looks_like_windows(volid: str) -> bool:
+    """An ISO whose name says Windows (Win11_25H2_English_x64.iso, windows-server-2025.iso…)."""
+    name = volid.rsplit("/", 1)[-1].lower()
+    return "win" in name and not is_virtio_disc(volid)
+
+
+VIRTIO_AS_SYSTEM = ("That ISO image is the VirtIO drivers disc, which has no Windows on it: choose the Windows ISO "
+                    "as the ISO image (the VirtIO disc goes under VirtIO drivers).")
+
+
 def iso_name_from_url(url: str) -> str:
     name = os.path.basename(unquote(urlsplit(url.strip()).path))
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)
