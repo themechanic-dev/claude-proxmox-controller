@@ -665,6 +665,42 @@ class AgentSetupTest(UiCase):
             view.open_files(self.guest(201))
         self.assertEqual((self.asked[-1], opened), ("Install the guest agent?", [201]))
 
+    def test_install_guest_agent_in_the_row(self):
+        """The user's choice, 24/10: in the row of buttons — which takes a second row where the window is too narrow."""
+        self.cluster().guests[201]["agent_down"] = True
+        view = self.loaded_view()
+        self.addCleanup(view.close)
+        self.assertTrue(wait_until(lambda: 201 in view.details))
+        self.select(view, 201)
+        self.assertTrue(view.act["agent"].isEnabled())  # a running VM whose agent is silent
+        self.select(view, 100)
+        self.assertFalse(view.act["agent"].isEnabled())  # a container has no agent
+        self.select(view, 201)
+        opened = []
+        with mock.patch.object(agent_setup, "AgentSetupDialog", lambda *a: opened.append(a[3]["vmid"]) or mock.Mock()):
+            view.act["agent"].click()
+        self.assertEqual(opened, [201])
+        self.cluster().guests[201]["agent_down"] = False
+        view._refresh_details(force=True)
+        self.assertTrue(wait_until(lambda: not view.act["agent"].isEnabled()))  # it answers now: nothing to install
+
+    def test_the_buttons_take_a_second_row_when_narrow(self):
+        view = self.loaded_view()
+        view.show()
+        self.addCleanup(view.close)
+        rows = []
+        for width in (1700, 1060, 1700):
+            view.resize(width, 760)
+            QTest.qWait(40)
+            bottom = max(b.mapTo(view, b.rect().bottomLeft()).y() for b in view.act.values())
+            self.assertLess(bottom, view.table.mapTo(view, QPoint(0, 0)).y(), width)  # never over the list
+            rows.append(view.actions.rows())
+            groups = {k: view.act[k].parentWidget() for k in ("shutdown", "stop", "files", "agent", "edit", "graphs")}
+            self.assertIs(groups["shutdown"], groups["stop"])  # a group moves down whole
+            self.assertIs(groups["files"], groups["agent"])
+            self.assertIs(groups["edit"], groups["graphs"])
+        self.assertEqual(rows, [1, 2, 1])  # and back to one when it is wide again
+
 
 class GuestDialogsTest(UiCase):
     def client(self):

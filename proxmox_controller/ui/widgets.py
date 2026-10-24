@@ -2,12 +2,80 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLayout, QLayoutItem, QMessageBox, QProgressBar,
+                               QPushButton, QVBoxLayout, QWidget)
 
 from .theme import refresh_widget_style
+
+
+class FlowLayout(QLayout):
+    """Its items side by side, as far as the width goes, and on in another row below — as many rows as the window's
+    width needs, laid out again as it is resized (height-for-width, which the page's scroll area honours). An item
+    is never split: a group of buttons in one widget moves down whole."""
+
+    def __init__(self, parent: QWidget | None = None, spacing: int = 6):
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self._gap = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> Qt.Orientation:
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._place(QRect(0, 0, width, 0), move=False)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._place(rect, move=True)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def rows(self) -> int:
+        """How many rows it uses now (for the tests)."""
+        tops = {item.geometry().top() for item in self._items if not item.isEmpty()}
+        return len(tops)
+
+    def _place(self, rect: QRect, move: bool) -> int:
+        m = self.contentsMargins()
+        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line = area.x(), area.y(), 0
+        for item in self._items:
+            if item.isEmpty():  # hidden
+                continue
+            hint = item.sizeHint()
+            if x + hint.width() > area.right() + 1 and line:  # does not fit after the last one: another row
+                x, y, line = area.x(), y + line + self._gap, 0
+            if move:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._gap
+            line = max(line, hint.height())
+        return y + line - rect.y() + m.bottom()
 
 
 def label(text: str = "", name: str = "", wrap: bool = False, selectable: bool = False) -> QLabel:

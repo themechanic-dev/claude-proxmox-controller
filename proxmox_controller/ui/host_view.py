@@ -19,8 +19,8 @@ from ..core.details import read_details
 from ..core.pve import Host, Pve, PveError, storage_order
 from . import theme
 from .tasks_panel import SHOWN as TASKS_SHOWN, TaskLogDialog, TasksPanel
-from .widgets import (ElidedLabel, Pill, StatCard, button, card, confirm, dot_icon, error, gib, label, mem_text,
-                      power_icon, uptime_text)
+from .widgets import (ElidedLabel, FlowLayout, Pill, StatCard, button, card, confirm, dot_icon, error, gib, label,
+                      mem_text, power_icon, uptime_text)
 from .worker import Runner
 
 CONSOLE_WAYS = (("spice", "SPICE — sound, clipboard, USB"), ("vnc", "Built-in console"),
@@ -382,14 +382,23 @@ class HostView(QWidget):
         guests_head.addWidget(self.new_btn)
         cl.addLayout(guests_head)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(6)
+        # one row where the window is wide enough, two (or more) where it is not: the groups move down whole
+        self.actions = FlowLayout(spacing=6)
         self.act: dict[str, object] = {}
+        group = None
         for key, text in (("start", "Start"), ("shutdown", "Shut Down…"), ("stop", "Stop…"), ("reboot", "Reboot…"),
-                          ("console", "Console"), ("files", "Files…"),
-                          ("edit", "Edit…"), ("notes", "Notes…"), ("snapshots", "Snapshots…"),
-                          ("backups", "Backups…"),
-                          ("graphs", "Graphs…"), ("delete", "Delete…")):
+                          ("|", ""), ("console", "Console"), ("files", "Files…"), ("agent", "Install Guest Agent…"),
+                          ("|", ""), ("edit", "Edit…"), ("notes", "Notes…"), ("snapshots", "Snapshots…"),
+                          ("backups", "Backups…"), ("graphs", "Graphs…"),
+                          ("|", ""), ("delete", "Delete…")):
+            if group is None or key == "|":
+                box = QWidget()
+                group = QHBoxLayout(box)
+                group.setContentsMargins(0, 0, 0, 0)
+                group.setSpacing(6)
+                self.actions.addWidget(box)
+                if key == "|":
+                    continue
             if key == "console":  # a click opens the usual console; the arrow offers every kind
                 b = QToolButton()
                 b.setText(text)
@@ -403,15 +412,16 @@ class HostView(QWidget):
             else:
                 b = button(text, "destructive" if key == "delete" else "")
             b.clicked.connect(lambda _=False, k=key: self.guest_action(k))
-            actions.addWidget(b)
+            group.addWidget(b)
             self.act[key] = b
         self.act["files"].setToolTip("Copy files and folders between this computer and the guest (a VM whose "
                                      "guest agent does not answer: the app offers to install it)")
+        self.act["agent"].setToolTip("Install the QEMU guest agent in a running VM whose agent does not answer — "
+                                     "through its console (it shows the VM's address, and Files and Commands need it)")
         self.act["console"].setFixedHeight(self.act["start"].sizeHint().height())  # a tool button is a bit taller
         self.console_btn.setFixedHeight(self.reboot_btn.sizeHint().height())
         self.jobs_btn.setFixedHeight(self.new_btn.sizeHint().height())
-        actions.addStretch(1)
-        cl.addLayout(actions)
+        cl.addLayout(self.actions)
 
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
@@ -658,6 +668,7 @@ class HostView(QWidget):
         t.sortByColumn(*self.sort)
         self._apply_filter()
         self._fit_columns()
+        self._update_actions()  # whether a VM's agent answers is known now (Install Guest Agent…)
 
     def _fit_columns(self) -> None:
         """Every column as wide as its contents, and any room the window has to spare shared out among them in
@@ -815,7 +826,7 @@ class HostView(QWidget):
             stopped = bool(g) and g.get("status") == "stopped"
             template = bool(g) and bool(g.get("template"))  # a template is copied, never started
             enabled = {"start": stopped and not template, "shutdown": running, "stop": running, "reboot": running,
-                       "console": running, "files": running,
+                       "console": running, "files": running, "agent": self._agent_missing(g),
                        "edit": bool(g), "notes": bool(g), "snapshots": bool(g) and not template,
                        "backups": bool(g),
                        "graphs": bool(g),
@@ -834,11 +845,11 @@ class HostView(QWidget):
                 for how, title in CONSOLE_WAYS:
                     sub.addAction(title).triggered.connect(lambda _=False, h=how: self.open_selected_console(h))
                 continue
+            if key == "agent" and not b.isEnabled():  # offered only where it is needed
+                continue
             a = menu.addAction(b.text())
             a.setEnabled(b.isEnabled())
             a.triggered.connect(lambda _=False, k=key: self.guest_action(k))
-            if key == "files" and self._agent_missing(self.selected()):
-                menu.addAction("Install Guest Agent…").triggered.connect(lambda: self.guest_action("agent"))
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def guest_action(self, key: str) -> None:
