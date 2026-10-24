@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import io
 import json
 import os
 import re
@@ -205,8 +206,17 @@ class Pve:
         """Send a file from this computer to one of the host's storages (an ISO image). The file is streamed, so
         a 6 GB image needs no memory; `progress(sent, total)` is called as it goes and `cancelled()` can stop it.
         Returns the task that moves the file into place."""
-        name = upload_name(path)
-        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            return self._upload(node, storage, upload_name(path), os.path.getsize(path), fh, content, progress,
+                                cancelled, chunk)
+
+    def upload_data(self, node: str, storage: str, name: str, data: bytes, content: str = "iso") -> str:
+        """A small file made on this computer (a new VM's answer disc) into one of the host's storages; returns the
+        task that moves it into place."""
+        return self._upload(node, storage, upload_name(name), len(data), io.BytesIO(data), content)
+
+    def _upload(self, node: str, storage: str, name: str, size: int, fh, content: str = "iso",
+                progress=None, cancelled=None, chunk: int = 1 << 20) -> str:
         boundary = "pvc" + uuid.uuid4().hex
         head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"content\"\r\n\r\n{content}\r\n"
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"filename\"; filename=\"{name}\"\r\n"
@@ -222,17 +232,16 @@ class Pve:
             conn.endheaders()
             conn.send(head)
             sent = 0
-            with open(path, "rb") as fh:
-                while True:
-                    if cancelled is not None and cancelled():
-                        raise PveError("The upload was cancelled.")
-                    block = fh.read(chunk)
-                    if not block:
-                        break
-                    conn.send(block)
-                    sent += len(block)
-                    if progress is not None:
-                        progress(sent, size)
+            while True:
+                if cancelled is not None and cancelled():
+                    raise PveError("The upload was cancelled.")
+                block = fh.read(chunk)
+                if not block:
+                    break
+                conn.send(block)
+                sent += len(block)
+                if progress is not None:
+                    progress(sent, size)
             conn.send(tail)
             resp = conn.getresponse()
             raw = resp.read()
@@ -447,6 +456,14 @@ class Pve:
         Sys.Audit; other commands need more."""
         return str(self.post(f"/nodes/{q(node)}/qemu/{int(vmid)}/monitor", command=command) or "")
 
+    def send_key(self, node: str, vmid: int, key: str) -> None:
+        """Presses a key in a running VM, as QEMU names it ("ret", "ctrl-alt-delete")."""
+        self.put(f"/nodes/{q(node)}/qemu/{int(vmid)}/sendkey", key=key)
+
+    def vm_status(self, node: str, vmid: int) -> dict:
+        """A VM's state now: status, uptime (seconds since QEMU started it), qmpstatus, spice…"""
+        return self.get(f"/nodes/{q(node)}/qemu/{int(vmid)}/status/current") or {}
+
     def pending(self, node: str, vmid: int) -> list[str]:
         """Settings of a running VM that change only at its next start."""
         items = self.get(f"/nodes/{q(node)}/qemu/{int(vmid)}/pending") or []
@@ -524,6 +541,10 @@ class Pve:
         return self.post(f"/nodes/{q(node)}/lxc", ostemplate=archive, restore=True, **params)
 
     def delete_backup(self, node: str, storage: str, volid: str) -> str:
+        return self.delete_volume(node, storage, volid)
+
+    def delete_volume(self, node: str, storage: str, volid: str) -> str:
+        """Deletes a file of a storage (a backup, an ISO image); Proxmox may answer with a task."""
         return self.delete(f"/nodes/{q(node)}/storage/{q(storage)}/content/{q(volid)}")
 
     def deleted_guests_backups(self) -> list[dict]:

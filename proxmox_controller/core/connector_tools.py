@@ -16,12 +16,12 @@ import shlex
 import time
 from dataclasses import dataclass, field
 from typing import Callable
-from urllib.parse import quote
 
-from . import claude_policy, guestfiles, screen, ssh, startup, tasks, vmhw, wol
+from . import claude_policy, cloudseed, cloudvm, guestfiles, screen, setupdisc, ssh, startup, tasks, vmhw, winsetup, wol
+from .cloudvm import CLOUD_IMAGES, CLOUD_URL, USERNAME
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
-from .vmspec import PROFILES, VMNAME, iso_name_from_url, vm_params
+from .vmspec import PROFILES, VMNAME, WINDOWS, iso_name_from_url, vm_params
 
 WAIT_S = 60          # a request waits this long for its Proxmox task; longer ones are followed with task_log
 LOG_LINES = 200      # the most lines task_log returns at a time
@@ -31,10 +31,7 @@ SNAPNAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,39}$")
 HOSTNAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 CIDR = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
 IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
-USERNAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 # Ubuntu's official cloud images (cloud-images.ubuntu.com): release → size in MB (measured 14/10/2026)
-CLOUD_IMAGES = {"24.04": 626, "26.04": 865}
-CLOUD_URL = "https://cloud-images.ubuntu.com/releases/{v}/release/ubuntu-{v}-server-cloudimg-amd64.img"
 
 
 class ToolError(Exception):
@@ -98,6 +95,7 @@ class Context:
     showing: bool = False          # the request goes to the user's window: its words may bring a picture
     _guests: list | None = field(default=None, repr=False)
     pointers: dict = field(default_factory=dict, repr=False)  # vmid → (state, mouse), read once a request
+    remember: Callable[[dict], None] | None = None  # the app keeps a new VM's setup disc, to take it away when set up
 
     def guests(self) -> list[dict]:
         if self._guests is None:
@@ -577,21 +575,100 @@ def _vm_params(ctx: Context, a: dict) -> tuple[str, dict]:
     return node, p
 
 
+def _windows_setup(a: dict) -> dict | None:
+    """The answer file's settings when Windows is to install itself (windows_user given), checked; else None."""
+    if not a.get("windows_user"):
+        for key in ("edition", "language", "remote_desktop", "dark_theme"):
+            if key in a:
+                raise ToolError(f"{key} is for a Windows that installs itself: give windows_user too.")
+        return None
+    profile = a.get("profile", "linux")
+    if profile not in WINDOWS:
+        raise ToolError("windows_user: only with the win11 or win10 profile.")
+    edition = a.get("edition") or winsetup.default_edition(profile)
+    rdp = bool(a.get("remote_desktop"))
+    problem = winsetup.check_user(a["windows_user"], "password", rdp, edition)  # (the user types the real one)
+    if problem:
+        raise ToolError(problem)
+    language = a.get("language") or winsetup.language_of_iso(a["iso"])
+    if language not in winsetup.LANGUAGES and not re.fullmatch(r"[a-z]{2,3}-[A-Z]{2}", language):
+        raise ToolError("language: a code such as en-US or el-GR.")
+    return {"user": a["windows_user"], "edition": edition, "language": language, "remote_desktop": rdp,
+            "dark": bool(a.get("dark_theme")), "virtio": bool(a.get("virtio_iso")),
+            "guest_tools": a.get("guest_agent", True)}
+
+
+def _create_vm_also(a: dict) -> tuple:
+    """Starting it is a power request; a Windows that installs itself also gets Enter pressed at its installer's
+    question (console) — each only where its switch is not Off."""
+    return _power_for_start(a) + (("console",) if a.get("start") and a.get("windows_user") else ())
+
+
 def _create_vm_words(ctx: Context, a: dict):
     node, p = _vm_params(ctx, a)
-    return f"Create VM {p['vmid']} ({p['name']}) on {node}", [
-        f"{PROFILES[a.get('profile', 'linux')]['label']}: {p['cores']} cores, {p['memory']} MiB, disk "
-        f"{next(v for k, v in p.items() if k in ('scsi0', 'sata0'))}", f"Boots {a['iso']}"
-        + (f", {_start_note(ctx, a)}" if a.get("start") else "")]
+    lines = [f"{PROFILES[a.get('profile', 'linux')]['label']}: {p['cores']} cores, {p['memory']} MiB, disk "
+             f"{next(v for k, v in p.items() if k in ('scsi0', 'sata0'))}", f"Boots {a['iso']}"
+             + (f", {_start_note(ctx, a)}" if a.get("start") else "")]
+    win = _windows_setup(a)
+    if win:
+        extras = [x for x, on in (("Remote Desktop on", win["remote_desktop"]), ("dark theme", win["dark"]),
+                                  ("VirtIO guest tools and agent", win["virtio"] and win["guest_tools"])) if on]
+        lines += [f"Windows installs itself: {win['edition']}, {win['language']}, user '{win['user']}' with the "
+                  "password you type below (Claude does not see it)" + (f"; {', '.join(extras)}" if extras else ""),
+                  "Its answer disc (with that password) is deleted by the app as soon as Windows is ready"]
+        if a.get("start") and _start(ctx, a):
+            lines.append("The app presses Enter at the installer's 'Press any key to boot from CD'" +
+                         ("" if "console" in ctx.kinds else " — not here: Console requests are Off"))
+    return f"Create VM {p['vmid']} ({p['name']}) on {node}", lines
 
 
 def _create_vm(ctx: Context, a: dict):
     node, p = _vm_params(ctx, a)
-    upid = ctx.pve.create_vm(node, p)
-    out = {"vmid": p["vmid"], "name": p["name"], "node": node, **finish(ctx, node, upid, wait=WAIT_S * 3),
-           "next": "Open its console (Console in the app, or console_screenshot) to install the operating system."}
-    if a.get("start") and not p["start"]:
+    win = _windows_setup(a)
+    if not win:
+        upid = ctx.pve.create_vm(node, p)
+        out = {"vmid": p["vmid"], "name": p["name"], "node": node, **finish(ctx, node, upid, wait=WAIT_S * 3),
+               "next": "Open its console (Console in the app, or console_screenshot) to install the operating system."}
+        if a.get("start") and not p["start"]:
+            out["started"] = NOT_STARTED
+        return out
+    if not ctx.secret:
+        raise ToolError("No password was typed.")
+    xml = winsetup.answer_file(password=ctx.secret, computer=winsetup.computer_name(p["name"]),
+                               uefi=p.get("bios") == "ovmf", **win)
+    vmid, start = p["vmid"], p.pop("start")
+    drive = setupdisc.free_slot(p)
+    volid = setupdisc.upload(ctx.pve, node, setupdisc.storage_of(a["iso"]), vmid, {winsetup.ANSWER_NAME: xml.encode()},
+                             "autounattend")
+    p[drive] = f"{volid},media=cdrom"
+    try:
+        made = finish(ctx, node, ctx.pve.create_vm(node, p), wait=WAIT_S * 3)
+    except Exception:
+        setupdisc.delete(ctx.admin or ctx.pve, node, volid)  # (deleting an ISO needs the user's token)
+        raise
+    if ctx.remember is not None:
+        ctx.remember(setupdisc.entry(ctx.host.id, node, vmid, volid, drive, win["virtio"] and win["guest_tools"]))
+    out = {"vmid": vmid, "name": p["name"], "node": node, **made, "windows": {
+        "edition": win["edition"], "language": win["language"], "user": win["user"],
+        "password": "set by the user (not shown to you)", "remote_desktop": win["remote_desktop"],
+        "answer_disc": f"{volid} on {drive} — the app deletes it once Windows is ready"}}
+    if made["status"] != "done":
+        out["note"] = "The VM is still being made: start it when task_log shows it finished, and press Enter in its " \
+                      "console at 'Press any key to boot from CD or DVD' (about 10 s after the start)."
+        return out
+    if start:
+        out["started"] = finish(ctx, node, ctx.pve.guest_action(node, "qemu", vmid, "start"))["status"]
+        if "console" in ctx.kinds:
+            presses = setupdisc.press_boot_key(ctx.pve, node, vmid)
+            out["boot_key"] = f"Enter pressed {presses} times in the first {setupdisc.BOOT_KEY_S} s"
+        else:
+            out["boot_key"] = "not pressed (Console requests are Off): press Enter in its console at 'Press any " \
+                              "key to boot from CD or DVD' — or restart it and do so"
+    elif a.get("start"):
         out["started"] = NOT_STARTED
+    out["next"] = ("Windows installs itself (about 15–30 minutes, with restarts); watch it with console_screenshot. "
+                   "Done when it shows the desktop" + (" and the guest agent answers (run_command works)"
+                                                       if win["virtio"] and win["guest_tools"] else "") + ".")
     return out
 
 
@@ -652,8 +729,8 @@ def _cloud_words(ctx: Context, a: dict):
 
 def _cloud_image(ctx: Context, a: dict):
     node, v = ctx.node(a.get("node", "")), a.get("release", "24.04")
-    name = f"ubuntu-{v}-server-cloudimg-amd64.qcow2"  # (the image is qcow2; Proxmox goes by the file's extension)
-    there = next((i["volid"] for i in ctx.pve.images(node) if i["volid"].endswith("/" + name)), None)
+    name = cloudvm.image_name(v)
+    there = cloudvm.find_image(ctx.pve.images(node), v)
     if there:
         return {"image": there, "status": "already on the host"}
     storage = a.get("storage") or next((s["storage"] for s in ctx.pve.storages(node, content="import")), "")
@@ -675,43 +752,72 @@ def _cloud_vm_params(ctx: Context, a: dict) -> tuple[str, dict, int]:
     if a["image"] not in images:
         raise ToolError(f"No image {a['image']} on {node} (get_cloud_image downloads one; list_install_media lists "
                         "them).")
-    desktop = a.get("edition", "server") == "desktop"
+    edition = a.get("edition", "server")
+    desktop = edition == "desktop"
+    if a.get("remote_desktop") and not desktop:
+        raise ToolError("remote_desktop needs edition 'desktop' (a server has no desktop to show).")
     storage = a.get("storage") or next((s["storage"] for s in (ctx.admin or ctx.pve).storages(node, content="images")),
                                        "")
     if not storage:
         raise ToolError(f"No storage on {node} takes VM disks.")
-    disk = a.get("disk_gb", 32 if desktop else 20)
-    p = {"vmid": a.get("vmid") or (ctx.admin or ctx.pve).next_id(), "name": a["name"], "ostype": "l26",
-         "cores": a.get("cores", 2), "memory": a.get("memory_mib", 4096 if desktop else 2048),
-         "scsihw": "virtio-scsi-single", "scsi0": f"{storage}:0,import-from={a['image']},discard=on,iothread=1",
-         "ide2": f"{storage}:cloudinit", "boot": "order=scsi0", "net0": f"virtio,bridge={a.get('bridge', 'vmbr0')},firewall=1",
-         "agent": "1", "ciuser": user, "ipconfig0": "ip=dhcp", "vga": "qxl" if desktop else "std",
-         "onboot": bool(a.get("start_at_boot"))}
-    if desktop:
-        p.update(audio0="device=ich9-intel-hda,driver=spice", tablet=1)  # (Proxmox leaves the tablet out with SPICE)
-    if a.get("ssh_public_key"):
-        p["sshkeys"] = quote(a["ssh_public_key"].strip(), safe="")  # Proxmox wants the keys URL-encoded
+    size = cloudvm.SIZES[edition]
+    disk = a.get("disk_gb", size["disk"])
+    p = cloudvm.vm_params(vmid=a.get("vmid") or (ctx.admin or ctx.pve).next_id(), name=a["name"], image=a["image"],
+                          storage=storage, bridge=a.get("bridge", "vmbr0"), cores=a.get("cores", size["cores"]),
+                          memory=a.get("memory_mib", size["memory"]), user=user,
+                          ssh_key=a.get("ssh_public_key", ""), desktop=desktop, onboot=bool(a.get("start_at_boot")),
+                          seed="pending" if desktop else "")  # (the desktop's disc is made when it is created)
     return node, p, disk
+
+
+def _seed_storage(ctx: Context, node: str) -> str:
+    """Where the desktop's setup disc goes: the first storage that takes ISO images."""
+    found = next((s["storage"] for s in (ctx.admin or ctx.pve).storages(node, content="iso")), "")
+    if not found:
+        raise ToolError(f"No storage on {node} takes ISO images, which the desktop's setup disc needs.")
+    return found
 
 
 def _cloud_vm_words(ctx: Context, a: dict):
     node, p, disk = _cloud_vm_params(ctx, a)
     desktop = a.get("edition", "server") == "desktop"
-    return f"Create VM {p['vmid']} ({p['name']}) — Ubuntu {'Desktop' if desktop else 'Server'} — on {node}", [
-        f"From {a['image']}: {p['cores']} cores, {p['memory']} MiB, disk {disk} GB, network by DHCP",
-        f"User '{p['ciuser']}', with the password you type below (Claude does not see it)" +
-        (" and an SSH key" if a.get("ssh_public_key") else ""),
-        "The desktop is installed after the first start (see the result's next steps)" if desktop else
-        "Ready about a minute after it starts"]
+    user = a.get("username", "user")
+    lines = [f"From {a['image']}: {p['cores']} cores, {p['memory']} MiB, disk {disk} GB, network by DHCP",
+             f"User '{user}', with the password you type below (Claude does not see it)" +
+             (" and an SSH key" if a.get("ssh_public_key") else "")]
+    if desktop:
+        lines += [f"On the first start it installs Ubuntu Desktop and the QEMU guest agent" +
+                  (", and Remote Desktop (xrdp, an Xfce session: sign in with that user)" if a.get("remote_desktop")
+                   else "") + ", then restarts by itself",
+                  f"From a setup disc on {_seed_storage(ctx, node)} (the password as a hash), deleted by the app once "
+                  "the agent answers"]
+    else:
+        lines.append("Ready about a minute after it starts")
+    return f"Create VM {p['vmid']} ({p['name']}) — Ubuntu {'Desktop' if desktop else 'Server'} — on {node}", lines
 
 
 def _cloud_vm(ctx: Context, a: dict):
     node, p, disk = _cloud_vm_params(ctx, a)
-    if ctx.secret:
+    vmid, desktop, rdp = p["vmid"], a.get("edition") == "desktop", bool(a.get("remote_desktop"))
+    user = a.get("username", "user")
+    volid = ""
+    if desktop:
+        seed = {"user-data": cloudseed.user_data(vm_name=p["name"], user=user, password=ctx.secret,
+                                                 ssh_keys=[a.get("ssh_public_key", "")], remote_desktop=rdp).encode(),
+                "meta-data": cloudseed.meta_data(p["name"], vmid).encode()}
+        volid = setupdisc.upload(ctx.pve, node, _seed_storage(ctx, node), vmid, seed, cloudseed.SEED_LABEL)
+        p["ide2"] = f"{volid},media=cdrom"
+    elif ctx.secret:
         p["cipassword"] = ctx.secret  # (Proxmox keeps only a hash of it)
-    vmid = p["vmid"]
-    made = finish(ctx, node, ctx.pve.create_vm(node, p), wait=WAIT_S * 3)
-    out = {"vmid": vmid, "name": p["name"], "node": node, "user": p["ciuser"],
+    try:
+        made = finish(ctx, node, ctx.pve.create_vm(node, p), wait=WAIT_S * 3)
+    except Exception:
+        if volid:
+            setupdisc.delete(ctx.admin or ctx.pve, node, volid)  # (deleting an ISO needs the user's token)
+        raise
+    if volid and ctx.remember is not None:
+        ctx.remember(setupdisc.entry(ctx.host.id, node, vmid, volid, "ide2", True))
+    out = {"vmid": vmid, "name": p["name"], "node": node, "user": user,
            "password": "set by the user (not shown to you)" if ctx.secret else "none", **made}
     if made["status"] != "done":
         out["note"] = "The disk is still being made from the image: start the VM when task_log shows it finished."
@@ -722,14 +828,20 @@ def _cloud_vm(ctx: Context, a: dict):
         out["started"] = finish(ctx, node, ctx.pve.guest_action(node, "qemu", vmid, "start"))["status"]
     elif a.get("start", True):
         out["started"] = NOT_STARTED
-    next_steps = ["It boots in about a minute; cloud-init sets the user, the password and the network on the first "
-                  "start. Its console (console_screenshot) shows the address it got.",
-                  "qemu-guest-agent is not in Ubuntu's cloud image: install it (sudo apt install -y qemu-guest-agent) "
-                  "so its address shows in Proxmox Controller and Commands can work."]
-    if a.get("edition") == "desktop":
-        next_steps.append("Ubuntu Desktop is not in the cloud image: install it (sudo apt install -y "
-                          "ubuntu-desktop-minimal), then reboot — through SSH, or on the console: console_send the user "
-                          "name, console_type_password for the password (and again when sudo asks).")
+    if desktop:
+        next_steps = ["On the first start cloud-init sets the user and the network, then installs Ubuntu Desktop and "
+                      "the QEMU guest agent" + (" and Remote Desktop" if rdp else "") + " — 10 to 20 minutes — and "
+                      "restarts by itself into the login screen. The app deletes the setup disc once the agent "
+                      "answers; its address then shows in Proxmox Controller."]
+        if rdp:
+            next_steps.append(f"Remote Desktop: connect to its address, port {cloudseed.RDP_PORT}, with the user and "
+                              "its password (an Xfce session). One user cannot be signed in at the console and over "
+                              "Remote Desktop at the same time.")
+    else:
+        next_steps = ["It boots in about a minute; cloud-init sets the user, the password and the network on the first "
+                      "start. Its console (console_screenshot) shows the address it got.",
+                      "qemu-guest-agent is not in Ubuntu's cloud image: install it (sudo apt install -y "
+                      "qemu-guest-agent) so its address shows in Proxmox Controller and Commands can work."]
     out["next_steps"] = next_steps
     return out
 
@@ -1466,15 +1578,30 @@ def _tools() -> list[Tool]:
              {**vm, "storage": {"type": "string"}, "mode": {"type": "string", "enum": ["snapshot", "suspend", "stop"]},
               "protected": {"type": "boolean"}, "note": {"type": "string"}}, ("host", "vmid"), _backup, _backup_words),
         Tool("create_vm", "change", "Create a VM that boots an ISO image (see list_install_media). Profiles: linux, "
-             "win11 (UEFI, Secure Boot, TPM 2.0), win10, other. It gets a SPICE display, sound and a USB tablet.",
+             "win11 (UEFI, Secure Boot, TPM 2.0), win10, other. It gets a SPICE display, sound and a USB tablet. "
+             "Windows (win11/win10) installs itself with windows_user: the app puts an answer file on a disc of its "
+             "own — VirtIO drivers from virtio_iso, the edition, no setup questions, that user with a password the "
+             "USER types in Proxmox Controller's window (you never give or see it), optionally Remote Desktop and the "
+             "dark theme, and the VirtIO guest tools with the QEMU guest agent last; with start, the app presses "
+             "Enter at the installer's 'Press any key to boot from CD' (a Console request in passing). The disc is "
+             "deleted once Windows is ready.",
              {**host, "name": {"type": "string"}, "iso": {"type": "string", "description": "An ISO's volid."},
               "profile": {"type": "string", "enum": list(PROFILES)}, "vmid": {"type": "integer", "minimum": 100},
               "cores": {"type": "integer", "minimum": 1, "maximum": 512},
               "memory_mib": {"type": "integer", "minimum": 64}, "disk_gb": {"type": "integer", "minimum": 1},
               "storage": {"type": "string"}, "bridge": {"type": "string"}, "virtio_iso": {"type": "string"},
               "host_cpu": {"type": "boolean"}, "guest_agent": {"type": "boolean"},
-              "start_at_boot": {"type": "boolean"}, "start": {"type": "boolean"}, "node": {"type": "string"}},
-             ("host", "name", "iso"), _create_vm, _create_vm_words, also=_power_for_start),
+              "start_at_boot": {"type": "boolean"}, "start": {"type": "boolean"}, "node": {"type": "string"},
+              "windows_user": {"type": "string", "description": "Windows installs itself with this user (an "
+                               "administrator); the user types its password."},
+              "edition": {"type": "string", "description": "As the installer lists it. Default: Windows 11 Pro "
+                          "(win10: Windows 10 Pro). Remote Desktop needs Pro, Education, Enterprise or Server."},
+              "language": {"type": "string", "description": "Such as en-US or el-GR. Default: from the ISO's name, "
+                           "else en-US. The keyboard is English (US)."},
+              "remote_desktop": {"type": "boolean"}, "dark_theme": {"type": "boolean"}},
+             ("host", "name", "iso"), _create_vm, _create_vm_words, also=_create_vm_also,
+             secret=lambda a: f"Password for the Windows user '{a['windows_user']}' in the new VM {a.get('name', '')}"
+             if a.get("windows_user") else ""),
         Tool("get_cloud_image", "change", "Have the host download Ubuntu Server's official cloud image (24.04 or "
              "26.04), once, to make VMs from with create_cloud_vm.",
              {**host, "release": {"type": "string", "enum": list(CLOUD_IMAGES)}, "storage": {"type": "string"},
@@ -1482,9 +1609,12 @@ def _tools() -> list[Tool]:
         Tool("create_cloud_vm", "change", "Create an Ubuntu VM from a cloud image (see get_cloud_image) — ready in "
              "about a minute, no installer: a user, its password (the USER types it in Proxmox Controller's window; "
              "you never give or see a password), optionally an SSH public key, network by DHCP. edition 'desktop' "
-             "adds a SPICE display, sound and a USB tablet; the desktop itself is installed after the first start.",
+             "adds a SPICE display, sound and a USB tablet, and installs Ubuntu Desktop and the QEMU guest agent by "
+             "itself on the first start (from a setup disc the app makes and deletes afterwards); remote_desktop "
+             "adds Remote Desktop (xrdp, port 3389, an Xfce session) with the same user and password.",
              {**host, "name": {"type": "string"}, "image": {"type": "string", "description": "The image's volid."},
               "edition": {"type": "string", "enum": ["server", "desktop"]},
+              "remote_desktop": {"type": "boolean", "description": "Desktop only."},
               "username": {"type": "string", "description": "Default: user."}, "vmid": {"type": "integer", "minimum": 100},
               "cores": {"type": "integer", "minimum": 1, "maximum": 512}, "memory_mib": {"type": "integer", "minimum": 512},
               "disk_gb": {"type": "integer", "minimum": 4}, "storage": {"type": "string"}, "bridge": {"type": "string"},

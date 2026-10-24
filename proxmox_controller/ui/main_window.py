@@ -250,6 +250,11 @@ class MainWindow(QMainWindow):
         if not self.demo:
             store.save_hosts(self.hosts)
 
+    def remember_setup_disc(self, disc: dict) -> None:
+        """A new VM's setup disc, made through the connector: kept until its host's page takes it away."""
+        self.settings.setdefault("setup_discs", []).append(disc)
+        self._save_settings()
+
     def _save_settings(self) -> None:
         if not self.demo:
             store.save_settings(self.settings)

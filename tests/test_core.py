@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -22,7 +23,7 @@ from unittest import mock
 from proxmox_controller.core import apt, ssh as sshmod
 from proxmox_controller.core import (autostart, claude_access, claude_policy, connector_link, connector_tools, jobs,
                                      mcp, netinfo, screen, sounds, spice, startup, store, tasks, vault, vmhw, wol)
-from proxmox_controller.core import guestfiles
+from proxmox_controller.core import cloudseed, guestfiles, isofs, setupdisc, winsetup
 from proxmox_controller.core.des import encrypt_block, vnc_response
 from proxmox_controller.core.fakevnc import FakeVncServer
 from proxmox_controller.core.rfb import RfbClient, RfbError, qnum_from_evdev, qnum_from_windows
@@ -1304,7 +1305,9 @@ class ConnectorToolsTest(unittest.TestCase):
         dcfg = self.pve.guest_config("pve", "qemu", desk["vmid"])
         self.assertEqual((dcfg["vga"], dcfg["memory"], self.status(desk["vmid"])), ("qxl", 4096, "stopped"))
         self.assertEqual(str(dcfg["tablet"]), "1")  # SPICE would leave it out
-        self.assertIn("ubuntu-desktop-minimal", " ".join(desk["next_steps"]))
+        self.assertIn("installs Ubuntu Desktop", " ".join(desk["next_steps"]))  # by itself, from the setup disc
+        self.assertNotIn("ciuser", dcfg)  # the app's own cloud-init disc instead of Proxmox's drive
+        self.assertRegex(dcfg["ide2"], r"^local:iso/pvc-setup-\d+-[0-9a-f]{6}\.iso,media=cdrom$")
         for bad in ({"image": "local:import/nope.qcow2"}, {"image": image, "username": "Root!"}):
             with self.assertRaises(connector_tools.ToolError):
                 self.run_tool("create_cloud_vm", secret="x", host="demo-pve", name="w2", reason="r", **bad)
@@ -1317,6 +1320,82 @@ class ConnectorToolsTest(unittest.TestCase):
         with self.assertRaises(PveError):
             self.run_tool("create_container", secret="abc", host="demo-pve", hostname="db2", template=template,
                           reason="r")
+
+    def run_with(self, tool_name, /, secret="", kinds=None, **args):
+        """run_tool, with the discs the app would keep (ctx.remember) and chosen switches not Off."""
+        tool = connector_tools.TOOLS[tool_name]
+        ctx = self.ctx()
+        ctx.secret, kept = secret, []
+        ctx.remember = kept.append
+        if kinds is not None:
+            ctx.kinds = frozenset(kinds)
+        return tool.run(ctx, connector_tools.check(tool, args)), kept
+
+    def test_windows_that_installs_itself(self):
+        iso, virtio = "local:iso/Win11_25H2_Greek_x64.iso", "local:iso/virtio-win.iso"
+        self.cluster.isos += [iso, virtio]
+        args = dict(host="demo-pve", name="win-desk", iso=iso, profile="win11", virtio_iso=virtio,
+                    windows_user="nikos", remote_desktop=True, dark_theme=True, start=True, reason="r")
+        tool = connector_tools.TOOLS["create_vm"]
+        self.assertEqual(tool.secret_prompt(args), "Password for the Windows user 'nikos' in the new VM win-desk")
+        self.assertEqual(tool.secret_prompt({"name": "x"}), "")  # no Windows setup: no password asked
+        self.assertEqual(tool.also_of(args), ("power", "console"))  # the start, and Enter at the installer's question
+        what, lines = self.words("create_vm", **args)
+        self.assertIn("Windows installs itself: Windows 11 Pro, el-GR, user 'nikos'", " ".join(lines))
+        self.assertIn("Remote Desktop on, dark theme", " ".join(lines))
+        with mock.patch.object(setupdisc, "BOOT_KEY_S", 0.05), mock.patch.object(setupdisc, "BOOT_KEY_EVERY_S", 0.01):
+            out, kept = self.run_with("create_vm", secret="Win-Pass-77", **args)
+        vmid = out["vmid"]
+        self.assertNotIn("Win-Pass-77", json.dumps(out))
+        cfg = self.pve.guest_config("pve", "qemu", vmid)
+        disc = cfg["ide3"].split(",")[0]
+        self.assertTrue(setupdisc.is_setup_disc(disc))
+        self.assertEqual(kept, [{**kept[0], "host": "demo-pve", "vmid": vmid, "volid": disc, "drive": "ide3",
+                                 "agent": True}])
+        _, files = read_iso(self.cluster.files[disc.split("/")[1]], joliet=True)
+        xml = files["autounattend.xml"].decode()
+        self.assertIn("<Name>nikos</Name>", xml)
+        self.assertIn(winsetup.hidden("Win-Pass-77", "Password"), xml)
+        self.assertIn("<UILanguage>el-GR</UILanguage>", xml)
+        self.assertNotIn("Win-Pass-77", xml)
+        self.assertEqual(self.status(vmid), "running")
+        self.assertTrue(self.cluster.keys and set(self.cluster.keys) == {(vmid, "ret")})
+        self.assertIn("Enter pressed", out["boot_key"])
+        # Console Off: not pressed, and said so
+        self.cluster.keys.clear()
+        out, _ = self.run_with("create_vm", secret="pw", kinds=("read", "change", "power"),
+                               **{**args, "name": "win-2"})
+        self.assertIn("not pressed", out["boot_key"])
+        self.assertEqual(self.cluster.keys, [])
+        for bad, words in (({"profile": "linux"}, "only with the win11 or win10"),
+                           ({"windows_user": None, "remote_desktop": True}, "give windows_user too"),
+                           ({"edition": "Windows 11 Home"}, "Home"),
+                           ({"windows_user": "Guest"}, "Windows' own")):
+            a = {k: v for k, v in {**args, "name": "win-3", **bad}.items() if v is not None}
+            with self.assertRaises(connector_tools.ToolError) as caught:
+                self.run_with("create_vm", secret="pw", **a)
+            self.assertIn(words, str(caught.exception))
+
+    def test_desktop_with_remote_desktop(self):
+        image = self.run_tool("get_cloud_image", host="demo-pve", release="24.04", reason="r")["image"]
+        args = dict(host="demo-pve", name="desk", image=image, edition="desktop", remote_desktop=True,
+                    username="nikos", start=False, reason="r")
+        _, lines = self.words("create_cloud_vm", **args)
+        self.assertIn("Remote Desktop (xrdp", " ".join(lines))
+        out, kept = self.run_with("create_cloud_vm", secret="Lnx-Pass-9", **args)
+        self.assertNotIn("Lnx-Pass-9", json.dumps(out))
+        cfg = self.pve.guest_config("pve", "qemu", out["vmid"])
+        disc = cfg["ide2"].split(",")[0]
+        self.assertEqual((kept[0]["volid"], kept[0]["drive"], kept[0]["agent"]), (disc, "ide2", True))
+        label, files = read_iso(self.cluster.files[disc.split("/")[1]], joliet=True)
+        self.assertEqual(label, "cidata")
+        data = json.loads(files["user-data"].decode().split("\n", 1)[1])
+        self.assertIn("xrdp", data["packages"])
+        self.assertEqual(data["password"], cloudseed.sha512_crypt("Lnx-Pass-9", data["password"].split("$")[2]))
+        self.assertNotIn(out["vmid"], self.cluster.secrets)  # not through Proxmox's cloud-init this time
+        self.assertIn("Remote Desktop: connect to its address, port 3389", " ".join(out["next_steps"]))
+        with self.assertRaises(connector_tools.ToolError):
+            self.run_with("create_cloud_vm", secret="x", **{**args, "name": "srv", "edition": "server"})
 
     def test_typing_a_password(self):
         what, lines, picture = self.words("console_type_password", host="demo-pve", vmid=201, reason="login")
@@ -2591,3 +2670,280 @@ class GuestFilesTest(unittest.TestCase):
             guestfiles.extract_tar(buf, root / "out")
         self.assertFalse((root / "outside.txt").exists())
 
+
+
+def read_iso(image: bytes, joliet: bool) -> tuple[str, dict[str, bytes]]:
+    """The volume name and the root folder's files of an ISO image, read as a CD reader would (the primary tree's
+    names or the Joliet tree's)."""
+    sector = isofs.SECTOR
+    desc = image[(17 if joliet else 16) * sector:][:sector]
+    assert desc[1:6] == b"CD001" and desc[0] == (2 if joliet else 1)
+    if joliet:
+        assert desc[88:91] == b"%/E"
+    label = desc[40:72].decode("utf-16-be" if joliet else "ascii").strip()
+    root = desc[156:190]
+    at, size = struct.unpack("<I", root[2:6])[0], struct.unpack("<I", root[10:14])[0]
+    folder, files, pos = image[at * sector:at * sector + size], {}, 0
+    while pos < len(folder):
+        length = folder[pos]
+        if length == 0:  # the rest of this sector is empty: records never cross into the next one
+            pos = (pos // sector + 1) * sector
+            continue
+        rec = folder[pos:pos + length]
+        ident = rec[33:33 + rec[32]]
+        if ident not in (b"\x00", b"\x01"):
+            extent, data_len = struct.unpack("<I", rec[2:6])[0], struct.unpack("<I", rec[10:14])[0]
+            name = ident.decode("utf-16-be") if joliet else ident.decode("ascii")
+            files[name] = image[extent * sector:extent * sector + data_len]
+        pos += length
+    return label, files
+
+
+class IsoFsTest(unittest.TestCase):
+    """The setup disc's ISO image: both trees readable, the real names in the Joliet one."""
+
+    FILES = {"autounattend.xml": b"<unattend/>", "user-data": b"#cloud-config\n{}", "meta-data": b"",
+             "big.bin": bytes(range(256)) * 41}
+
+    def test_both_trees(self):
+        image = isofs.make_iso(self.FILES, "cidata", when=0)
+        self.assertEqual(len(image) % isofs.SECTOR, 0)
+        label, files = read_iso(image, joliet=True)
+        self.assertEqual((label, files), ("cidata", self.FILES))  # the real names (what Windows and Linux read)
+        label, files = read_iso(image, joliet=False)
+        self.assertEqual(label, "CIDATA")
+        self.assertEqual(sorted(files), ["AUTOUNAT.XML;1", "BIG.BIN;1", "META_DAT.;1", "USER_DAT.;1"])
+        self.assertEqual(files["BIG.BIN;1"], self.FILES["big.bin"])
+
+    def test_a_folder_longer_than_a_sector(self):
+        many = {f"file-number-{n:03d}-with-a-long-name.txt": str(n).encode() for n in range(60)}
+        _, files = read_iso(isofs.make_iso(many, "many"), joliet=True)
+        self.assertEqual(files, many)
+        _, short = read_iso(isofs.make_iso(many, "many"), joliet=False)
+        self.assertEqual(len(set(short)), 60)  # 8.3 names, each one different
+
+    def test_names_are_checked(self):
+        for files, label in (({"a b.txt": b""}, "x"), ({"ok.txt": b""}, "bad label"), ({"δ.txt": b""}, "x")):
+            with self.assertRaises(ValueError):
+                isofs.make_iso(files, label)
+        self.assertEqual(isofs.short_names(["user-data", "user-data.x", "USER_DAT"]),
+                         ["USER_DAT.", "USER_DAT.X", "USER_D_2."])
+
+    @unittest.skipUnless(shutil.which("xorriso"), "xorriso is not installed")
+    def test_xorriso_reads_it(self):
+        """Another program's reader (libisofs), as a check on the format itself."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "seed.iso")
+            Path(path).write_bytes(isofs.make_iso(self.FILES, "cidata"))
+            listing = subprocess.run(["xorriso", "-indev", path, "-ls", "/"], capture_output=True, text=True).stdout
+            self.assertEqual(sorted(re.findall(r"'([^']+)'", listing)), sorted(self.FILES))
+            out = os.path.join(d, "out")
+            subprocess.run(["xorriso", "-osirrox", "on", "-indev", path, "-extract", "/", out],
+                           capture_output=True, check=True)
+            for name, data in self.FILES.items():
+                self.assertEqual(Path(out, name).read_bytes(), data)
+            if shutil.which("blkid"):  # how cloud-init finds its disc
+                found = subprocess.run(["blkid", "-p", "-o", "export", path], capture_output=True, text=True).stdout
+                self.assertIn("LABEL=cidata", found)
+
+
+class WinSetupTest(unittest.TestCase):
+    NS = {"u": "urn:schemas-microsoft-com:unattend"}
+
+    def xml(self, **kw):
+        import xml.etree.ElementTree as ET
+        args = {"user": "nikos", "password": "S3cret-Pässword", "computer": "win-1", "edition": "Windows 11 Pro",
+                "uefi": True, **kw}
+        text = winsetup.answer_file(**args)
+        return text, ET.fromstring(text)
+
+    def component(self, root, setting, name):
+        for s in root.findall("u:settings", self.NS):
+            if s.get("pass") == setting:
+                for c in s.findall("u:component", self.NS):
+                    if c.get("name") == name:
+                        return c
+        return None
+
+    def test_answer_file(self):
+        text, root = self.xml(remote_desktop=True, dark=True)
+        self.assertNotIn("S3cret", text)  # only Windows' hidden form
+        shell = self.component(root, "oobeSystem", "Microsoft-Windows-Shell-Setup")
+        account = shell.find("u:UserAccounts/u:LocalAccounts/u:LocalAccount", self.NS)
+        self.assertEqual(account.find("u:Name", self.NS).text, "nikos")
+        self.assertEqual(account.find("u:Group", self.NS).text, "Administrators")
+        hidden = account.find("u:Password/u:Value", self.NS).text
+        self.assertEqual(base64.b64decode(hidden).decode("utf-16-le"), "S3cret-PässwordPassword")
+        self.assertEqual(shell.find("u:AutoLogon/u:LogonCount", self.NS).text, "1")
+        self.assertEqual(shell.find("u:OOBE/u:ProtectYourPC", self.NS).text, "3")
+        self.assertIsNone(shell.find("u:UserAccounts/u:AdministratorPassword", self.NS))  # not a server
+        setup = self.component(root, "windowsPE", "Microsoft-Windows-Setup")
+        self.assertEqual(setup.find(".//u:MetaData/u:Value", self.NS).text, "Windows 11 Pro")
+        self.assertEqual(setup.find(".//u:InstallTo/u:PartitionID", self.NS).text, "3")  # EFI, MSR, Windows
+        kinds = [p.find("u:Type", self.NS).text for p in setup.findall(".//u:CreatePartition", self.NS)]
+        self.assertEqual(kinds, ["EFI", "MSR", "Primary"])
+        paths = [p.text for p in self.component(root, "windowsPE", "Microsoft-Windows-PnpCustomizationsWinPE")
+                 .findall(".//u:Path", self.NS)]
+        self.assertIn("E:\\vioscsi\\w11\\amd64", paths)
+        self.assertIn("D:\\NetKVM\\w11\\amd64", paths)
+        self.assertEqual(self.component(root, "specialize", "Microsoft-Windows-Shell-Setup")
+                         .find("u:ComputerName", self.NS).text, "win-1")
+        commands = [c.find("u:CommandLine", self.NS).text for c in shell.findall(".//u:SynchronousCommand", self.NS)]
+        self.assertIn("fDenyTSConnections -Value 0", commands[0])
+        self.assertIn(winsetup.RDP_FIREWALL_GROUP, commands[0])  # the firewall group in any language
+        self.assertTrue(any("AppsUseLightTheme" in c for c in commands))
+        self.assertIn("virtio-win-guest-tools.exe", commands[-1])  # last: the agent answering means ready
+        orders = [int(c.find("u:Order", self.NS).text) for c in shell.findall(".//u:SynchronousCommand", self.NS)]
+        self.assertEqual(orders, list(range(1, len(orders) + 1)))
+
+    def test_bios_server_and_no_virtio(self):
+        text, root = self.xml(uefi=False, virtio=False, edition="Windows Server 2022 Standard (Desktop Experience)")
+        setup = self.component(root, "windowsPE", "Microsoft-Windows-Setup")
+        self.assertEqual([p.find("u:Type", self.NS).text for p in setup.findall(".//u:CreatePartition", self.NS)],
+                         ["Primary", "Primary"])
+        self.assertEqual(setup.find(".//u:ModifyPartition/u:Active", self.NS).text, "true")
+        self.assertEqual(setup.find(".//u:InstallTo/u:PartitionID", self.NS).text, "2")
+        self.assertIsNone(self.component(root, "windowsPE", "Microsoft-Windows-PnpCustomizationsWinPE"))
+        shell = self.component(root, "oobeSystem", "Microsoft-Windows-Shell-Setup")
+        admin = shell.find("u:UserAccounts/u:AdministratorPassword/u:Value", self.NS).text
+        self.assertEqual(base64.b64decode(admin).decode("utf-16-le"), "S3cret-PässwordAdministratorPassword")
+        self.assertIsNone(shell.find("u:FirstLogonCommands", self.NS))  # no tools without the VirtIO disc
+        self.assertIn("2k22", winsetup.driver_folder("Windows Server 2022 Standard (Desktop Experience)"))
+        self.assertEqual(winsetup.driver_folder("Windows 10 Pro"), "w10")
+
+    def test_checks(self):
+        ok = ("user", "pw", False, "Windows 11 Pro")
+        self.assertEqual(winsetup.check_user(*ok), "")
+        self.assertEqual(winsetup.check_user("user", "", False, "Windows 11 Pro"), "")  # no password: allowed
+        for args, words in ((("user", "", True, "Windows 11 Pro"), "Remote Desktop needs a password"),
+                            (("user", "pw", True, "Windows 11 Home"), "Home"),
+                            (("Administrator", "pw", False, "Windows 11 Pro"), "Windows' own"),
+                            (("bad/name", "pw", False, "Windows 11 Pro"), "user name"),
+                            (("user", "", False, "Windows Server 2025 Standard"), "Administrator")):
+            self.assertIn(words, winsetup.check_user(*args))
+        with self.assertRaises(ValueError):
+            winsetup.answer_file(user="user", password="", computer="x", edition="Windows 11 Pro", uefi=True,
+                                 remote_desktop=True)
+
+    def test_names(self):
+        for volid, lang in (("local:iso/Win11_25H2_English_x64.iso", "en-US"),
+                            ("local:iso/Win11_25H2_EnglishInternational_x64.iso", "en-GB"),
+                            ("nas:iso/Win11_24H2_Greek_x64v2.iso", "el-GR"),
+                            ("local:iso/26100.1742_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_de-de.iso", "de-DE"),
+                            ("local:iso/windows.iso", "en-US")):
+            self.assertEqual(winsetup.language_of_iso(volid), lang, volid)
+        self.assertEqual(winsetup.computer_name("my-windows-vm-number-one.lan"), "my-windows-vm-n")
+        self.assertEqual(winsetup.computer_name("1234"), "*")
+        self.assertEqual(winsetup.default_edition("win10"), "Windows 10 Pro")
+
+
+class CloudSeedTest(unittest.TestCase):
+    def test_sha512_crypt(self):
+        # Ulrich Drepper's own examples (the SHA-crypt specification)
+        self.assertEqual(cloudseed.sha512_crypt("Hello world!", "saltstring"),
+                         "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJuesI68u4OTLiBFdcbYEd"
+                         "FCoEOfaS35inz1")
+        self.assertEqual(cloudseed.sha512_crypt("Hello world!", "saltstringsaltstring", rounds=10000),
+                         "$6$rounds=10000$saltstringsaltst$OW1/O6BYHV6BcXZu8QVeXbDWra3Oeqh0sbHbbMCVNSnCM/UrjmM0Dp8vOuZe"
+                         "HBy/YTBmSK6H9qs/y3RnOaw5v.")
+        made = cloudseed.sha512_crypt("pw")
+        salt = made.split("$")[2]
+        self.assertEqual((len(salt), cloudseed.sha512_crypt("pw", salt)), (16, made))
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl is not installed")
+    def test_sha512_crypt_as_openssl(self):
+        for pw in ("a", "Καλημέρα κόσμε!", "x" * 65, "x" * 200, "p@ss w0rd$\\"):
+            theirs = subprocess.run(["openssl", "passwd", "-6", "-salt", "AbC.def/123", "-stdin"], input=pw.encode(),
+                                    capture_output=True).stdout.decode().strip()
+            self.assertEqual(cloudseed.sha512_crypt(pw, "AbC.def/123"), theirs)
+
+    def config(self, **kw):
+        text = cloudseed.user_data(**{"vm_name": "desk.lan", "user": "nikos", "password": "Pw-1234",
+                                      "ssh_keys": ["ssh-ed25519 AAAA me@pc", ""], **kw})
+        self.assertTrue(text.startswith("#cloud-config\n"))
+        self.assertNotIn("Pw-1234", text)
+        return json.loads(text.split("\n", 1)[1])  # (JSON: YAML too, for cloud-init)
+
+    def test_desktop_with_remote_desktop(self):
+        cfg = self.config(remote_desktop=True)
+        self.assertEqual((cfg["user"], cfg["users"], cfg["hostname"], cfg["fqdn"]),
+                         ("nikos", ["default"], "desk", "desk.lan"))
+        salt = cfg["password"].split("$")[2]
+        self.assertEqual(cfg["password"], cloudseed.sha512_crypt("Pw-1234", salt))
+        self.assertEqual(cfg["ssh_authorized_keys"], ["ssh-ed25519 AAAA me@pc"])
+        for pkg in ("qemu-guest-agent", "ubuntu-desktop-minimal", "xrdp", "xorgxrdp", "xfce4"):
+            self.assertIn(pkg, cfg["packages"])
+        self.assertIn(["update-alternatives", "--set", "x-session-manager", "/usr/bin/xfce4-session"], cfg["runcmd"])
+        self.assertIn(["systemctl", "enable", "--now", "xrdp"], cfg["runcmd"])
+        self.assertEqual(cfg["runcmd"][0], ["systemctl", "start", "qemu-guest-agent"])
+        self.assertEqual(cfg["power_state"]["mode"], "reboot")
+        self.assertTrue(cfg["package_upgrade"])  # the image on the host ages: the VM starts up to date
+        self.assertIn("color-manager", cfg["write_files"][0]["content"])
+
+    def test_without_remote_desktop(self):
+        cfg = self.config()
+        self.assertNotIn("xrdp", cfg["packages"])
+        self.assertNotIn("write_files", cfg)
+        self.assertNotIn("power_state", self.config(desktop=False))
+        with self.assertRaises(ValueError):
+            cloudseed.user_data(vm_name="d", user="u", password="", ssh_keys=[], remote_desktop=True)
+        one, two = (json.loads(cloudseed.meta_data("desk.lan", 120)) for _ in range(2))
+        self.assertNotEqual(one["instance-id"], two["instance-id"])
+        self.assertEqual(one["local-hostname"], "desk")
+
+
+class SetupDiscTest(unittest.TestCase):
+    def setUp(self):
+        DemoPve._clusters.clear()
+        self.pve = DemoPve(DEMO_HOSTS[0])
+        self.cluster = self.pve.cluster
+
+    def vm_with_disc(self, vmid=150, agent=True, status="running", uptime=600):
+        volid = setupdisc.upload(self.pve, "pve", "local", vmid, {"autounattend.xml": b"<x/>"}, "autounattend")
+        self.pve.create_vm("pve", {"vmid": vmid, "name": f"vm{vmid}", "scsi0": "local-lvm:8",
+                                   "ide3": f"{volid},media=cdrom", "agent": "1" if agent else "0"})
+        g = self.cluster.guests[vmid]
+        g.update(status=status, uptime=uptime)
+        return setupdisc.entry("demo-pve", "pve", vmid, volid, "ide3", agent)
+
+    def test_upload(self):
+        volid = setupdisc.upload(self.pve, "pve", "local", 150, {"user-data": b"x", "meta-data": b""}, "cidata")
+        self.assertRegex(volid, r"^local:iso/pvc-setup-150-[0-9a-f]{6}\.iso$")
+        self.assertTrue(setupdisc.is_setup_disc(volid))
+        self.assertFalse(setupdisc.is_setup_disc("local:iso/virtio-win.iso"))
+        label, files = read_iso(self.cluster.files[volid.split("/")[1]], joliet=True)
+        self.assertEqual((label, files), ("cidata", {"user-data": b"x", "meta-data": b""}))
+        self.assertEqual(setupdisc.free_slot({"ide2": "x", "ide3": "y"}), "ide1")
+
+    def test_tidy(self):
+        ready = self.vm_with_disc(150)                                  # the agent answers: set up
+        stopped = self.vm_with_disc(151, status="stopped")              # not started yet: it still needs the disc
+        silent = self.vm_with_disc(152)                                 # the agent does not answer yet
+        self.cluster.guests[152]["agent_down"] = True
+        young = self.vm_with_disc(153, agent=False, uptime=60)          # no agent will tell; started a minute ago
+        old = self.vm_with_disc(154, agent=False, uptime=setupdisc.READY_UPTIME_S)
+        given_up = self.vm_with_disc(155, uptime=setupdisc.AGENT_GIVE_UP_S)
+        self.cluster.guests[155]["agent_down"] = True
+        gone = self.vm_with_disc(156)
+        del self.cluster.guests[156]
+        entries = [ready, stopped, silent, young, old, given_up, gone]
+        taken, said = setupdisc.tidy(self.pve, entries, self.pve.guests())
+        self.assertEqual(taken, {ready["volid"], old["volid"], given_up["volid"], gone["volid"]})
+        for e in (ready, old, given_up, gone):
+            self.assertNotIn(e["volid"], self.cluster.isos)  # the file is deleted
+        for e in (stopped, silent, young):
+            self.assertIn(e["volid"], self.cluster.isos)
+        self.assertEqual(self.pve.guest_config("pve", "qemu", 150)["ide3"], "none,media=cdrom")  # the drive emptied
+        self.assertIn("VM 150 (vm150): setup finished", said[0])
+        self.assertTrue(any("VM 156 is gone" in t for t in said))
+        self.assertEqual(setupdisc.tidy(self.pve, [ready], self.pve.guests())[0], {ready["volid"]})  # gone already
+
+    def test_boot_key(self):
+        self.vm_with_disc(150)
+        naps = []
+        self.assertEqual(setupdisc.press_boot_key(self.pve, "pve", 150, seconds=0.05, every=0.01,
+                                                  sleep=lambda s: (naps.append(s), time.sleep(0.01))),
+                         len(naps))
+        self.assertTrue(naps and all(k == (150, "ret") for k in self.cluster.keys))
+        self.cluster.guests[150]["status"] = "stopped"
+        self.assertEqual(setupdisc.press_boot_key(self.pve, "pve", 150, seconds=0.03, every=0.01), 0)  # no error

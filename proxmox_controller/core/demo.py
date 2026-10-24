@@ -30,7 +30,8 @@ class DemoPve(Pve):
         self.cluster = self._clusters[host.id]
 
     def request(self, method: str, path: str, params: dict | None = None, as_json: bool = False):
-        params = {k: (v if as_json else _form_value(v)) for k, v in (params or {}).items() if v is not None}
+        params = {k: (v if as_json or isinstance(v, bytes) else _form_value(v))  # (bytes: an upload's file)
+                  for k, v in (params or {}).items() if v is not None}
         h = self.host  # the host's own token: Claude's token gets only its privileges, as on a real Proxmox
         status, reason, payload = self.cluster.handle(method, unquote(path), params,
                                                       f"PVEAPIToken={h.token_id}={h.token_secret}")
@@ -69,3 +70,9 @@ class DemoPve(Pve):
             time.sleep(0.02)
         return self.request("POST", f"/nodes/{node}/storage/{storage}/upload",
                             {"content": content, "filename": name, "size": size})
+
+    def _upload(self, node: str, storage: str, name: str, size: int, fh, content: str = "iso",
+                progress=None, cancelled=None, chunk: int = 1 << 20) -> str:
+        data = fh.read()  # (a small file made here: kept whole, for the tests to read)
+        return self.request("POST", f"/nodes/{node}/storage/{storage}/upload",
+                            {"content": content, "filename": name, "size": len(data), "data": data})

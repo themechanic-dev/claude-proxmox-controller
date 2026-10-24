@@ -37,6 +37,7 @@ def parse_multipart(body: bytes, boundary: str) -> dict:
         if 'filename="' in disposition:
             out[name] = disposition.split('filename="', 1)[1].split('"', 1)[0]
             out["size"] = str(len(data))
+            out["data"] = data
         else:
             out[name] = data.decode()
     return out

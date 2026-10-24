@@ -343,7 +343,8 @@ class Connector(QObject):
             host = info["host"]
             entry["host"] = host.name
             ctx = Context(host=host, pve=self.make_client(info["claude"]), admin=self.make_client(host),
-                          kinds=not_off(info["switches"]))  # (before the words: they say what will be done)
+                          kinds=not_off(info["switches"]),  # (before the words: they say what will be done)
+                          remember=lambda disc: self.on_gui(lambda: self.win.remember_setup_disc(disc)))
             if info["state"] == OFF:  # refused — but the log says what was tried, in words, when it can
                 try:
                     entry["what"] = tool.words(ctx, args)[0] if tool.words else ""

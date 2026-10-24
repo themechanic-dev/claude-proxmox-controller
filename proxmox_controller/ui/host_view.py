@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
                                QHeaderView, QMenu, QScrollArea, QStackedWidget, QStyle, QStyledItemDelegate,
                                QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
 
-from ..core import netinfo, spice, startup, tasks, wol  # noqa: F401 (netinfo: the tests replace its ARP table)
+from ..core import netinfo, setupdisc, spice, startup, tasks, wol  # noqa: F401 (netinfo: the tests replace its ARP table)
 from ..core.details import read_details
 from ..core.pve import Host, Pve, PveError, storage_order
 from . import theme
@@ -29,6 +29,7 @@ DETAILS_REFRESH_S = 60  # notes, MAC and IP addresses change rarely: read them o
 AFTER_START_S = 30      # …and once more this long after a start, when a booted guest has its address
 WAKE_TIMEOUT_S = 240
 UPDATES_EVERY_S = 1800  # the waiting package updates are counted again this often (the host checks daily)
+SETUP_DISCS_EVERY_S = 60  # new VMs' setup discs are checked this often (core/setupdisc.py)
 MULTI = ("start", "shutdown", "stop", "reboot")  # what works on several selected guests at once
 CLOSED_LOGS_KEPT = 5  # closed task-log windows kept for reopening; older ones are freed
 COLUMNS = ["", "ID", "Name", "Type", "Status", "Boot", "CPU", "Memory", "Disk", "IP address", "Uptime", ""]
@@ -250,6 +251,8 @@ class HostView(QWidget):
         self.waking_until = 0.0
         self.sort = (COL_ID, Qt.SortOrder.AscendingOrder)
         self.task_logs: dict[str, TaskLogDialog] = {}
+        self.discs_at = 0.0  # when the setup discs were last checked
+        self.discs_inflight = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -520,6 +523,7 @@ class HostView(QWidget):
         self._update_header()
         self.stack.setCurrentIndex(1)
         self._refresh_details()
+        self._tidy_setup_discs()
 
     def _show_numbers(self, data) -> None:
         sts = list(data["status"].values())
@@ -1046,16 +1050,54 @@ class HostView(QWidget):
         if not self.nodes:
             return
         from .vm_dialog import CreateVmDialog
-        dlg = CreateVmDialog(self, self.client, self.runner, self.nodes)
+        dlg = CreateVmDialog(self, self.client, self.runner, self.nodes, remember=self.remember_setup_disc)
         dlg.finished.connect(lambda *_: self._after_new_vm(dlg))
         dlg.open()
 
     def _after_new_vm(self, dlg) -> None:
         if dlg.created:
-            vmid, name = dlg.created
-            self.notify(f"Created VM {vmid} ({name}) — open its Console to install the operating system")
+            self.notify(dlg.done_text)
             self.details_at = 0.0
+        if dlg.boot_keys:  # Windows' installer disc asks for a key before it boots: pressed here, not in the window
+            node, vmid = dlg.boot_keys
+            pve = self.client()
+            self.runner.run(lambda: setupdisc.press_boot_key(pve, node, vmid),
+                            lambda n, err: self.notify(f"VM {vmid}: Enter pressed at the installer's question — "
+                                                       "Windows Setup runs by itself now" if n else
+                                                       f"VM {vmid}: Enter could not be pressed — press a key in its "
+                                                       "Console at “Press any key to boot from CD”"))
         self.refresh()
+
+    # -- setup discs of new VMs --------------------------------------------------------------------
+
+    def remember_setup_disc(self, disc: dict) -> None:
+        """Keeps a new VM's setup disc in the settings until it is taken away (it holds the user's password)."""
+        self.prefs.setdefault("setup_discs", []).append({**disc, "host": self.host.id})
+        if self.on_prefs_changed:
+            self.on_prefs_changed()
+
+    def _tidy_setup_discs(self) -> None:
+        """Takes away the discs of this host's VMs that are set up (or gone) — checked once a minute."""
+        discs = [d for d in self.prefs.get("setup_discs") or [] if d.get("host") == self.host.id]
+        if not discs or self.discs_inflight or time.monotonic() < self.discs_at:
+            return
+        self.discs_inflight, self.discs_at = True, time.monotonic() + SETUP_DISCS_EVERY_S
+        pve, guests = self.client(), [dict(g) for g in self.guests]
+
+        def done(result, err):
+            self.discs_inflight = False
+            if err is not None or not result:
+                return  # tried again the next time
+            gone, said = result
+            if gone:
+                self.prefs["setup_discs"] = [d for d in self.prefs.get("setup_discs") or []
+                                             if d.get("volid") not in gone]
+                if self.on_prefs_changed:
+                    self.on_prefs_changed()
+            for text in said:
+                self.notify(text)
+
+        self.runner.run(lambda: setupdisc.tidy(pve, discs, guests), done)
 
     def new_container(self) -> None:
         if not self.nodes:

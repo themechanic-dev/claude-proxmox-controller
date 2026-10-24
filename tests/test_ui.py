@@ -7,6 +7,7 @@ import sys
 import shutil
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,8 +28,8 @@ if QApplication is not None:
     from proxmox_controller.core.pve import Host, PveError
     from proxmox_controller import app as app_module
     import threading
-    from proxmox_controller.core import (claude_access, claude_policy, connector_link, connector_log, sounds,
-                                         screen as screen_core, ssh as ssh_core, vault)
+    from proxmox_controller.core import (claude_access, claude_policy, connector_link, connector_log, setupdisc,
+                                         sounds, screen as screen_core, ssh as ssh_core, vault)
     from proxmox_controller.ui import (backup_jobs, backups, bulk, claude_window, connector, console, geometry,
                                        agent_setup, files_window, graph_wall, guest_dialogs, hazard, host_dialog,
                                        host_shell, host_view, main_window, tasks_panel, theme, vault_dialogs,
@@ -1068,6 +1069,49 @@ class VmParamsTest(unittest.TestCase):
         self.assertEqual(vm_dialog.iso_name_from_url("https://x.org/a/ubuntu%2024.04.iso?dl=1"), "ubuntu_24.04.iso")
 
 
+def test_core_read_iso(image: bytes) -> dict:
+    from tests.test_core import read_iso
+    return read_iso(image, joliet=True)[1]
+
+
+class SetupDiscViewTest(UiCase):
+    def test_discs_go_once_the_vm_is_set_up(self):
+        pve = DemoPve(DEMO_HOSTS[0])
+        volid = setupdisc.upload(pve, "pve", "local", 160, {"autounattend.xml": b"<x/>"}, "autounattend")
+        pve.create_vm("pve", {"vmid": 160, "name": "win", "scsi0": "local-lvm:8", "ide3": f"{volid},media=cdrom",
+                              "agent": "1"})
+        self.cluster().guests[160]["agent_down"] = True  # Windows is still installing
+        other = {**setupdisc.entry("other-host", "pve", 160, "local:iso/pvc-setup-160-aaaaaa.iso", "ide3", True)}
+        prefs = {"setup_discs": [setupdisc.entry("demo-pve", "pve", 160, volid, "ide3", True), other]}
+        view = self.loaded_view(prefs=prefs)
+        self.assertTrue(wait_until(lambda: not view.discs_inflight))
+        self.assertIn(volid, self.cluster().isos)  # stopped: kept
+        self.cluster().guests[160]["status"] = "running"
+        view.discs_at = 0.0
+        view.refresh()
+        self.assertTrue(wait_until(lambda: view.discs_at and not view.discs_inflight))
+        self.assertIn(volid, self.cluster().isos)  # running, the agent silent: kept
+        self.cluster().guests[160]["agent_down"] = False  # the guest tools are in: Windows is ready
+        view.discs_at = 0.0
+        view.refresh()
+        self.assertTrue(wait_until(lambda: volid not in self.cluster().isos))
+        self.assertTrue(wait_until(lambda: prefs["setup_discs"] == [other]))  # another host's disc is not this page's
+        self.assertTrue(self.saved_prefs)
+        self.assertTrue(any("setup finished" in n for n in self.notes))
+        self.assertEqual(self.guest_cfg(160)["ide3"], "none,media=cdrom")
+
+    def test_enter_after_windows_starts(self):
+        view = self.loaded_view(prefs={})
+        done = types.SimpleNamespace(created=(201, "win"), done_text="Created VM 201 (win)", boot_keys=("pve", 201))
+        with mock.patch.object(setupdisc, "BOOT_KEY_S", 0.05), mock.patch.object(setupdisc, "BOOT_KEY_EVERY_S", 0.01):
+            view._after_new_vm(done)
+            self.assertTrue(wait_until(lambda: any("Enter pressed" in n for n in self.notes)))
+        self.assertIn("Created VM 201 (win)", self.notes)
+        self.assertIn((201, "ret"), self.cluster().keys)
+        view.remember_setup_disc({"node": "pve", "vmid": 201, "volid": "local:iso/x.iso"})
+        self.assertEqual(view.prefs["setup_discs"][0]["host"], "demo-pve")
+
+
 class VmDialogTest(UiCase):
     def client(self):
         return DemoPve(DEMO_HOSTS[0])
@@ -1114,6 +1158,116 @@ class VmDialogTest(UiCase):
         cfg = self.cluster().guests[103]["cfg"]
         self.assertEqual((cfg["bios"], cfg["ide0"]), ("ovmf", "local:iso/virtio-win.iso,media=cdrom"))
         self.assertIn("tpmstate0", cfg)
+
+    def test_windows_installs_itself(self):
+        self.client()
+        self.cluster().isos += ["local:iso/Win11_25H2_Greek_x64.iso", "local:iso/virtio-win.iso"]
+        kept = []
+        dlg = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"], remember=kept.append)
+        self.assertTrue(wait_until(lambda: dlg.isEnabled() and dlg.iso.count()))
+        self.assertFalse(self.visible(dlg, dlg.unattended))  # Linux: nothing of Windows' setup
+        self.assertFalse(self.visible(dlg, dlg.user))
+        dlg.profile.setCurrentIndex(dlg.profile.findData("win11"))
+        dlg.iso.setCurrentIndex(dlg.iso.findData("local:iso/Win11_25H2_Greek_x64.iso"))
+        self.assertTrue(all(self.visible(dlg, f) for f in (dlg.unattended, dlg.user, dlg.rdp)))
+        self.assertFalse(self.visible(dlg, dlg.ssh_key))  # (a Linux matter)
+        self.assertEqual((dlg.edition.currentText(), dlg.language.currentText()), ("Windows 11 Pro", "el-GR"))
+        self.assertEqual(dlg.virtio.currentData(), "local:iso/virtio-win.iso")
+        self.assertIn("deletes the answer disc", dlg.hint.text())
+        self.assertFalse([dlg.virtio.itemData(i) for i in range(dlg.virtio.count())
+                          if "pvc-setup" in (dlg.virtio.itemData(i) or "")])
+        dlg.name.setText("win-desk")
+        dlg.rdp.setChecked(True)
+        dlg.create()
+        self.assertIn("Remote Desktop needs a password", self.errors[-1][1])
+        dlg.password.setText("Pw-1")
+        dlg.password2.setText("Pw-2")
+        dlg.create()
+        self.assertIn("not the same", self.errors[-1][1])
+        dlg.edition.setCurrentText("Windows 11 Home")
+        dlg.password2.setText("Pw-1")
+        dlg.create()
+        self.assertIn("Home", self.errors[-1][1])
+        dlg.edition.setCurrentText("Windows 11 Pro")
+        dlg.dark.setChecked(True)
+        dlg.create()
+        self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
+        cfg = self.cluster().guests[103]["cfg"]
+        disc = cfg["ide3"].split(",")[0]
+        self.assertEqual((dlg.boot_keys, kept[0]["volid"], kept[0]["drive"], kept[0]["agent"]),
+                         (("pve", 103), disc, "ide3", True))
+        self.assertEqual(self.cluster().guests[103]["status"], "running")
+        xml = test_core_read_iso(self.cluster().files[disc.split("/")[1]])["autounattend.xml"].decode()
+        self.assertIn("fDenyTSConnections", xml)
+        self.assertIn("AppsUseLightTheme", xml)
+        self.assertNotIn("Pw-1<", xml)
+        self.assertIn("Windows installs itself", dlg.done_text)
+        again = self.dialog()  # the answer disc is not offered as an ISO to install from
+        self.assertFalse([again.iso.itemData(i) for i in range(again.iso.count())
+                          if "pvc-setup" in again.iso.itemData(i)])
+        again.close()
+
+    def test_windows_by_hand(self):
+        dlg = self.dialog()
+        dlg.profile.setCurrentIndex(dlg.profile.findData("win10"))
+        dlg.unattended.setChecked(False)
+        self.assertFalse(self.visible(dlg, dlg.user))  # the old way: its console, by hand
+        dlg.name.setText("win10")
+        dlg.create()
+        self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
+        self.assertNotIn("ide3", self.cluster().guests[103]["cfg"])
+        self.assertIsNone(dlg.boot_keys)
+
+    def test_ready_made_ubuntu(self):
+        kept = []
+        dlg = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"], remember=kept.append)
+        self.assertTrue(wait_until(lambda: dlg.isEnabled() and dlg.iso.count()))
+        dlg.from_cloud.setChecked(True)
+        self.assertTrue(all(self.visible(dlg, f) for f in (dlg.release, dlg.user, dlg.ssh_key)))
+        self.assertFalse(any(self.visible(dlg, f) for f in (dlg.iso, dlg.profile, dlg.unattended)))
+        self.assertFalse(dlg.rdp.isEnabled())  # Server: no desktop to show
+        self.assertEqual((dlg.cores.value(), dlg.memory.value(), dlg.disk.value()), (2, 2048, 20))
+        dlg.name.setText("srv")
+        dlg.create()
+        self.assertIn("Get Image", self.errors[-1][1])
+        self.assertTrue(dlg.image_btn.isVisible() or not dlg.isVisible())
+        dlg.get_image()
+        self.assertTrue(wait_until(lambda: dlg.isEnabled() and dlg.image_state.text() == "image on the host"))
+        dlg.create()
+        self.assertIn("password, or an SSH key", self.errors[-1][1])
+        dlg.password.setText("srv-pw")
+        dlg.password2.setText("srv-pw")
+        dlg.create()
+        self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
+        cfg, g = self.cluster().guests[103]["cfg"], self.cluster().guests[103]
+        self.assertEqual((cfg["ciuser"], cfg["ide2"], self.cluster().secrets[103], g["disk_gb"], g["status"]),
+                         ("user", "local-lvm:cloudinit", "srv-pw", 20, "running"))
+        self.assertEqual(kept, [])  # Proxmox's own cloud-init: no disc of the app's
+        desk = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"], remember=kept.append)
+        self.assertTrue(wait_until(lambda: desk.isEnabled() and desk.iso.count()))
+        desk.from_cloud.setChecked(True)
+        desk.cloud_edition.setCurrentIndex(desk.cloud_edition.findData("desktop"))
+        self.assertEqual((desk.memory.value(), desk.disk.value()), (4096, 32))
+        self.assertTrue(desk.rdp.isEnabled())
+        desk.rdp.setChecked(True)
+        desk.name.setText("desk")
+        desk.user.setText("Nikos")
+        desk.password.setText("d-pw")
+        desk.password2.setText("d-pw")
+        desk.create()
+        self.assertIn("Linux user name", self.errors[-1][1])
+        desk.user.setText("nikos")
+        desk.create()
+        self.assertTrue(wait_until(lambda: desk.result() == desk.DialogCode.Accepted))
+        cfg = self.cluster().guests[104]["cfg"]
+        disc = cfg["ide2"].split(",")[0]
+        self.assertEqual((kept[0]["volid"], kept[0]["drive"], self.cluster().guests[104]["disk_gb"]),
+                         (disc, "ide2", 32))
+        self.assertNotIn("ciuser", cfg)
+        data = test_core_read_iso(self.cluster().files[disc.split("/")[1]])["user-data"].decode()
+        self.assertIn('"xrdp"', data)
+        self.assertNotIn("d-pw", data)
+        self.assertEqual(desk.boot_keys, None)  # only Windows waits for a key
 
     def test_download_an_iso(self):
         dlg = self.dialog()

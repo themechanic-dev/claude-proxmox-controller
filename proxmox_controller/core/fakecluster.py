@@ -85,6 +85,8 @@ class FakeCluster:
         self.images: list[str] = []  # disk images to import (content "import"): cloud images
         self.secrets: dict[int, str] = {}  # a new guest's password as Proxmox received it, for the tests
         self.uploaded: dict[str, int] = {}  # file name → bytes received, for the tests
+        self.files: dict[str, bytes] = {}  # a small uploaded file's contents (an answer disc), for the tests
+        self.keys: list[tuple[int, str]] = []  # (vmid, key) pressed with sendkey, for the tests
         self.templates = ["local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst",
                           "local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst"]
         self.appliances = [
@@ -328,7 +330,7 @@ class FakeCluster:
                         "cpu": random.uniform(0.005, 0.08) if on else 0, "maxcpu": g["cores"],
                         "mem": int(g["memory"] * (1 << 20) * random.uniform(0.2, 0.6)) if on else 0,
                         "maxmem": g["memory"] << 20, "disk": int(g["disk_gb"] * (1 << 30) * 0.35),
-                        "maxdisk": g["disk_gb"] << 30, "uptime": 7200 if on else 0,
+                        "maxdisk": g["disk_gb"] << 30, "uptime": g.get("uptime", 7200) if on else 0,
                         **({"tags": g["tags"]} if g.get("tags") else {})})
         return out
 
@@ -577,6 +579,8 @@ class FakeCluster:
         if volid not in self.isos:
             self.isos.append(volid)
         self.uploaded[name] = int(p.get("size", 0))
+        if isinstance(p.get("data"), bytes):
+            self.files[name] = p["data"]
         return self._task("imgcopy", "")
 
     def create_vm(self, p, node):
@@ -588,9 +592,9 @@ class FakeCluster:
         name = p.get("name", "")
         if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?", name):
             raise ValueError("name: invalid format - value does not look like a valid DNS name")
-        for key in ("ide0", "ide2"):
-            value = p.get(key, "").split(",")[0]
-            if key in p and value not in self.isos and value != "none" and not value.endswith(":cloudinit"):
+        for key in (k for k in p if re.fullmatch(r"ide\d|sata\d+", k) and "media=cdrom" in p[k] or k == "ide2"):
+            value = p[key].split(",")[0]
+            if value not in self.isos and value != "none" and not value.endswith(":cloudinit"):
                 raise ValueError(f"{key}: volume '{value}' does not exist")
         disk = next((k for k in ("scsi0", "sata0", "virtio0") if k in p), None)
         m = re.match(r"([^:,]+):(\d+)", p.get(disk, "")) if disk else None
@@ -646,7 +650,8 @@ class FakeCluster:
     def qemu_status(self, p, node, vmid):
         g = self._guest("qemu", vmid)
         on = g["status"] == "running"
-        out = {"vmid": int(vmid), "status": g["status"], "name": g["name"], "qmpstatus": g["status"]}
+        out = {"vmid": int(vmid), "status": g["status"], "name": g["name"], "qmpstatus": g["status"],
+               "uptime": g.get("uptime", 7200) if on else 0}
         vga = str(g.get("cfg", g.get("extra", {})).get("vga", "")).split(",")[0]
         if on and (g.get("spice") or vga.startswith("qxl")):
             out["spice"] = 1
@@ -765,6 +770,22 @@ class FakeCluster:
         if b is None:
             raise ValueError(f"volume '{volid}' does not exist")
         return b
+
+    def delete_content(self, p, node, storage, volid):
+        if volid.startswith(f"{storage}:iso/"):  # an ISO image (Datastore.Allocate, checked before)
+            if volid not in self.isos:
+                raise ValueError(f"volume '{volid}' does not exist")
+            self.isos.remove(volid)
+            self.files.pop(volid.split("/", 1)[1], None)
+            return self._task("imgdel", "")
+        return self.delete_backup(p, node, storage, volid)
+
+    def send_key(self, p, node, vmid):
+        g = self._guest("qemu", vmid)
+        if g["status"] != "running":
+            raise RuntimeError(f"VM {vmid} not running")
+        self.keys.append((int(vmid), p.get("key", "")))
+        return None
 
     def delete_backup(self, p, node, storage, volid):
         b = self.backup_content(p, node, storage, volid)
@@ -1077,7 +1098,7 @@ ROUTES = [
     (("POST", rf"/nodes/{_N}/(lxc|qemu)/(\d+)/vncproxy"), FakeCluster.vncproxy),
     (("GET", rf"/nodes/{_N}/hardware/usb"), FakeCluster.hardware_usb),
     (("POST", rf"/nodes/{_N}/vzdump"), FakeCluster.vzdump),
-    (("DELETE", rf"/nodes/{_N}/storage/{_N}/content/(.+)"), FakeCluster.delete_backup),
+    (("DELETE", rf"/nodes/{_N}/storage/{_N}/content/(.+)"), FakeCluster.delete_content),
     (("PUT", rf"/nodes/{_N}/storage/{_N}/content/(.+)"), FakeCluster.update_backup),
     (("GET", rf"/nodes/{_N}/tasks/{_N}/log"), FakeCluster.task_log),
     (("GET", rf"/nodes/{_N}/tasks"), FakeCluster.list_tasks),
@@ -1093,6 +1114,7 @@ ROUTES = [
     (("GET", rf"/nodes/{_N}/qemu/(\d+)/status/current"), FakeCluster.qemu_status),
     (("POST", rf"/nodes/{_N}/qemu/(\d+)/spiceproxy"), FakeCluster.spiceproxy),
     (("POST", rf"/nodes/{_N}/qemu/(\d+)/monitor"), FakeCluster.monitor),
+    (("PUT", rf"/nodes/{_N}/qemu/(\d+)/sendkey"), FakeCluster.send_key),
     (("POST", rf"/nodes/{_N}/qemu/(\d+)/clone"), FakeCluster.clone),
     (("GET", rf"/nodes/{_N}/tasks/{_N}/status"), FakeCluster.task_status),
     (("POST", rf"/nodes/{_N}/qemu/(\d+)/agent/exec"), FakeCluster.agent_exec),
@@ -1145,6 +1167,7 @@ REQUIRES = [
     (("POST", r"/nodes/[^/]+/storage/[^/]+/upload"), [("Datastore.AllocateTemplate",)]),
     (("POST", _G + r"/vncproxy"), [("VM.Console",)]),
     (("POST", r"/nodes/[^/]+/qemu/\d+/spiceproxy"), [("VM.Console",)]),
+    (("PUT", r"/nodes/[^/]+/qemu/\d+/sendkey"), [("VM.Console",)]),
     (("POST", r"/nodes/[^/]+/qemu/\d+/monitor"), [("Sys.Audit",), ("Sys.Modify",)]),  # (Proxmox 9: 'info' needs no more)
     (("GET", r"/nodes/[^/]+/hardware/usb"), [("Sys.Modify",)]),
     (("POST", r"/nodes/[^/]+/vzdump"), [("VM.Backup", "Datastore.AllocateSpace")]),
