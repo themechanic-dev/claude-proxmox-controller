@@ -2719,7 +2719,10 @@ class ScreenVnc(FakeVncServer):
         self._flush()
 
     def _full_screen(self):
-        self._send(struct.pack(">BxH", 0, 1) + struct.pack(">HHHHi", 0, 0, self.width, self.height, 0) + self.image)
+        rects = [struct.pack(">HHHHi", 0, 0, self.width, self.height, 0) + self.image]
+        if self.offer_ext_keys and self.client_ext_keys:  # as QEMU: scan codes welcome
+            rects.append(struct.pack(">HHHHi", 0, 0, 0, 0, -258))
+        self._send(struct.pack(">BxH", 0, len(rects)) + b"".join(rects))
 
     def _typed(self, down, keysym):
         if down and self.on_key is not None:
@@ -3047,7 +3050,8 @@ class SetupDiscTest(unittest.TestCase):
         self.assertTrue(screen.answer_prompt(open_console, setupdisc.boot_prompt_on, timeout=10, settle=1,
                                              first_after=0.1))
         downs = [k for k in servers[0].keys if k[1]]
-        self.assertTrue(downs and all(k[2] == 0xFF0D for k in downs))  # Enter, and nothing else
+        self.assertTrue(downs and all(k[2] == 0xFF0D for k in downs))  # Enter, and nothing else …
+        self.assertEqual(downs[0], ("qnum", True, 0xFF0D, 0x1C))  # … with its scan code, as the built-in console
         # missed: through the Boot Manager — Enter (the menu), Down (the DVD), Enter; then the question again, answered
         too_late, menu = screen_of("boot-too-late.png"), screen_of("boot-menu.png")
         servers.clear()

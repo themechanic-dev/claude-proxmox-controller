@@ -11,10 +11,16 @@ import time
 import zlib
 from typing import Callable
 
-from .rfb import RfbClient, RfbError
+from .rfb import RfbClient, RfbError, qnum_from_evdev
 
 MAX_WIDTH = 1280  # wider screens are halved (or more): enough to read, and lighter for Claude to look at
 KEY_GAP_S = 0.012  # between keys, so a busy guest misses none
+KEY_HOLD_S = 0.08  # a key held as a hand holds it: answer_prompt's keys (Windows' boot question took no shorter one)
+# Linux input codes of the keys answer_prompt may press, for their keyboard scan codes (QEMU's extended key event):
+# sent as the built-in console sends a key typed by the user — which Windows' boot question took, when a key sent by
+# its keysym alone, with no hold, was ignored there (the sixth live test, 24/10)
+EVDEV = {"enter": 28, "return": 28, "escape": 1, "esc": 1, "tab": 15, "space": 57, "backspace": 14,
+         "up": 103, "down": 108, "left": 105, "right": 106}
 
 KEYS = {"enter": 0xFF0D, "return": 0xFF0D, "tab": 0xFF09, "escape": 0xFF1B, "esc": 0xFF1B, "backspace": 0xFF08,
         "delete": 0xFFFF, "del": 0xFFFF, "insert": 0xFF63, "home": 0xFF50, "end": 0xFF57, "pageup": 0xFF55,
@@ -187,8 +193,14 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
     True once answered: after keys (or a recovery), neither the question nor the `missed` screen for `settle` seconds.
     False if it never came within `timeout`. A console that drops (the guest restarting) or stays silent for `quiet`
     seconds is opened again. `log(line)` hears what was seen, for the app's log file."""
-    combos = [parse_combo(k) for k in keys]
-    steps = [(parse_combo(k), wait) for k, wait in recovery]  # (every name checked before anything is pressed)
+    def scancoded(name: str) -> list[tuple[int, int]]:
+        syms = parse_combo(name)
+        if len(syms) == 1 and name.lower() in EVDEV:
+            return [(syms[0], qnum_from_evdev(EVDEV[name.lower()]))]
+        return [(sym, 0) for sym in syms]
+
+    combos = [scancoded(k) for k in keys]
+    steps = [(scancoded(k), wait) for k, wait in recovery]  # (every name checked before anything is pressed)
     end = time.monotonic() + timeout
     answered, recoveries, recovered_at = False, 0, 0.0
     shown_at = pressed_at = quiet_since = 0.0  # when the question showed, the keys went, the screen went quiet
@@ -196,11 +208,12 @@ def answer_prompt(open_console: Callable[[], tuple], is_prompt: Callable[[int, i
     last_said = 0.0
 
     def press(client, chosen):
-        for syms in chosen:
-            for sym in syms:
-                client.key(True, sym)
-            for sym in reversed(syms):
-                client.key(False, sym)
+        for keys_ in chosen:
+            for sym, qnum in keys_:
+                client.key(True, sym, qnum)
+            time.sleep(KEY_HOLD_S)
+            for sym, qnum in reversed(keys_):
+                client.key(False, sym, qnum)
             time.sleep(KEY_GAP_S)
 
     while time.monotonic() < end:
