@@ -10,10 +10,15 @@ from __future__ import annotations
 import re
 from urllib.parse import quote
 
+from .vmspec import DEFAULT_CPU
+
 CLOUD_IMAGES = {"24.04": 626, "26.04": 865}  # release → the image's size in MB
 CLOUD_URL = "https://cloud-images.ubuntu.com/releases/{v}/release/ubuntu-{v}-server-cloudimg-amd64.img"
 USERNAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-SIZES = {"server": {"cores": 2, "memory": 2048, "disk": 20}, "desktop": {"cores": 2, "memory": 4096, "disk": 32}}
+# The desktop as the Windows VMs (the user's choice, 24/10): 2 cores and 4 GB without the host's CPU type ran at
+# 100 % with stuttering sound over Remote Desktop, and Firefox left 0.7 GB free
+SIZES = {"server": {"cores": 2, "memory": 2048, "disk": 20, "host_cpu": False},
+         "desktop": {"cores": 4, "memory": 8192, "disk": 32, "host_cpu": True}}
 
 
 def image_name(release: str) -> str:
@@ -31,10 +36,12 @@ def release_of(volid: str) -> str:
 
 
 def vm_params(*, vmid: int, name: str, image: str, storage: str, bridge: str, cores: int, memory: int, user: str,
-              ssh_key: str = "", desktop: bool = False, onboot: bool = False, seed: str = "") -> dict:
+              ssh_key: str = "", desktop: bool = False, onboot: bool = False, seed: str = "",
+              host_cpu: bool = False) -> dict:
     """The Proxmox API parameters. `seed`: the volid of the app's own cloud-init disc (the desktop), in place of
     Proxmox's cloud-init drive. The disk is the image's own size (~3.5 GB) until it is grown after the copy."""
-    p = {"vmid": vmid, "name": name, "ostype": "l26", "cores": cores, "memory": memory,
+    p = {"vmid": vmid, "name": name, "ostype": "l26", "cores": cores, "cpu": "host" if host_cpu else DEFAULT_CPU,
+         "memory": memory,
          "scsihw": "virtio-scsi-single", "scsi0": f"{storage}:0,import-from={image},discard=on,iothread=1",
          "boot": "order=scsi0", "net0": f"virtio,bridge={bridge},firewall=1", "agent": "1",
          "vga": "qxl" if desktop else "std", "onboot": bool(onboot)}

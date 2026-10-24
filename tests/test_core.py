@@ -1300,10 +1300,12 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertIn(f"import-from={image}", cfg["scsi0"])
         self.assertEqual((self.cluster.guests[vmid]["disk_gb"], self.status(vmid)), (20, "running"))
         self.assertNotIn("tablet", cfg)  # the server edition: the default display, which keeps Proxmox's tablet
+        self.assertEqual(cfg["cpu"], "x86-64-v2-AES")  # not the API's kvm64
         desk = self.run_tool("create_cloud_vm", secret="x", host="demo-pve", name="desk", image=image,
                              edition="desktop", start=False, reason="r")
         dcfg = self.pve.guest_config("pve", "qemu", desk["vmid"])
-        self.assertEqual((dcfg["vga"], dcfg["memory"], self.status(desk["vmid"])), ("qxl", 4096, "stopped"))
+        self.assertEqual((dcfg["vga"], dcfg["memory"], dcfg["cores"], dcfg["cpu"], self.status(desk["vmid"])),
+                         ("qxl", 8192, 4, "host", "stopped"))
         self.assertEqual(str(dcfg["tablet"]), "1")  # SPICE would leave it out
         self.assertIn("installs Ubuntu Desktop", " ".join(desk["next_steps"]))  # by itself, from the setup disc
         self.assertNotIn("ciuser", dcfg)  # the app's own cloud-init disc instead of Proxmox's drive
@@ -2983,8 +2985,11 @@ class CloudSeedTest(unittest.TestCase):
         for pkg in ("qemu-guest-agent", "ubuntu-desktop-minimal", "gnome-remote-desktop", "openssl"):
             self.assertIn(pkg, cfg["packages"])
         self.assertNotIn("xrdp", cfg["packages"])
+        # the agent waits for the restart (its package starts it minutes before the desktop is in), once per VM
+        self.assertEqual(cfg["bootcmd"][0], ["cloud-init-per", "instance", "pvc-agent-later", "systemctl", "mask",
+                                             "--runtime", "qemu-guest-agent.service"])
         # the password: from the disc into memory on the first boot only
-        fetch = cfg["bootcmd"][0]
+        fetch = cfg["bootcmd"][1]
         for part in ("mount -o ro -L cidata", "/rdp-password /run/pvc-rdp-password", "[ ! -e " + cloudseed.RDP_DONE):
             self.assertIn(part, fetch)
         self.assertTrue(fetch.endswith("; true"))  # no disc any more: not an error
@@ -2999,8 +3004,11 @@ class CloudSeedTest(unittest.TestCase):
                                         grd + ["enable"], ["systemctl", "enable", "gnome-remote-desktop.service"])]
         self.assertEqual(order, sorted(order))  # measured: the credentials before enable, which starts the service
         self.assertIn(["sh", "-c", f"mkdir -p /var/lib/proxmox-controller && touch {cloudseed.RDP_DONE}"], run)
-        self.assertIn("gnome-initial-setup-done", json.dumps(run))  # no "Welcome" wizard asking for the password
-        self.assertEqual(run[-1], ["systemctl", "start", "qemu-guest-agent"])  # last: the app reads it as set up
+        # no "Welcome" asking for the password: neither the new user's nor (26.04) the upgraded user's
+        welcome = next(c[-1] for c in run if "gnome-initial-setup-done" in c[-1])
+        self.assertIn("/home/nikos/.config/gnome-initial-setup/upgrade-$VERSION_ID-done", welcome)
+        self.assertTrue(welcome.startswith(". /etc/os-release && "))
+        self.assertNotIn(["systemctl", "start", "qemu-guest-agent"], run)  # (masked until the restart)
         self.assertEqual(cfg["power_state"]["mode"], "reboot")
         self.assertTrue(cfg["package_upgrade"])  # the image on the host ages: the VM starts up to date
         # the text login says the work goes on behind it, until the end
@@ -3008,7 +3016,7 @@ class CloudSeedTest(unittest.TestCase):
         self.assertIn("in the background", cfg["write_files"][0]["content"])
         self.assertNotIn("\\", cfg["write_files"][0]["content"])  # (agetty reads backslashes as escapes)
         self.assertTrue(cloudseed.SETUP_ISSUE.startswith("/etc/issue.d/") and cloudseed.SETUP_ISSUE.endswith(".issue"))
-        self.assertEqual(run[-2], ["rm", "-f", cloudseed.SETUP_ISSUE])
+        self.assertEqual(run[-1], ["rm", "-f", cloudseed.SETUP_ISSUE])
 
     def test_dark_theme(self):
         cfg = self.config(dark=True)
@@ -3026,7 +3034,10 @@ class CloudSeedTest(unittest.TestCase):
         self.assertNotIn("Pw 1234".encode(), files["user-data"])
         self.assertEqual(json.loads(files["meta-data"])["local-hostname"], "desk")
         label, back = read_iso(isofs.make_iso(files, cloudseed.SEED_LABEL), joliet=True)
-        self.assertEqual((label, sorted(back)), ("cidata", ["meta-data", "rdp-password", "user-data"]))
+        self.assertEqual((label, sorted(back)), ("cidata", ["meta-data", "network-config", "rdp-password",
+                                                            "user-data"]))
+        # DHCP with the MAC from the first boot: the address stays when the desktop brings the network up itself
+        self.assertEqual(json.loads(back["network-config"])["ethernets"]["ens18"]["dhcp-identifier"], "mac")
         self.assertNotIn("rdp-password", cloudseed.seed_files(vm_name="d", vmid=1, user="u", password="p",
                                                               ssh_keys=[]))
 
@@ -3041,12 +3052,13 @@ class CloudSeedTest(unittest.TestCase):
     def test_without_remote_desktop(self):
         cfg = self.config()
         self.assertNotIn("gnome-remote-desktop", cfg["packages"])
-        self.assertNotIn("bootcmd", cfg)
+        self.assertEqual(len(cfg["bootcmd"]), 1)  # the agent's mask alone
         self.assertEqual([f["path"] for f in cfg["write_files"]], [cloudseed.SETUP_ISSUE])
-        self.assertEqual(cfg["runcmd"][-1], ["systemctl", "start", "qemu-guest-agent"])
+        self.assertEqual(cfg["runcmd"][-1], ["rm", "-f", cloudseed.SETUP_ISSUE])
         server = self.config(desktop=False)
         self.assertNotIn("power_state", server)
         self.assertNotIn("write_files", server)
+        self.assertNotIn("bootcmd", server)
         self.assertEqual(server["runcmd"], [["systemctl", "start", "qemu-guest-agent"]])
         with self.assertRaises(ValueError):
             cloudseed.user_data(vm_name="d", user="u", password="", ssh_keys=[], remote_desktop=True)

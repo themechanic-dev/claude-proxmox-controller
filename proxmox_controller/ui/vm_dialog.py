@@ -263,6 +263,9 @@ class CreateVmDialog(_Busy, QDialog):
         self.cores = QSpinBox()
         self.cores.setRange(1, 512)
         self.host_cpu = QCheckBox("Host's CPU type (fastest)")
+        self.host_cpu.setToolTip("The VM sees this host's own processor with all its features — the fastest, and what "
+                                 "a desktop needs for smooth video. Unticked: x86-64-v2-AES, which any recent host "
+                                 "runs, for a VM that moves between hosts with different processors.")
         self.memory = QSpinBox()
         self.memory.setRange(64, 4 * 1024 * 1024)
         self.memory.setSingleStep(512)
@@ -461,6 +464,7 @@ class CreateVmDialog(_Busy, QDialog):
 
     def _cloud_edition_changed(self) -> None:
         size = cloudvm.SIZES[self.cloud_edition.currentData()]
+        self.host_cpu.setChecked(size["host_cpu"])
         self.cores.setValue(size["cores"])
         self.memory.setValue(size["memory"])
         self.disk.setValue(size["disk"])
@@ -496,7 +500,7 @@ class CreateVmDialog(_Busy, QDialog):
         if cloud and not desktop:
             self.rdp.setChecked(False)
         self.rdp.setToolTip("" if setup or not cloud or desktop else "Remote Desktop needs the Desktop edition")
-        self.host_cpu.setVisible(iso)
+        self.host_cpu.setVisible(not copy)  # a copy keeps the template's
         form.setRowVisible(self._row_of(self.agent), iso)
         self.hw.set_visible(iso)  # a copy keeps the template's display, sound and USB; a cloud VM gets its own
         self.disk.setVisible(not copy)  # a copy keeps the template's disk size
@@ -830,7 +834,8 @@ class CreateVmDialog(_Busy, QDialog):
                                       storage=self.storage.currentData(),
                                       bridge=self.bridge.currentText().strip() or "vmbr0", cores=self.cores.value(),
                                       memory=self.memory.value(), user=user, ssh_key=key, desktop=desktop,
-                                      onboot=self.onboot.isChecked(), seed="pending" if desktop else ""),
+                                      onboot=self.onboot.isChecked(), seed="pending" if desktop else "",
+                                      host_cpu=self.host_cpu.isChecked()),
                   **self.startup.params()}
         seed_storage = self.iso_storages[0] if self.iso_storages else ""
         self.done_text = (f"Created VM {vmid} ({name}) — " +

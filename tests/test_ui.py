@@ -1086,8 +1086,9 @@ class VmParamsTest(unittest.TestCase):
         self.assertEqual((p["ostype"], p["scsi0"], p["net0"], p["boot"], p["ide2"], p["agent"]),
                          ("l26", "local-lvm:32,iothread=1,discard=on", "virtio,bridge=vmbr0,firewall=1",
                           "order=scsi0;ide2;net0", f"{ISO},media=cdrom", "1"))
-        for key in ("bios", "efidisk0", "tpmstate0", "ide0", "cpu", "sata0"):
+        for key in ("bios", "efidisk0", "tpmstate0", "ide0", "sata0"):
             self.assertNotIn(key, p)
+        self.assertEqual(p["cpu"], "x86-64-v2-AES")  # not the API's kvm64 (no SSE4.2 or AVX)
 
     def test_windows_11_without_and_with_virtio(self):
         p = vm_dialog.vm_params(profile="win11", virtio_iso="", **{**self.base, "host_cpu": True})
@@ -1316,8 +1317,10 @@ class VmDialogTest(UiCase):
         desk = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"], remember=kept.append)
         self.assertTrue(wait_until(lambda: desk.isEnabled() and desk.iso.count()))
         desk.from_cloud.setChecked(True)
+        self.assertFalse(desk.host_cpu.isChecked() or desk.host_cpu.isHidden())  # a server: the portable type
         desk.cloud_edition.setCurrentIndex(desk.cloud_edition.findData("desktop"))
-        self.assertEqual((desk.memory.value(), desk.disk.value()), (4096, 32))
+        self.assertEqual((desk.cores.value(), desk.memory.value(), desk.disk.value(), desk.host_cpu.isChecked()),
+                         (4, 8192, 32, True))  # as the Windows VMs: smooth video and sound over Remote Desktop
         self.assertTrue(desk.rdp.isEnabled())
         self.assertFalse(desk.dark.isHidden())  # the dark theme: Ubuntu Desktop too
         desk.rdp.setChecked(True)
@@ -1336,6 +1339,8 @@ class VmDialogTest(UiCase):
         self.assertEqual((kept[0]["volid"], kept[0]["drive"], self.cluster().guests[104]["disk_gb"]),
                          (disc, "ide2", 32))
         self.assertNotIn("ciuser", cfg)
+        self.assertEqual((cfg["cpu"], str(cfg["cores"])), ("host", "4"))
+        self.assertEqual(self.cluster().guests[103]["cfg"]["cpu"], "x86-64-v2-AES")
         files = test_core_read_iso(self.cluster().files[disc.split("/")[1]])
         data = files["user-data"].decode()
         self.assertIn('"gnome-remote-desktop"', data)

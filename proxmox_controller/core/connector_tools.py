@@ -770,7 +770,8 @@ def _cloud_vm_params(ctx: Context, a: dict) -> tuple[str, dict, int]:
                           storage=storage, bridge=a.get("bridge", "vmbr0"), cores=a.get("cores", size["cores"]),
                           memory=a.get("memory_mib", size["memory"]), user=user,
                           ssh_key=a.get("ssh_public_key", ""), desktop=desktop, onboot=bool(a.get("start_at_boot")),
-                          seed="pending" if desktop else "")  # (the desktop's disc is made when it is created)
+                          seed="pending" if desktop else "",  # (the desktop's disc is made when it is created)
+                          host_cpu=bool(a.get("host_cpu", size["host_cpu"])))
     return node, p, disk
 
 
@@ -786,7 +787,8 @@ def _cloud_vm_words(ctx: Context, a: dict):
     node, p, disk = _cloud_vm_params(ctx, a)
     desktop = a.get("edition", "server") == "desktop"
     user = a.get("username", "user")
-    lines = [f"From {a['image']}: {p['cores']} cores, {p['memory']} MiB, disk {disk} GB, network by DHCP",
+    lines = [f"From {a['image']}: {p['cores']} cores (CPU type {p['cpu']}), {p['memory']} MiB, disk {disk} GB, "
+             "network by DHCP",
              f"User '{user}', with the password you type below (Claude does not see it)" +
              (" and an SSH key" if a.get("ssh_public_key") else "")]
     if desktop:
@@ -1626,6 +1628,8 @@ def _tools() -> list[Tool]:
               "edition": {"type": "string", "enum": ["server", "desktop"]},
               "remote_desktop": {"type": "boolean", "description": "Desktop only."},
               "dark_theme": {"type": "boolean", "description": "Desktop only."},
+              "host_cpu": {"type": "boolean", "description": "The host's own CPU type (else x86-64-v2-AES). "
+                           "Default: true for the desktop, false for a server."},
               "username": {"type": "string", "description": "Default: user."}, "vmid": {"type": "integer", "minimum": 100},
               "cores": {"type": "integer", "minimum": 1, "maximum": 512}, "memory_mib": {"type": "integer", "minimum": 512},
               "disk_gb": {"type": "integer", "minimum": 4}, "storage": {"type": "string"}, "bridge": {"type": "string"},

@@ -43,6 +43,10 @@ DARK_DEFAULTS = "[org/gnome/desktop/interface]\ncolor-scheme='prefer-dark'\ngtk-
 # before the login starts (cloud-init's network stage comes before systemd-user-sessions) and removed at the end.
 # No backslashes: agetty reads them as escapes.
 SETUP_ISSUE = "/etc/issue.d/90-proxmox-controller.issue"
+# The DHCP client ID is the MAC from the first boot, as Windows sends it: cloud-init's network asks with another one,
+# and the desktop, once in, brings the network up with the MAC — the router then gave a new address (measured 24/10:
+# .122 on the first boot, .198 after it). net0 is always ens18 on Proxmox (its PCI slot 18).
+NETWORK_CONFIG = {"version": 2, "ethernets": {"ens18": {"dhcp4": True, "dhcp6": True, "dhcp-identifier": "mac"}}}
 SETUP_MESSAGE = ("Proxmox Controller is setting up this VM in the background: installing Ubuntu Desktop (10-20 min).\n"
                  "It restarts into the desktop by itself.\n"
                  "Please do not sign in here or turn it off.\n\n")
@@ -139,8 +143,15 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], de
     keys = [k.strip() for k in ssh_keys if k.strip()]
     if keys:
         cfg["ssh_authorized_keys"] = keys
+    if desktop:
+        # The guest agent waits for the restart: its package starts it at once, minutes before the desktop is in (the
+        # app reads an answering agent as "set up", and the address it shows changes with the restart). A runtime mask
+        # ends with that restart by itself; once per VM, as the disc may still be there at the next boot.
+        cfg["bootcmd"] = [["cloud-init-per", "instance", "pvc-agent-later", "systemctl", "mask", "--runtime",
+                           "qemu-guest-agent.service"]]
     if remote_desktop:
-        cfg["bootcmd"], rdp = _rdp_commands(host, user)
+        fetch, rdp = _rdp_commands(host, user)
+        cfg["bootcmd"] = cfg.get("bootcmd", []) + fetch
         cfg["runcmd"] += rdp
     files = []
     if desktop:
@@ -153,15 +164,21 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], de
     if files:
         cfg["write_files"] = files
     if desktop:
-        # no "Welcome" wizard on the first sign-in: it is all set already, and it kept asking for the password
+        # No "Welcome" on the first sign-in, it is all set already: gnome-initial-setup-done skips the one for a new
+        # user, and on Ubuntu 26.04 it then shows the one for an upgraded user unless upgrade-<release>-done is there
+        # too — with a privacy page that asked for the password every minute (measured 24/10; as a normal install
+        # leaves them)
         home = f"/home/{user}"
-        cfg["runcmd"].append(["runuser", "-u", user, "--", "sh", "-c", f"mkdir -p {home}/.config && "
-                              f"printf yes > {home}/.config/gnome-initial-setup-done"])
+        cfg["runcmd"].append(["runuser", "-u", user, "--", "sh", "-c",
+                              f". /etc/os-release && mkdir -p {home}/.config/gnome-initial-setup && "
+                              f"printf yes > {home}/.config/gnome-initial-setup-done && "
+                              f"touch {home}/.config/gnome-initial-setup/upgrade-$VERSION_ID-done"])
         cfg["runcmd"].append(["rm", "-f", SETUP_ISSUE])
         # the login screen starts with the next boot, once everything is in
         cfg["power_state"] = {"mode": "reboot", "condition": True, "timeout": 120,
                               "message": "Proxmox Controller: the desktop is installed, restarting"}
-    cfg["runcmd"].append(["systemctl", "start", "qemu-guest-agent"])  # last: the app reads it as "set up"
+    else:
+        cfg["runcmd"].append(["systemctl", "start", "qemu-guest-agent"])  # (a desktop has it after its restart)
     return "#cloud-config\n" + json.dumps(cfg, indent=2) + "\n"
 
 
@@ -177,7 +194,8 @@ def seed_files(*, vm_name: str, vmid: int, user: str, password: str, ssh_keys: l
     files = {"user-data": user_data(vm_name=vm_name, user=user, password=password, ssh_keys=ssh_keys,
                                     remote_desktop=remote_desktop, dark=dark, time_zone=time_zone,
                                     keyboard=keyboard).encode(),
-             "meta-data": meta_data(vm_name, vmid).encode()}
+             "meta-data": meta_data(vm_name, vmid).encode(),
+             "network-config": (json.dumps(NETWORK_CONFIG, indent=2) + "\n").encode()}
     if remote_desktop:
         files[RDP_PASSWORD_FILE] = (password + "\n").encode()
     return files

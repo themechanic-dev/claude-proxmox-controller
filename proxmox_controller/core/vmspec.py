@@ -17,6 +17,10 @@ PROFILES = {
     "other": {"label": "Other", "ostype": "other", "cores": 1, "memory": 1024, "disk": 16},
 }
 WINDOWS = ("win11", "win10")
+# Without a CPU type the API gives QEMU's oldest, kvm64 (Proxmox's own web UI picks this one instead): no SSE4.2 or AVX,
+# which Windows 11 24H2 needs to start at all, and without which video and a desktop drawn without a GPU crawl
+# (measured 24/10 on a ready-made Ubuntu Desktop: 100 % CPU, broken sound). "host" passes all of the host's CPU.
+DEFAULT_CPU = "x86-64-v2-AES"
 
 
 def vm_params(*, vmid: int, name: str, profile: str, iso: str, virtio_iso: str, cores: int, host_cpu: bool,
@@ -34,8 +38,7 @@ def vm_params(*, vmid: int, name: str, profile: str, iso: str, virtio_iso: str, 
          "ide2": f"{iso},media=cdrom",
          "net0": f"{'virtio' if fast else 'e1000e'},bridge={bridge},firewall=1",
          "boot": f"order={disk};ide2;net0", "onboot": onboot, "start": start}
-    if host_cpu:
-        p["cpu"] = "host"
+    p["cpu"] = "host" if host_cpu else DEFAULT_CPU
     if agent:
         p["agent"] = "1"
     if profile == "win11":  # Windows 11 insists on UEFI with Secure Boot and a TPM 2.0
