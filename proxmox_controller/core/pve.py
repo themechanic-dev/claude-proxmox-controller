@@ -311,6 +311,14 @@ class Pve:
             raise ValueError(command)
         self.post(f"/nodes/{q(node)}/status", command=command)
 
+    def networks(self, node: str) -> list[dict]:
+        """The host's own network interfaces as Proxmox lists them (iface, type, cidr, gateway…)."""
+        return self.get(f"/nodes/{q(node)}/network") or []
+
+    def node_dns(self, node: str) -> dict:
+        """The host's DNS settings: dns1–dns3 and search."""
+        return self.get(f"/nodes/{q(node)}/dns") or {}
+
     def bridges(self, node: str) -> list[str]:
         nets = self.get(f"/nodes/{q(node)}/network", type="any_bridge") or []
         names = sorted(n["iface"] for n in nets if n.get("iface") and n.get("type") in ("bridge", "OVSBridge"))

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
                                QHeaderView, QMenu, QScrollArea, QStackedWidget, QStyle, QStyledItemDelegate,
                                QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
 
-from ..core import netinfo, setupdisc, spice, startup, tasks, wol  # noqa: F401 (netinfo: the tests replace its ARP table)
+from ..core import autoinstall, netinfo, setupdisc, spice, startup, tasks, wol  # noqa: F401 (netinfo: the tests replace its ARP table)
 from ..core.details import read_details
 from ..core.pve import Host, Pve, PveError, storage_order
 from . import theme
@@ -1069,7 +1069,9 @@ class HostView(QWidget):
         if not self.nodes:
             return
         from .vm_dialog import CreateVmDialog
-        dlg = CreateVmDialog(self, self.client, self.runner, self.nodes, remember=self.remember_setup_disc)
+        known = frozenset(ip for d in self.details.values() for ip in (d or {}).get("ips", []))
+        dlg = CreateVmDialog(self, self.client, self.runner, self.nodes, remember=self.remember_setup_disc,
+                             known_ips=known)
         dlg.finished.connect(lambda *_: self._after_new_vm(dlg))
         dlg.open()
 
@@ -1077,7 +1079,17 @@ class HostView(QWidget):
         if dlg.created:
             self.notify(dlg.done_text)
             self.details_at = 0.0
-        if dlg.boot_keys:  # Windows' installer disc asks for a key before it boots: answered here, not in the window
+        if dlg.boot_keys and dlg.boot_kind == "ubuntu":  # the installer asks "Continue with autoinstall?"
+            node, vmid = dlg.boot_keys
+            pve = self.client()
+            self.notify(f"VM {vmid}: watching its screen for the installer's “Continue with autoinstall?”…")
+            self.runner.run(lambda: autoinstall.answer_question(pve, node, vmid),
+                            lambda answered, err: self.notify(
+                                f"VM {vmid}: yes typed at the installer's question — Ubuntu installs itself now"
+                                if answered and err is None else
+                                f"VM {vmid}: the installer's question was not seen" + (f" ({err})" if err else "") +
+                                " — if its Console shows “Continue with autoinstall? (yes|no)”, type yes there"))
+        elif dlg.boot_keys:  # Windows' installer disc asks for a key before it boots: answered here, not in the window
             node, vmid = dlg.boot_keys
             pve = self.client()
             self.notify(f"VM {vmid}: watching its screen for “Press any key to boot from CD or DVD”…")

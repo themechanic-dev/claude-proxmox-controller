@@ -13,7 +13,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QLineEdit, QProgressDialog, QRadioButton, QSpinBox, QVBoxLayout, QWidget)
 
-from ..core import cloudseed, cloudvm, setupdisc, timezones, winsetup
+from ..core import autoinstall, cloudseed, cloudvm, setupdisc, staticnet, timezones, winsetup
 from ..core.pve import Pve, PveError, q, upload_name
 from ..core.vmspec import (PROFILES, VIRTIO_AS_SYSTEM, VMNAME, WINDOWS, is_virtio_disc,  # noqa: F401 (tests too)
                            iso_name_from_url, looks_like_windows, vm_params)
@@ -132,13 +132,18 @@ class DownloadIsoDialog(_Busy, QDialog):
 
 class CreateVmDialog(_Busy, QDialog):
     def __init__(self, parent: QWidget, client: Callable[[], Pve], runner: Runner, nodes: list[str],
-                 remember: Callable[[dict], None] | None = None):
+                 remember: Callable[[dict], None] | None = None, known_ips: set[str] | frozenset = frozenset()):
         super().__init__(parent)
         self.client, self.runner, self.nodes = client, runner, nodes
         self.remember = remember or (lambda disc: None)  # keeps a setup disc, for the app to take away later
+        self.known_ips = known_ips  # the guests' addresses the app knows: not offered as a static IP
         self.created: tuple[int, str] | None = None
         self.done_text = ""  # what the main window says once it is made
-        self.boot_keys: tuple[str, int] | None = None  # (node, vmid): Windows was started and waits for a key
+        # (node, vmid): an installer was started that waits for keys — Windows' boot question or Ubuntu's
+        # "Continue with autoinstall?" (boot_kind "windows" | "ubuntu")
+        self.boot_keys: tuple[str, int] | None = None
+        self.boot_kind = ""
+        self.host_net: dict = {}  # the host's own network (core/staticnet.host_network)
         self.iso_storages: list[str] = []
         self.import_storages: list[str] = []
         self.cloud_images: list[dict] = []
@@ -194,11 +199,11 @@ class CreateVmDialog(_Busy, QDialog):
         virtio_row.setSpacing(8)
         virtio_row.addWidget(self.virtio, 1)
         virtio_row.addWidget(self.virtio_btn)
-        # Windows that installs itself (an answer file on a disc of its own)
+        # Windows, or an Ubuntu Server ISO, that installs itself (answers on a disc of its own)
         self.unattended = QCheckBox("Installs itself")
-        self.unattended.setToolTip("An answer file on a small disc of its own: no keys to press in the installer and "
-                                   "no setup questions. The app deletes that disc (it holds the password) once "
-                                   "Windows is ready.")
+        self.unattended.setToolTip("Answers on a small disc of its own: no setup questions — the app presses the one "
+                                   "key the installer still asks for. The app deletes that disc (it holds the "
+                                   "password) once the system is ready.")
         self.unattended.setChecked(True)
         self.edition = QComboBox()
         self.edition.setEditable(True)
@@ -257,6 +262,20 @@ class CreateVmDialog(_Busy, QDialog):
         options_row.addWidget(self.rdp)
         options_row.addWidget(self.dark)
         options_row.addStretch(1)
+        # a fixed address of its own (Ubuntu): only the address — the rest is the host's own network
+        self.static = QCheckBox("Static IP")
+        self.static.setToolTip("A fixed address of its own instead of the network's DHCP. The network's size, the "
+                               "gateway and the DNS servers are the Proxmox host's own (those of the bridge).")
+        self.static_ip = QLineEdit()
+        self.static_ip.setPlaceholderText("192.168.1.50")
+        self.static_ip.setMaximumWidth(150)
+        self.static_note = label("", "dim")
+        static_row = QHBoxLayout()
+        static_row.setSpacing(8)
+        static_row.addWidget(self.static)
+        static_row.addWidget(self.static_ip)
+        static_row.addWidget(self.static_note)
+        static_row.addStretch(1)
         self.template = QComboBox()
         self.full = QCheckBox("Full copy (stands on its own; a linked copy shares the template's disk)")
         self.full.setChecked(True)
@@ -297,7 +316,7 @@ class CreateVmDialog(_Busy, QDialog):
         form.addRow("Operating system", self.profile)
         form.addRow("ISO image", iso_row)
         form.addRow("VirtIO drivers", virtio_row)
-        form.addRow("Windows setup", win_row)
+        form.addRow("Setup", win_row)
         form.addRow("Ubuntu", cloud_row)
         form.addRow("User", user_row)
         form.addRow("SSH key", self.ssh_key)
@@ -310,6 +329,7 @@ class CreateVmDialog(_Busy, QDialog):
         form.addRow("Memory", self.memory)
         form.addRow("Disk", disk_row)
         form.addRow("Network bridge", self.bridge)
+        form.addRow("", static_row)
         self.hw = HardwareFields(form)
         self.hw.set_defaults()
         form.addRow("", self.agent)
@@ -334,6 +354,8 @@ class CreateVmDialog(_Busy, QDialog):
 
         self.profile.currentIndexChanged.connect(lambda *_: self._profile_changed())
         self.iso.currentIndexChanged.connect(lambda *_: self._iso_changed())
+        self.static.toggled.connect(lambda *_: self._static_changed())
+        self.bridge.currentTextChanged.connect(lambda *_: self._static_changed())
         self.virtio.currentIndexChanged.connect(lambda *_: self._mode_changed())  # (the hint says what it lacks)
         self.unattended.toggled.connect(lambda *_: self._mode_changed())
         self.release.currentIndexChanged.connect(lambda *_: self._show_image())
@@ -344,6 +366,7 @@ class CreateVmDialog(_Busy, QDialog):
         self.full.toggled.connect(lambda *_: self._mode_changed())
         self.node.currentTextChanged.connect(lambda *_: self.load())
         self._profile_changed()
+        self._static_changed()
         fit_to_width(self, 600)
         self.load()
 
@@ -362,6 +385,12 @@ class CreateVmDialog(_Busy, QDialog):
             except PveError:
                 return None  # the list says so; creating the VM still works
 
+        def net():
+            try:
+                return staticnet.host_network(pve, node)
+            except PveError:
+                return {}  # no static address then (the note says why)
+
         self.runner.run(lambda: {"id": pve.next_id(),  # (an old VM's setup disc is not one to install from)
                                  "isos": [i for i in pve.isos(node) if not setupdisc.is_setup_disc(i["volid"] or "")],
                                  "iso_storages": [s["storage"] for s in pve.storages(node, content="iso")],
@@ -369,7 +398,7 @@ class CreateVmDialog(_Busy, QDialog):
                                  "images": pve.images(node),
                                  "storage": pve.storages(node, content="images"), "bridges": pve.bridges(node),
                                  "templates": [g for g in pve.guests() if g.get("template") and g["type"] == "qemu"
-                                               and g.get("node") == node], "usb": usb()},
+                                               and g.get("node") == node], "usb": usb(), "net": net()},
                         lambda data, err: self._loaded(data, err, select_iso))
 
     def _loaded(self, data, err, select_iso: str = "") -> None:
@@ -381,6 +410,7 @@ class CreateVmDialog(_Busy, QDialog):
         self.iso_storages = data["iso_storages"]
         self.import_storages = data["import_storages"]
         self.cloud_images = data["images"]
+        self.host_net = data.get("net") or {}
         self._show_image()
         chosen = self.hw.chosen()
         self.hw.set_devices(data["usb"] or [], chosen)
@@ -432,7 +462,7 @@ class CreateVmDialog(_Busy, QDialog):
         if self.profile.currentData() in WINDOWS and not select_iso:
             self._pick_windows_iso()
         self._iso_changed()
-        self._mode_changed()
+        self._static_changed()
         if self.from_template.isChecked():
             self._template_changed()
 
@@ -461,6 +491,27 @@ class CreateVmDialog(_Busy, QDialog):
     def _iso_changed(self) -> None:
         if self.iso.currentData():
             self.language.setCurrentText(winsetup.language_of_iso(self.iso.currentData()))
+        self._mode_changed()  # (an Ubuntu Server ISO can install itself)
+
+    def _static_changed(self) -> None:
+        on = self.static.isChecked()
+        self.static_ip.setVisible(on)
+        self.static_note.setVisible(on)
+        self.static_note.setText(staticnet.describe(self.static_info()))
+        fit_to_width(self, 600)
+
+    def static_info(self) -> dict | None:
+        """What a static address on the chosen bridge takes from the host (core/staticnet.for_bridge)."""
+        return staticnet.for_bridge(self.host_net, self.bridge.currentText().strip() or "vmbr0")
+
+    def static_settings(self) -> dict | None:
+        """The fixed address to write, or None for DHCP (checked already)."""
+        if not (self.static.isChecked() and self.static_offered()):
+            return None
+        return staticnet.settings(self.static_ip.text(), self.static_info())
+
+    def static_offered(self) -> bool:
+        return self.from_cloud.isChecked() or self.linux_setup()
 
     def _cloud_edition_changed(self) -> None:
         size = cloudvm.SIZES[self.cloud_edition.currentData()]
@@ -473,6 +524,14 @@ class CreateVmDialog(_Busy, QDialog):
     def windows_setup(self) -> bool:
         """Windows from an ISO that installs itself."""
         return self.from_iso.isChecked() and self.profile.currentData() in WINDOWS and self.unattended.isChecked()
+
+    def linux_iso(self) -> bool:
+        """An Ubuntu Server ISO for a Linux VM: one that can install itself (core/autoinstall.py)."""
+        return (self.from_iso.isChecked() and self.profile.currentData() == "linux"
+                and autoinstall.is_server_iso(self.iso.currentData() or ""))
+
+    def linux_setup(self) -> bool:
+        return self.linux_iso() and self.unattended.isChecked()
 
     def desktop(self) -> bool:
         return self.from_cloud.isChecked() and self.cloud_edition.currentData() == "desktop"
@@ -487,12 +546,16 @@ class CreateVmDialog(_Busy, QDialog):
         copy = not iso and not cloud
         windows = iso and self.profile.currentData() in WINDOWS
         setup, desktop = self.windows_setup(), self.desktop()
+        lsetup = self.linux_setup()  # an Ubuntu Server ISO that installs itself
         form = self.form
         for field, visible in ((self.template, copy), (self.full, copy), (self.profile, iso), (self.iso, iso),
-                               (self.virtio, windows), (self.unattended, windows), (self.release, cloud),
-                               (self.user, setup or cloud), (self.ssh_key, cloud),
-                               (self.rdp, setup or cloud)):
+                               (self.virtio, windows), (self.unattended, windows or self.linux_iso()),
+                               (self.release, cloud), (self.user, setup or cloud or lsetup),
+                               (self.ssh_key, cloud or lsetup), (self.rdp, setup or cloud),
+                               (self.static, cloud or lsetup)):
             form.setRowVisible(self._row_of(field), visible)
+        self.edition.setVisible(windows)
+        self.language.setVisible(windows)
         self.edition.setEnabled(setup)
         self.language.setEnabled(setup)
         self.dark.setVisible(setup or desktop)
@@ -501,7 +564,7 @@ class CreateVmDialog(_Busy, QDialog):
             self.rdp.setChecked(False)
         self.rdp.setToolTip("" if setup or not cloud or desktop else "Remote Desktop needs the Desktop edition")
         self.host_cpu.setVisible(not copy)  # a copy keeps the template's
-        form.setRowVisible(self._row_of(self.agent), iso)
+        form.setRowVisible(self._row_of(self.agent), iso and not lsetup)  # (that setup installs the agent)
         self.hw.set_visible(iso)  # a copy keeps the template's display, sound and USB; a cloud VM gets its own
         self.disk.setVisible(not copy)  # a copy keeps the template's disk size
         self.disk_label.setText("Copy to" if copy else "on")
@@ -512,6 +575,10 @@ class CreateVmDialog(_Busy, QDialog):
         elif cloud and desktop:
             self.hint.setText("On the first start it installs the desktop and the guest agent by itself (10–20 "
                               "minutes), then restarts into the login screen. The app then deletes its setup disc.")
+        elif lsetup:
+            self.hint.setText("No setup questions: the app types yes at the installer's “Continue with autoinstall?” "
+                              "and deletes the setup disc (it holds the password) once the guest agent answers. The "
+                              "whole disk, the guest agent, OpenSSH and the updates — about 15 minutes.")
         elif cloud:
             self.hint.setText("On the first start it installs the updates and the guest agent by itself (2–5 "
                               "minutes; it restarts once if an update needs it). The app then deletes its setup disc.")
@@ -717,6 +784,19 @@ class CreateVmDialog(_Busy, QDialog):
             lang = self.language.currentText().strip()
             if lang not in winsetup.LANGUAGES and not re.fullmatch(r"[a-z]{2,3}-[A-Z]{2}", lang):
                 return "The language: a code such as en-US or el-GR."
+        if self.linux_setup():
+            if not cloudvm.USERNAME.match(self.user.text()):
+                return "The Linux user name: small letters, digits, '_' and '-', starting with a letter."
+            if not password:
+                return "Give the user a password (sudo asks for it)."
+            if any(ord(c) < 32 for c in password):
+                return "The password cannot hold control characters."
+            if not self.iso_storages:
+                return "No storage on this host takes ISO images, which the setup disc needs."
+        if self.static.isChecked() and self.static_offered():
+            problem = staticnet.check(self.static_ip.text(), self.static_info(), self.known_ips)
+            if problem:
+                return problem
         if self.from_cloud.isChecked():
             if not cloudvm.find_image(self.cloud_images, self.release.currentData()):
                 return "Ubuntu's cloud image is not on the host yet: Get Image first."
@@ -729,7 +809,7 @@ class CreateVmDialog(_Busy, QDialog):
                 return "The password cannot hold control characters."
             if not self.iso_storages:
                 return "No storage on this host takes ISO images, which the setup disc needs."
-        if (self.windows_setup() or self.from_cloud.isChecked()) and password != again:
+        if (self.windows_setup() or self.linux_setup() or self.from_cloud.isChecked()) and password != again:
             return "The two passwords are not the same."
         return ""
 
@@ -751,6 +831,8 @@ class CreateVmDialog(_Busy, QDialog):
         self.done_text = f"Created VM {vmid} ({name}) — open its Console to install the operating system"
         if self.windows_setup():
             job = self._windows_job(pve, node, vmid, name)
+        elif self.linux_setup():
+            job = self._linux_job(pve, node, vmid, name)
         elif self.from_cloud.isChecked():
             job = self._cloud_job(pve, node, vmid, name)
         elif self.from_iso.isChecked():
@@ -782,8 +864,8 @@ class CreateVmDialog(_Busy, QDialog):
             disc, started = result if isinstance(result, tuple) else (None, False)
             if disc is not None:
                 self.remember(disc)
-            if started and self.windows_setup():
-                self.boot_keys = (node, vmid)
+            if started and (self.windows_setup() or self.linux_setup()):
+                self.boot_keys, self.boot_kind = (node, vmid), "windows" if self.windows_setup() else "ubuntu"
             self.created = (vmid, name)
             self.accept()
 
@@ -824,10 +906,42 @@ class CreateVmDialog(_Busy, QDialog):
 
         return job
 
+    def _linux_job(self, pve: Pve, node: str, vmid: int, name: str) -> Callable[[], tuple]:
+        """An Ubuntu Server ISO that installs itself: its autoinstall disc first (beside the ISO), the VM with it,
+        then the start — the main window types yes at the installer's question."""
+        params = {**self.params(), **self.hw.params(), **self.startup.params(), "agent": "1"}
+        start = params.pop("start")
+        settings = {"user": self.user.text(), "password": self.password.text(),
+                    "ssh_keys": [self.ssh_key.text().strip()], "static": self.static_settings()}
+        storage = self.iso_storages[0]
+        self.done_text = (f"Created VM {vmid} ({name}) — Ubuntu Server installs itself (about 15 minutes)" +
+                          (": watch it in its Console" if start else ": start it, and type yes at “Continue with "
+                           "autoinstall?” in its Console"))
+
+        def job():
+            place = timezones.region(timezones.host_zone(pve, node))
+            files = autoinstall.seed_files(vm_name=name, vmid=vmid, time_zone=place["iana"],
+                                           keyboard=place["keyboard"], **settings)
+            drive = setupdisc.free_slot(params)
+            volid = setupdisc.upload(pve, node, storage, vmid, files, cloudseed.SEED_LABEL)
+            params[drive] = f"{volid},media=cdrom"
+            try:
+                pve.wait_task(node, pve.create_vm(node, params), timeout=900)
+            except Exception:
+                setupdisc.delete(pve, node, volid)
+                raise
+            disc = setupdisc.entry("", node, vmid, volid, drive, True)
+            if start:
+                pve.wait_task(node, pve.guest_action(node, "qemu", vmid, "start"), timeout=300)
+            return disc, start
+
+        return job
+
     def _cloud_job(self, pve: Pve, node: str, vmid: int, name: str) -> Callable[[], tuple]:
         """Ubuntu from its cloud image, set up by the app's setup disc (Server and Desktop alike)."""
         desktop = self.desktop()
         rdp, dark = desktop and self.rdp.isChecked(), desktop and self.dark.isChecked()
+        static = self.static_settings()
         user, password, key = self.user.text(), self.password.text(), self.ssh_key.text().strip()
         disk, start = self.disk.value(), self.start.isChecked()
         params = {**cloudvm.vm_params(vmid=vmid, name=name, image=cloudvm.find_image(self.cloud_images,
@@ -847,7 +961,7 @@ class CreateVmDialog(_Busy, QDialog):
             place = timezones.region(timezones.host_zone(pve, node))
             files = cloudseed.seed_files(vm_name=name, vmid=vmid, user=user, password=password, ssh_keys=[key],
                                          desktop=desktop, remote_desktop=rdp, dark=dark, time_zone=place["iana"],
-                                         keyboard=place["keyboard"])
+                                         keyboard=place["keyboard"], static=static)
             volid = setupdisc.upload(pve, node, seed_storage, vmid, files, cloudseed.SEED_LABEL)
             params["ide2"] = f"{volid},media=cdrom"
             disc = setupdisc.entry("", node, vmid, volid, "ide2", True)

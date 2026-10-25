@@ -28,8 +28,9 @@ if QApplication is not None:
     from proxmox_controller.core.pve import Host, PveError
     from proxmox_controller import app as app_module
     import threading
-    from proxmox_controller.core import (claude_access, claude_policy, cloudseed, connector_link, connector_log,
-                                         setupdisc, sounds, screen as screen_core, ssh as ssh_core, vault)
+    from proxmox_controller.core import (autoinstall, claude_access, claude_policy, cloudseed, connector_link,
+                                         connector_log, setupdisc, sounds, screen as screen_core, ssh as ssh_core,
+                                         vault)
     from proxmox_controller.ui import (backup_jobs, backups, bulk, claude_window, connector, console, geometry,
                                        agent_setup, files_window, graph_wall, guest_dialogs, hazard, host_dialog,
                                        host_shell, host_view, main_window, tasks_panel, theme, vault_dialogs,
@@ -841,6 +842,7 @@ class GuestDialogsTest(UiCase):
         self.assertEqual(dlg.params()["startup"], "order=2")
         vm = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"])
         self.assertTrue(wait_until(lambda: vm.isEnabled() and vm.iso.count()))
+        vm.unattended.setChecked(False)  # (installed by hand)
         vm.onboot.setChecked(True)
         vm.startup.order.setValue(3)
         vm.startup.up.setValue(20)
@@ -1151,7 +1153,8 @@ class SetupDiscViewTest(UiCase):
 
     def test_enter_after_windows_starts(self):
         view = self.loaded_view(prefs={})
-        done = types.SimpleNamespace(created=(201, "win"), done_text="Created VM 201 (win)", boot_keys=("pve", 201))
+        done = types.SimpleNamespace(created=(201, "win"), done_text="Created VM 201 (win)", boot_keys=("pve", 201),
+                                     boot_kind="windows")
         watched = []
         with mock.patch.object(setupdisc, "answer_boot_prompt", lambda pve, node, vmid: watched.append(vmid) or True):
             view._after_new_vm(done)
@@ -1163,6 +1166,18 @@ class SetupDiscViewTest(UiCase):
             self.assertTrue(wait_until(lambda: any("was not seen" in n for n in self.notes)))
         view.remember_setup_disc({"node": "pve", "vmid": 201, "volid": "local:iso/x.iso"})
         self.assertEqual(view.prefs["setup_discs"][0]["host"], "demo-pve")
+
+    def test_yes_after_ubuntu_starts(self):
+        view = self.loaded_view(prefs={})
+        done = types.SimpleNamespace(created=(202, "srv"), done_text="Created VM 202 (srv)", boot_keys=("pve", 202),
+                                     boot_kind="ubuntu")
+        watched = []
+        with mock.patch.object(autoinstall, "answer_question", lambda pve, node, vmid: watched.append(vmid) or True), \
+                mock.patch.object(setupdisc, "answer_boot_prompt", lambda *a: self.fail("not Windows' question")):
+            view._after_new_vm(done)
+            self.assertTrue(wait_until(lambda: any("yes typed" in n for n in self.notes)))
+        self.assertEqual(watched, [202])
+        self.assertTrue(any("Continue with autoinstall?" in n for n in self.notes))
 
 
 class VmDialogTest(UiCase):
@@ -1183,6 +1198,9 @@ class VmDialogTest(UiCase):
         self.assertEqual((dlg.cores.value(), dlg.memory.value(), dlg.disk.value()), (2, 2048, 32))
         self.assertFalse(dlg.from_template.isEnabled())  # no templates on this host
         self.assertFalse(self.visible(dlg, dlg.virtio))  # VirtIO drivers are a Windows matter
+        self.assertTrue(dlg.linux_setup())  # an Ubuntu Server ISO installs itself unless told not to
+        dlg.unattended.setChecked(False)
+        self.assertFalse(self.visible(dlg, dlg.user) or self.visible(dlg, dlg.static))  # by hand: nothing of it
         dlg.name.setText("bad name")
         dlg.create()
         self.assertIn("name", self.errors[-1][1])
@@ -1212,14 +1230,51 @@ class VmDialogTest(UiCase):
         self.assertEqual((cfg["bios"], cfg["ide0"]), ("ovmf", "local:iso/virtio-win.iso,media=cdrom"))
         self.assertIn("tpmstate0", cfg)
 
+    def test_ubuntu_server_iso_installs_itself_with_a_static_ip(self):
+        kept = []
+        dlg = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"], remember=kept.append,
+                                       known_ips=frozenset({"192.168.1.26"}))
+        self.assertTrue(wait_until(lambda: dlg.isEnabled() and dlg.iso.count()))
+        self.assertTrue(dlg.linux_setup())  # the host's Ubuntu Server ISO, the Linux profile: it installs itself
+        for field in (dlg.unattended, dlg.user, dlg.ssh_key, dlg.static):
+            self.assertTrue(self.visible(dlg, field))
+        self.assertFalse(self.visible(dlg, dlg.agent))  # that setup installs the agent anyway
+        self.assertIn("Continue with autoinstall?", dlg.hint.text())
+        self.assertFalse(dlg.static_ip.isVisibleTo(dlg))  # the field opens with the tick
+        dlg.static.setChecked(True)
+        self.assertTrue(dlg.static_ip.isVisibleTo(dlg))
+        self.assertEqual(dlg.static_note.text(), "/24 · gateway 192.168.1.1 · DNS 192.168.1.1 (from the Proxmox host)")
+        dlg.name.setText("srv-ai")
+        dlg.password.setText("ai-pw")
+        dlg.password2.setText("ai-pw")
+        for address, words in (("", "an address such as"), ("192.168.1.26", "in use"), ("10.0.0.9", "not in")):
+            dlg.static_ip.setText(address)
+            dlg.create()
+            self.assertIn(words, self.errors[-1][1])
+        dlg.static_ip.setText("192.168.1.62")
+        dlg.create()
+        self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
+        cfg = self.cluster().guests[103]["cfg"]
+        disc = cfg["ide3"].split(",")[0]
+        self.assertEqual((kept[0]["volid"], kept[0]["drive"], kept[0]["agent"], str(cfg["agent"])),
+                         (disc, "ide3", True, "1"))
+        files = test_core_read_iso(self.cluster().files[disc.split("/")[1]])
+        ai = json.loads(files["user-data"].decode().split("\n", 1)[1])["autoinstall"]
+        self.assertEqual((ai["identity"]["username"], ai["network"]["ethernets"]["ens18"]["addresses"]),
+                         ("user", ["192.168.1.62/24"]))
+        self.assertNotIn(b"ai-pw", files["user-data"])
+        self.assertEqual((dlg.boot_keys, dlg.boot_kind), (("pve", 103), "ubuntu"))  # the main window types yes
+        self.assertIn("Ubuntu Server installs itself", dlg.done_text)
+
     def test_windows_installs_itself(self):
         self.client()
         self.cluster().isos += ["local:iso/Win11_25H2_Greek_x64.iso", "local:iso/virtio-win.iso"]
         kept = []
         dlg = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"], remember=kept.append)
         self.assertTrue(wait_until(lambda: dlg.isEnabled() and dlg.iso.count()))
-        self.assertFalse(self.visible(dlg, dlg.unattended))  # Linux: nothing of Windows' setup
-        self.assertFalse(self.visible(dlg, dlg.user))
+        self.assertTrue(self.visible(dlg, dlg.unattended))  # Linux with Ubuntu Server's ISO installs itself too …
+        self.assertFalse(dlg.edition.isVisibleTo(dlg) or dlg.language.isVisibleTo(dlg))  # … nothing of Windows' in it
+        self.assertFalse(self.visible(dlg, dlg.rdp))
         dlg.profile.setCurrentIndex(dlg.profile.findData("win11"))
         dlg.iso.setCurrentIndex(dlg.iso.findData("local:iso/Win11_25H2_Greek_x64.iso"))
         self.assertTrue(all(self.visible(dlg, f) for f in (dlg.unattended, dlg.user, dlg.rdp)))
@@ -1308,6 +1363,8 @@ class VmDialogTest(UiCase):
         self.assertIn("password, or an SSH key", self.errors[-1][1])
         dlg.password.setText("srv-pw")
         dlg.password2.setText("srv-pw")
+        dlg.static.setChecked(True)  # a fixed address, the rest from the host's network
+        dlg.static_ip.setText("192.168.1.63")
         dlg.create()
         self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
         cfg, g = self.cluster().guests[103]["cfg"], self.cluster().guests[103]
@@ -1316,6 +1373,7 @@ class VmDialogTest(UiCase):
         self.assertEqual((len(kept), kept[0]["volid"]), (1, cfg["ide2"].split(",")[0]))
         srv = test_core_read_iso(self.cluster().files[kept[0]["volid"].split("/")[1]])
         self.assertIn(b"installing the updates and the QEMU guest agent", srv["user-data"])
+        self.assertEqual(json.loads(srv["network-config"])["ethernets"]["ens18"]["addresses"], ["192.168.1.63/24"])
         self.assertNotIn(b"srv-pw", srv["user-data"])
         desk = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"], remember=kept.append)
         self.assertTrue(wait_until(lambda: desk.isEnabled() and desk.iso.count()))
@@ -1388,6 +1446,7 @@ class VmDialogTest(UiCase):
         self.assertEqual(set(items), {"0781:5581", "046d:c52b"})  # the hub is not offered
         items["0781:5581"].setCheckState(Qt.CheckState.Checked)
         hw.spice_usb.setChecked(True)
+        dlg.unattended.setChecked(False)  # (installed by hand)
         dlg.name.setText("desk")
         dlg.create()
         self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))

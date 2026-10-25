@@ -315,10 +315,16 @@ class FakeCluster:
         return None
 
     def network(self, p, node):
-        nets = [{"iface": "vmbr0", "type": "bridge", "active": 1}, {"iface": "eno1", "type": "eth", "active": 1}]
+        nets = [{"iface": "vmbr0", "type": "bridge", "active": 1, "cidr": "192.168.1.80/24", "gateway": "192.168.1.1"},
+                {"iface": "eno1", "type": "eth", "active": 1}]
+        if p.get("type") == "any_bridge":
+            nets = [n for n in nets if n["type"] == "bridge"]
         if not self.allowed([("SDN.Audit",), ("SDN.Use",)]):  # as Proxmox: bridges left out without a word
             nets = [n for n in nets if n["type"] != "bridge"]
         return nets
+
+    def dns(self, p, node):
+        return {"search": "lan", "dns1": "192.168.1.1"}
 
     def next_id(self, p):
         n = 100
@@ -1081,6 +1087,7 @@ ROUTES = [
     (("GET", rf"/nodes/{_N}/storage"), FakeCluster.storages),
     (("GET", rf"/nodes/{_N}/storage/{_N}/content"), FakeCluster.storage_content),
     (("GET", rf"/nodes/{_N}/network"), FakeCluster.network),
+    (("GET", rf"/nodes/{_N}/dns"), FakeCluster.dns),
     (("GET", rf"/nodes/{_N}/apt/update"), FakeCluster.apt_updates),
     (("POST", rf"/nodes/{_N}/apt/update"), FakeCluster.apt_refresh),
     (("GET", rf"/nodes/{_N}/apt/repositories"), FakeCluster.apt_repositories),

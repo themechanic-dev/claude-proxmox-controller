@@ -18,7 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import (claude_policy, cloudseed, cloudvm, guestfiles, screen, setupdisc, ssh, startup, tasks, timezones, vmhw,
+from . import (autoinstall, claude_policy, cloudseed, cloudvm, guestfiles, screen, setupdisc, ssh, startup, staticnet,
+               tasks, timezones, vmhw,
                winsetup, wol)
 from .cloudvm import CLOUD_IMAGES, CLOUD_URL, USERNAME
 from .details import read_details
@@ -602,6 +603,39 @@ def _windows_setup(a: dict) -> dict | None:
             "guest_tools": a.get("guest_agent", True)}
 
 
+def _linux_setup(a: dict) -> dict | None:
+    """The autoinstall's settings when an Ubuntu Server ISO is to install itself (linux_user given), checked; else
+    None."""
+    if not a.get("linux_user"):
+        if a.get("profile", "linux") == "linux":
+            for key in ("ssh_public_key", "static_ip"):
+                if key in a:
+                    raise ToolError(f"{key} is for an Ubuntu that installs itself: give linux_user too.")
+        return None
+    if a.get("profile", "linux") != "linux" or not autoinstall.is_server_iso(a["iso"]):
+        raise ToolError("linux_user: only with the linux profile and an Ubuntu Server ISO from 24.04 on "
+                        "(ubuntu-…-live-server-amd64.iso).")
+    if not USERNAME.match(a["linux_user"]):
+        raise ToolError("linux_user: small letters, digits, '_' and '-', starting with a letter.")
+    return {"user": a["linux_user"], "ssh_keys": [a.get("ssh_public_key", "")]}
+
+
+def _static_for(ctx: Context, node: str, a: dict) -> dict | None:
+    """The fixed address asked for (static_ip), with the rest from the host's network on the VM's bridge; else None."""
+    if not a.get("static_ip"):
+        return None
+    info = staticnet.for_bridge(staticnet.host_network(ctx.admin or ctx.pve, node), a.get("bridge", "vmbr0"))
+    problem = staticnet.check(str(a["static_ip"]), info)
+    if problem:
+        raise ToolError(f"static_ip: {problem}")
+    return staticnet.settings(str(a["static_ip"]), info)
+
+
+def _address_words(static: dict | None) -> str:
+    return (f"address {static['address']}, gateway {static['gateway']}, DNS {', '.join(static['dns'])} (the host's "
+            "network)" if static else "network by DHCP")
+
+
 def _create_vm_words(ctx: Context, a: dict):
     node, p = _vm_params(ctx, a)
     lines = [f"{PROFILES[a.get('profile', 'linux')]['label']}: {p['cores']} cores, {p['memory']} MiB, disk "
@@ -617,11 +651,22 @@ def _create_vm_words(ctx: Context, a: dict):
         if a.get("start") and _start(ctx, a):
             lines.append("The app itself presses Enter at the installer's 'Press any key to boot from CD or DVD' "
                          "(it waits only ~5 s: no second approval, whatever the Console switch says)")
+    linux = _linux_setup(a)
+    if linux:
+        lines += [f"Ubuntu Server installs itself: user '{linux['user']}' with the password you type below (Claude "
+                  "does not see it)" + (" and an SSH key" if a.get("ssh_public_key") else "") + "; the whole disk, "
+                  "the QEMU guest agent, OpenSSH, the host's time zone; " + _address_words(_static_for(ctx, node, a)),
+                  "Its setup disc (the password as a hash) is deleted by the app once the guest agent answers"]
+        if a.get("start") and _start(ctx, a):
+            lines.append("The app itself types yes at the installer's 'Continue with autoinstall?' (no second "
+                         "approval, whatever the Console switch says)")
     return f"Create VM {p['vmid']} ({p['name']}) on {node}", lines
 
 
 def _create_vm(ctx: Context, a: dict):
     node, p = _vm_params(ctx, a)
+    if _linux_setup(a):
+        return _create_linux_vm(ctx, a, node, p)
     win = _windows_setup(a)
     if not win:
         upid = ctx.pve.create_vm(node, p)
@@ -671,6 +716,54 @@ def _create_vm(ctx: Context, a: dict):
     out["next"] = ("Windows installs itself (about 15–30 minutes, with restarts); watch it with console_screenshot. "
                    "Done when it shows the desktop" + (" and the guest agent answers (run_command works)"
                                                        if win["virtio"] and win["guest_tools"] else "") + ".")
+    return out
+
+
+def _create_linux_vm(ctx: Context, a: dict, node: str, p: dict):
+    """An Ubuntu Server ISO that installs itself: its autoinstall disc beside the ISO, the VM, the start — and the app
+    types yes at the installer's one question (core/autoinstall.py)."""
+    linux = _linux_setup(a)
+    if not ctx.secret:
+        raise ToolError("No password was typed.")
+    static = _static_for(ctx, node, a)
+    place = timezones.region(timezones.host_zone(ctx.admin or ctx.pve, node))
+    vmid, start = p["vmid"], p.pop("start")
+    p["agent"] = "1"  # (the setup installs it: the app reads its answer as "installed")
+    files = autoinstall.seed_files(vm_name=p["name"], vmid=vmid, user=linux["user"], password=ctx.secret,
+                                   ssh_keys=linux["ssh_keys"], time_zone=place["iana"], keyboard=place["keyboard"],
+                                   static=static)
+    drive = setupdisc.free_slot(p)
+    volid = setupdisc.upload(ctx.pve, node, setupdisc.storage_of(a["iso"]), vmid, files, cloudseed.SEED_LABEL)
+    p[drive] = f"{volid},media=cdrom"
+    try:
+        made = finish(ctx, node, ctx.pve.create_vm(node, p), wait=WAIT_S * 3)
+    except Exception:
+        setupdisc.delete(ctx.admin or ctx.pve, node, volid)  # (deleting an ISO needs the user's token)
+        raise
+    if ctx.remember is not None:
+        ctx.remember(setupdisc.entry(ctx.host.id, node, vmid, volid, drive, True))
+    out = {"vmid": vmid, "name": p["name"], "node": node, **made, "ubuntu": {
+        "user": linux["user"], "password": "set by the user (not shown to you)",
+        "network": _address_words(static), "setup_disc": f"{volid} on {drive} — the app deletes it once the agent "
+                                                          "answers"}}
+    if made["status"] != "done":
+        out["note"] = ("The VM is still being made: start it when task_log shows it finished, and type yes in its "
+                       "console at 'Continue with autoinstall? (yes|no)' (about 2–3 minutes after the start).")
+        return out
+    if start:
+        out["started"] = finish(ctx, node, ctx.pve.guest_action(node, "qemu", vmid, "start"))["status"]
+        # The app types yes itself, with the user's token (the user's exception, 25/10) — part of this approved
+        # request; in the background, as the question comes minutes later
+        pve = ctx.admin or ctx.pve
+        threading.Thread(target=lambda: autoinstall.answer_question(pve, node, vmid), daemon=True,
+                         name=f"autoinstall-{vmid}").start()
+        out["question"] = ("the app watches its screen and types yes at 'Continue with autoinstall? (yes|no)' "
+                           f"(within {autoinstall.QUESTION_WAIT_S // 60} minutes); check with console_screenshot")
+    elif a.get("start"):
+        out["started"] = NOT_STARTED
+    out["next"] = ("Ubuntu Server installs itself (about 15 minutes, then it restarts into the installed system); "
+                   "done when the guest agent answers — its address then shows in Proxmox Controller and run_command "
+                   "works.")
     return out
 
 
@@ -788,7 +881,7 @@ def _cloud_vm_words(ctx: Context, a: dict):
     desktop = a.get("edition", "server") == "desktop"
     user = a.get("username", "user")
     lines = [f"From {a['image']}: {p['cores']} cores (CPU type {p['cpu']}), {p['memory']} MiB, disk {disk} GB, "
-             "network by DHCP",
+             + _address_words(_static_for(ctx, node, a)),
              f"User '{user}', with the password you type below (Claude does not see it)" +
              (" and an SSH key" if a.get("ssh_public_key") else "")]
     if desktop:
@@ -812,7 +905,8 @@ def _cloud_vm(ctx: Context, a: dict):
     place = timezones.region(timezones.host_zone(ctx.admin or ctx.pve, node))
     seed = cloudseed.seed_files(vm_name=p["name"], vmid=vmid, user=user, password=ctx.secret,
                                 ssh_keys=[a.get("ssh_public_key", "")], desktop=desktop, remote_desktop=rdp,
-                                dark=bool(a.get("dark_theme")), time_zone=place["iana"], keyboard=place["keyboard"])
+                                dark=bool(a.get("dark_theme")), time_zone=place["iana"], keyboard=place["keyboard"],
+                                static=_static_for(ctx, node, a))
     volid = setupdisc.upload(ctx.pve, node, _seed_storage(ctx, node), vmid, seed, cloudseed.SEED_LABEL)
     p["ide2"] = f"{volid},media=cdrom"
     try:
@@ -1590,7 +1684,11 @@ def _tools() -> list[Tool]:
              "USER types in Proxmox Controller's window (you never give or see it), optionally Remote Desktop and the "
              "dark theme, and the VirtIO guest tools with the QEMU guest agent last; with start, the app presses "
              "Enter at the installer's 'Press any key to boot from CD' itself (it waits only seconds). The disc is "
-             "deleted once Windows is ready.",
+             "deleted once Windows is ready. An Ubuntu Server ISO from 24.04 on (profile linux) installs itself with "
+             "linux_user: autoinstall answers on a disc of the app's — that user with the password the USER types, "
+             "optionally an SSH key and a static_ip, the whole disk, the QEMU guest agent, OpenSSH, the host's time "
+             "zone; with start, the app types yes at the installer's 'Continue with autoinstall?' itself. About 15 "
+             "minutes; the disc is deleted once the agent answers.",
              {**host, "name": {"type": "string"}, "iso": {"type": "string", "description": "An ISO's volid."},
               "profile": {"type": "string", "enum": list(PROFILES)}, "vmid": {"type": "integer", "minimum": 100},
               "cores": {"type": "integer", "minimum": 1, "maximum": 512},
@@ -1604,10 +1702,18 @@ def _tools() -> list[Tool]:
                           "(win10: Windows 10 Pro). Remote Desktop needs Pro, Education, Enterprise or Server."},
               "language": {"type": "string", "description": "Such as en-US or el-GR. Default: from the ISO's name, "
                            "else en-US. The keyboard is English (US)."},
-              "remote_desktop": {"type": "boolean"}, "dark_theme": {"type": "boolean"}},
+              "remote_desktop": {"type": "boolean"}, "dark_theme": {"type": "boolean"},
+              "linux_user": {"type": "string", "description": "An Ubuntu Server ISO installs itself with this user "
+                             "(sudo); the user types its password."},
+              "ssh_public_key": {"type": "string", "description": "With linux_user."},
+              "static_ip": {"type": "string", "description": "With linux_user: a fixed address such as 192.168.1.50; "
+                            "the network's size, gateway and DNS are the host's own (on the VM's bridge). Default: "
+                            "DHCP."}},
              ("host", "name", "iso"), _create_vm, _create_vm_words, also=_power_for_start,
-             secret=lambda a: f"Password for the Windows user '{a['windows_user']}' in the new VM {a.get('name', '')}"
-             if a.get("windows_user") else ""),
+             secret=lambda a: (f"Password for the Windows user '{a['windows_user']}' in the new VM {a.get('name', '')}"
+                               if a.get("windows_user") else
+                               f"Password for the user '{a['linux_user']}' in the new VM {a.get('name', '')}"
+                               if a.get("linux_user") else "")),
         Tool("get_cloud_image", "change", "Have the host download Ubuntu Server's official cloud image (24.04 or "
              "26.04), once, to make VMs from with create_cloud_vm.",
              {**host, "release": {"type": "string", "enum": list(CLOUD_IMAGES)}, "storage": {"type": "string"},
@@ -1630,6 +1736,8 @@ def _tools() -> list[Tool]:
               "cores": {"type": "integer", "minimum": 1, "maximum": 512}, "memory_mib": {"type": "integer", "minimum": 512},
               "disk_gb": {"type": "integer", "minimum": 4}, "storage": {"type": "string"}, "bridge": {"type": "string"},
               "ssh_public_key": {"type": "string"}, "start": {"type": "boolean", "description": "Default: true."},
+              "static_ip": {"type": "string", "description": "A fixed address such as 192.168.1.50; the network's "
+                            "size, gateway and DNS are the host's own (on the VM's bridge). Default: DHCP."},
               "start_at_boot": {"type": "boolean"}, "node": {"type": "string"}},
              ("host", "name", "image"), _cloud_vm, _cloud_vm_words, also=("power",),
              secret=lambda a: f"Password for the user '{a.get('username', 'user')}' in the new VM {a.get('name', '')}"),

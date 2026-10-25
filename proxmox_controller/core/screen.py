@@ -20,7 +20,10 @@ KEY_HOLD_S = 0.08  # a key held as a hand holds it: answer_prompt's keys (Window
 # sent as the built-in console sends a key typed by the user — which Windows' boot question took, when a key sent by
 # its keysym alone, with no hold, was ignored there (the sixth live test, 24/10)
 EVDEV = {"enter": 28, "return": 28, "escape": 1, "esc": 1, "tab": 15, "space": 57, "backspace": 14,
-         "up": 103, "down": 108, "left": 105, "right": 106}
+         "up": 103, "down": 108, "left": 105, "right": 106,
+         # the letters too (Ubuntu's installer is answered "yes"), in the keyboard's rows as Linux numbers them
+         **{c: 16 + i for i, c in enumerate("qwertyuiop")}, **{c: 30 + i for i, c in enumerate("asdfghjkl")},
+         **{c: 44 + i for i, c in enumerate("zxcvbnm")}}
 
 KEYS = {"enter": 0xFF0D, "return": 0xFF0D, "tab": 0xFF09, "escape": 0xFF1B, "esc": 0xFF1B, "backspace": 0xFF08,
         "delete": 0xFFFF, "del": 0xFFFF, "insert": 0xFF63, "home": 0xFF50, "end": 0xFF57, "pageup": 0xFF55,

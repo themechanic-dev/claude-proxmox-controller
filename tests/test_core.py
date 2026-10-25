@@ -23,7 +23,8 @@ from unittest import mock
 from proxmox_controller.core import apt, ssh as sshmod
 from proxmox_controller.core import (autostart, claude_access, claude_policy, connector_link, connector_tools, jobs,
                                      mcp, netinfo, screen, sounds, spice, startup, store, tasks, vault, vmhw, wol)
-from proxmox_controller.core import cloudseed, guestfiles, isofs, setupdisc, timezones, winsetup
+from proxmox_controller.core import (autoinstall, cloudseed, guestfiles, isofs, setupdisc, staticnet, timezones,
+                                     winsetup)
 from proxmox_controller.core.des import encrypt_block, vnc_response
 from proxmox_controller.core.fakevnc import FakeVncServer
 from proxmox_controller.core.rfb import RfbClient, RfbError, qnum_from_evdev, qnum_from_windows
@@ -1340,6 +1341,66 @@ class ConnectorToolsTest(unittest.TestCase):
         if kinds is not None:
             ctx.kinds = frozenset(kinds)
         return tool.run(ctx, connector_tools.check(tool, args)), kept
+
+    def test_ubuntu_server_iso_that_installs_itself(self):
+        iso = "local:iso/ubuntu-24.04.1-live-server-amd64.iso"  # (the pretend host's)
+        args = dict(host="demo-pve", name="srv-ai", iso=iso, profile="linux", linux_user="nikos",
+                    ssh_public_key="ssh-ed25519 AAAA me@pc", static_ip="192.168.1.60", start=True, reason="r")
+        tool = connector_tools.TOOLS["create_vm"]
+        self.assertEqual(tool.secret_prompt(args), "Password for the user 'nikos' in the new VM srv-ai")
+        _, lines = self.words("create_vm", **args)
+        said = " ".join(lines)
+        self.assertIn("Ubuntu Server installs itself: user 'nikos'", said)
+        self.assertIn("address 192.168.1.60/24, gateway 192.168.1.1, DNS 192.168.1.1", said)  # the host's network
+        self.assertIn("types yes at the installer's 'Continue with autoinstall?'", said)
+        watched = []
+        with mock.patch.object(autoinstall, "answer_question", lambda pve, node, vmid: watched.append((pve, vmid))):
+            out, kept = self.run_with("create_vm", secret="Srv-Pass-5", **args)
+            for t in [t for t in threading.enumerate() if t.name.startswith("autoinstall-")]:
+                t.join(5)
+        vmid = out["vmid"]
+        self.assertNotIn("Srv-Pass-5", json.dumps(out))
+        cfg = self.pve.guest_config("pve", "qemu", vmid)
+        disc = cfg["ide3"].split(",")[0]
+        self.assertEqual((cfg["ide2"].split(",")[0], str(cfg["agent"])), (iso, "1"))  # the ISO stays; the agent on
+        self.assertEqual(kept, [{**kept[0], "vmid": vmid, "volid": disc, "drive": "ide3", "agent": True}])
+        label, files = read_iso(self.cluster.files[disc.split("/")[1]], joliet=True)
+        self.assertEqual((label, sorted(files)), ("cidata", ["meta-data", "user-data"]))
+        self.assertNotIn(b"Srv-Pass-5", files["user-data"])
+        ai = json.loads(files["user-data"].decode().split("\n", 1)[1])["autoinstall"]
+        self.assertEqual((ai["identity"]["username"], ai["identity"]["hostname"], ai["timezone"]),
+                         ("nikos", "srv-ai", "Europe/Athens"))
+        self.assertEqual(ai["identity"]["password"],
+                         cloudseed.sha512_crypt("Srv-Pass-5", ai["identity"]["password"].split("$")[2]))
+        self.assertEqual(ai["network"]["ethernets"]["ens18"]["addresses"], ["192.168.1.60/24"])
+        self.assertEqual([v for _p, v in watched], [vmid])  # the question watched for, with the app's token
+        self.assertIs(watched[0][0], self.pve)
+        self.assertIn("types yes", out["question"])
+        for bad, words in (({"profile": "win11"}, "only with the linux profile"),
+                           ({"iso": "local:iso/ubuntu-22.04.5-live-server-amd64.iso"}, "from 24.04 on"),
+                           ({"linux_user": "Root!"}, "linux_user: small letters"),
+                           ({"linux_user": None}, "give linux_user too"),
+                           ({"static_ip": "10.0.0.5"}, "not in the host's network"),
+                           ({"static_ip": "192.168.1.80"}, "the Proxmox host's own address")):
+            a = {k: v for k, v in {**args, "name": "srv-2", **bad}.items() if v is not None}
+            self.cluster.isos.append("local:iso/ubuntu-22.04.5-live-server-amd64.iso")
+            with self.assertRaises(connector_tools.ToolError) as caught:
+                self.run_with("create_vm", secret="pw", **a)
+            self.assertIn(words, str(caught.exception))
+
+    def test_ready_made_ubuntu_with_a_static_address(self):
+        image = self.run_tool("get_cloud_image", host="demo-pve", release="24.04", reason="r")["image"]
+        args = dict(host="demo-pve", name="srv", image=image, static_ip="192.168.1.61", start=False, reason="r")
+        _, lines = self.words("create_cloud_vm", **args)
+        self.assertIn("address 192.168.1.61/24, gateway 192.168.1.1", lines[0])
+        out, kept = self.run_with("create_cloud_vm", secret="pw", **args)
+        _, files = read_iso(self.cluster.files[kept[0]["volid"].split("/")[1]], joliet=True)
+        card = json.loads(files["network-config"])["ethernets"]["ens18"]
+        self.assertEqual((card["dhcp4"], card["addresses"], card["routes"], card["nameservers"]),
+                         (False, ["192.168.1.61/24"], [{"to": "default", "via": "192.168.1.1"}],
+                          {"addresses": ["192.168.1.1"], "search": ["lan"]}))
+        with self.assertRaises(connector_tools.ToolError):
+            self.run_with("create_cloud_vm", secret="pw", **{**args, "name": "srv2", "static_ip": "192.168.1.1"})
 
     def test_windows_that_installs_itself(self):
         iso, virtio = "local:iso/Win11_25H2_Greek_x64.iso", "local:iso/virtio-win.iso"
@@ -3099,6 +3160,141 @@ class CloudSeedTest(unittest.TestCase):
         one, two = (json.loads(cloudseed.meta_data("desk.lan", 120)) for _ in range(2))
         self.assertNotEqual(one["instance-id"], two["instance-id"])
         self.assertEqual(one["local-hostname"], "desk")
+
+
+class AutoinstallTest(unittest.TestCase):
+    """An Ubuntu Server ISO that installs itself (measured on 26.04, 25/10)."""
+
+    def test_server_isos(self):
+        for volid, ok in (("local:iso/ubuntu-26.04-live-server-amd64.iso", True),
+                          ("local:iso/ubuntu-24.04.3-live-server-amd64.iso", True),
+                          ("nas:iso/ubuntu-24.04.1-live-server-amd64_1_.iso", True),
+                          ("local:iso/ubuntu-22.04.5-live-server-amd64_1_.iso", False),  # (it does not ask)
+                          ("local:iso/ubuntu-26.04-desktop-amd64.iso", False),
+                          ("local:iso/Win11_25H2_English_x64.iso", False), ("", False)):
+            self.assertEqual(autoinstall.is_server_iso(volid), ok, volid)
+
+    def test_the_question_is_recognised(self):
+        """Only the installer's "Continue with autoinstall? (yes|no)" — among every real screen the tests keep: GRUB,
+        the installer starting, its log scrolling, the installed system's login, and Windows' screens."""
+        for name in sorted(p.name for p in DATA.glob("*.png")):
+            self.assertEqual(autoinstall.question_on(*screen_of(name)), name == "ubuntu-autoinstall-question.png",
+                             name)
+        self.assertFalse(autoinstall.question_on(1024, 768, bytes(1024 * 768 * 4)))  # black
+
+    def test_yes_typed_when_the_question_shows(self):
+        """The log first, then the question: y, e, s and Enter — with their scan codes — once it shows, then done."""
+        log_screen, question = screen_of("ubuntu-installer-starting.png"), screen_of("ubuntu-autoinstall-question.png")
+        after = screen_of("ubuntu-installer-disk.png")
+        servers, typed = [], []
+
+        def flow(srv, keysym):
+            typed.append(keysym)
+            if keysym == 0xFF0D and srv.image == question[2]:
+                srv.show(after)
+
+        def open_console():
+            mine, theirs = socket.socketpair()
+            srv = ScreenVnc(WebSocket(theirs, client=False), "pw", log_screen, on_key=flow).start()
+            servers.append(srv)
+            threading.Timer(0.4, lambda: srv.show(question)).start()
+            return WebSocket(mine), "pw"
+
+        self.assertTrue(screen.answer_prompt(open_console, autoinstall.question_on, autoinstall.ANSWER, timeout=10,
+                                             refresh=0.1, first_after=0.2, again_after=5.0, settle=1))
+        self.assertEqual(typed, [ord("y"), ord("e"), ord("s"), 0xFF0D])  # once: not again while it scrolls on
+        downs = [k for k in servers[0].keys if k[1]]
+        self.assertEqual([k[3] for k in downs], [0x15, 0x12, 0x1F, 0x1C])  # as a keyboard sends them
+        self.assertEqual(servers[0].image, after[2])
+
+    def test_answer_question_watches_the_whole_screen(self):
+        seen = {}
+
+        def fake(open_console, is_prompt, keys, timeout, **kw):
+            seen.update(is_prompt=is_prompt, keys=keys, timeout=timeout, **kw)
+            kw["log"]("question SEEN")
+            return True
+
+        with mock.patch.object(screen, "answer_prompt", fake):
+            self.assertTrue(autoinstall.answer_question(DemoPve(DEMO_HOSTS[0]), "pve", 150))
+        self.assertIs(seen["is_prompt"], autoinstall.question_on)
+        self.assertEqual((seen["keys"], seen["timeout"], seen.get("top")), (("y", "e", "s", "enter"), 900, None))
+        self.assertIn("VM 150: question SEEN", (store.data_dir() / "boot-prompt.log").read_text())
+
+    def config(self, **kw):
+        text = autoinstall.user_data(**{"vm_name": "srv.lan", "user": "nikos", "password": "Pw-1234",
+                                        "ssh_keys": [], **kw})
+        self.assertTrue(text.startswith("#cloud-config\n"))
+        self.assertNotIn("Pw-1234", text)
+        return json.loads(text.split("\n", 1)[1])["autoinstall"]
+
+    def test_answers(self):
+        ai = self.config(time_zone="Europe/Athens", keyboard="gr")
+        self.assertEqual((ai["version"], ai["locale"], ai["timezone"]), (1, "en_US.UTF-8", "Europe/Athens"))
+        self.assertEqual(ai["keyboard"], {"layout": "us,gr", "toggle": "alt_shift_toggle"})
+        idn = ai["identity"]
+        self.assertEqual((idn["hostname"], idn["username"], idn["realname"]), ("srv", "nikos", "nikos"))
+        self.assertEqual(idn["password"], cloudseed.sha512_crypt("Pw-1234", idn["password"].split("$")[2]))
+        self.assertEqual(ai["ssh"], {"install-server": True, "authorized-keys": [], "allow-pw": True})
+        self.assertEqual(ai["packages"], ["qemu-guest-agent"])
+        self.assertEqual(ai["storage"], {"layout": {"name": "lvm", "sizing-policy": "all"}})  # the whole disk
+        self.assertEqual(ai["network"]["ethernets"]["ens18"]["dhcp-identifier"], "mac")
+        keyed = self.config(ssh_keys=["ssh-ed25519 AAAA me@pc", " "], keyboard="us")
+        self.assertEqual(keyed["ssh"]["authorized-keys"], ["ssh-ed25519 AAAA me@pc"])
+        self.assertFalse(keyed["ssh"]["allow-pw"])  # a key: no password over SSH, as the installer does
+        self.assertEqual(keyed["keyboard"], {"layout": "us"})
+        self.assertNotIn("timezone", keyed)
+        static = self.config(static={"address": "192.168.1.50/24", "gateway": "192.168.1.1", "dns": ["1.1.1.1"],
+                                     "search": []})
+        self.assertEqual(static["network"]["ethernets"]["ens18"]["addresses"], ["192.168.1.50/24"])
+        with self.assertRaises(ValueError):
+            self.config(password="")
+        files = autoinstall.seed_files(vm_name="srv", vmid=9, user="u", password="p", ssh_keys=[])
+        self.assertEqual(sorted(files), ["meta-data", "user-data"])
+
+
+class StaticNetTest(unittest.TestCase):
+    """A fixed address: only the address typed, the rest from the host's own network."""
+
+    def setUp(self):
+        DemoPve._clusters.clear()
+        self.net = staticnet.host_network(DemoPve(DEMO_HOSTS[0]), "pve")
+
+    def test_from_the_host(self):
+        self.assertEqual(self.net, {"bridges": {"vmbr0": {"cidr": "192.168.1.80/24", "gateway": "192.168.1.1"}},
+                                    "dns": ["192.168.1.1"], "search": ["lan"]})
+        info = staticnet.for_bridge(self.net, "vmbr0")
+        self.assertEqual(staticnet.describe(info), "/24 · gateway 192.168.1.1 · DNS 192.168.1.1 (from the Proxmox host)")
+        self.assertEqual(staticnet.settings(" 192.168.1.50 ", info),
+                         {"address": "192.168.1.50/24", "gateway": "192.168.1.1", "dns": ["192.168.1.1"],
+                          "search": ["lan"]})
+        self.assertIsNone(staticnet.for_bridge(self.net, "vmbr9"))  # no such bridge (or no address of its own)
+        self.assertIn("no IPv4 network", staticnet.describe(None))
+        # a gateway on another of the host's interfaces, in the bridge's network; no DNS: the gateway serves
+        other = {"bridges": {"vmbr1": {"cidr": "10.0.0.2/16", "gateway": ""}}, "dns": [], "search": []}
+        self.assertIsNone(staticnet.for_bridge(other, "vmbr1"))
+        other["bridges"]["vmbr1"]["gateway"] = "10.0.0.1"
+        self.assertEqual(staticnet.for_bridge(other, "vmbr1")["dns"], ["10.0.0.1"])
+
+    def test_check(self):
+        info = staticnet.for_bridge(self.net, "vmbr0")
+        self.assertEqual(staticnet.check("192.168.1.50", info), "")
+        for address, words in (("192.168.1", "an address such as"), ("hello", "an address such as"),
+                               ("10.1.2.3", "not in the host's network"), ("192.168.1.0", "network's own address"),
+                               ("192.168.1.255", "broadcast"), ("192.168.1.80", "host's own"),
+                               ("192.168.1.1", "gateway")):
+            self.assertIn(words, staticnet.check(address, info), address)
+        self.assertIn("in use", staticnet.check("192.168.1.26", info, frozenset({"192.168.1.26"})))
+        self.assertIn("no IPv4 network", staticnet.check("192.168.1.50", None))
+
+    def test_network_config(self):
+        self.assertEqual(cloudseed.network_config(None)["ethernets"]["ens18"],
+                         {"dhcp4": True, "dhcp6": True, "dhcp-identifier": "mac"})
+        card = cloudseed.network_config({"address": "192.168.1.50/24", "gateway": "192.168.1.1",
+                                         "dns": ["192.168.1.1"], "search": []})["ethernets"]["ens18"]
+        self.assertEqual(card, {"dhcp4": False, "dhcp6": True, "addresses": ["192.168.1.50/24"],
+                                "routes": [{"to": "default", "via": "192.168.1.1"}],
+                                "nameservers": {"addresses": ["192.168.1.1"]}})
 
 
 class SetupDiscTest(unittest.TestCase):

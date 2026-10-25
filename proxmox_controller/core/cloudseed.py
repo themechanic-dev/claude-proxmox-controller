@@ -197,6 +197,20 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], de
     return "#cloud-config\n" + json.dumps(cfg, indent=2) + "\n"
 
 
+def network_config(static: dict | None = None) -> dict:
+    """netplan's version 2 for the VM's card: DHCP asked with the MAC, or `static` — {"address": "a.b.c.d/nn",
+    "gateway", "dns": [...], "search": [...]} (core/staticnet.settings) — with IPv6 left to the network either way.
+    The ISO's autoinstall takes the same (core/autoinstall.py)."""
+    if not static:
+        return NETWORK_CONFIG
+    card: dict = {"dhcp4": False, "dhcp6": True, "addresses": [static["address"]],
+                  "routes": [{"to": "default", "via": static["gateway"]}],
+                  "nameservers": {"addresses": list(static["dns"])}}
+    if static.get("search"):
+        card["nameservers"]["search"] = list(static["search"])
+    return {"version": 2, "ethernets": {"ens18": card}}
+
+
 def meta_data(vm_name: str, vmid: int) -> str:
     """A new instance-id per disc: cloud-init sets the VM up once for each."""
     return json.dumps({"instance-id": f"pvc-{int(vmid)}-{secrets.token_hex(4)}",
@@ -204,14 +218,14 @@ def meta_data(vm_name: str, vmid: int) -> str:
 
 
 def seed_files(*, vm_name: str, vmid: int, user: str, password: str, ssh_keys: list[str], desktop: bool = True,
-               remote_desktop: bool = False, dark: bool = False, time_zone: str = "",
-               keyboard: str = "") -> dict[str, bytes]:
-    """The setup disc's files for an Ubuntu VM."""
+               remote_desktop: bool = False, dark: bool = False, time_zone: str = "", keyboard: str = "",
+               static: dict | None = None) -> dict[str, bytes]:
+    """The setup disc's files for an Ubuntu VM (`static`: its fixed address, see network_config)."""
     files = {"user-data": user_data(vm_name=vm_name, user=user, password=password, ssh_keys=ssh_keys, desktop=desktop,
                                     remote_desktop=remote_desktop, dark=dark, time_zone=time_zone,
                                     keyboard=keyboard).encode(),
              "meta-data": meta_data(vm_name, vmid).encode(),
-             "network-config": (json.dumps(NETWORK_CONFIG, indent=2) + "\n").encode()}
+             "network-config": (json.dumps(network_config(static), indent=2) + "\n").encode()}
     if remote_desktop:
         files[RDP_PASSWORD_FILE] = (password + "\n").encode()
     return files
