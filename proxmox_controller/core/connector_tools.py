@@ -770,16 +770,16 @@ def _cloud_vm_params(ctx: Context, a: dict) -> tuple[str, dict, int]:
                           storage=storage, bridge=a.get("bridge", "vmbr0"), cores=a.get("cores", size["cores"]),
                           memory=a.get("memory_mib", size["memory"]), user=user,
                           ssh_key=a.get("ssh_public_key", ""), desktop=desktop, onboot=bool(a.get("start_at_boot")),
-                          seed="pending" if desktop else "",  # (the desktop's disc is made when it is created)
+                          seed="pending",  # (the setup disc is made when it is created)
                           host_cpu=bool(a.get("host_cpu", size["host_cpu"])))
     return node, p, disk
 
 
 def _seed_storage(ctx: Context, node: str) -> str:
-    """Where the desktop's setup disc goes: the first storage that takes ISO images."""
+    """Where the setup disc goes: the first storage that takes ISO images."""
     found = next((s["storage"] for s in (ctx.admin or ctx.pve).storages(node, content="iso")), "")
     if not found:
-        raise ToolError(f"No storage on {node} takes ISO images, which the desktop's setup disc needs.")
+        raise ToolError(f"No storage on {node} takes ISO images, which the setup disc needs.")
     return found
 
 
@@ -792,15 +792,16 @@ def _cloud_vm_words(ctx: Context, a: dict):
              f"User '{user}', with the password you type below (Claude does not see it)" +
              (" and an SSH key" if a.get("ssh_public_key") else "")]
     if desktop:
-        lines += [f"On the first start it installs Ubuntu Desktop and the QEMU guest agent" +
-                  (", and turns on Ubuntu's own Remote Desktop (RDP, with that user and password)"
-                   if a.get("remote_desktop") else "") + (", with the dark theme" if a.get("dark_theme") else "") +
-                  ", then restarts by itself",
-                  f"From a setup disc on {_seed_storage(ctx, node)} (the password as a hash" +
-                  ("; for Remote Desktop the password itself too" if a.get("remote_desktop") else "") +
-                  "), deleted by the app once the agent answers"]
+        lines.append("On the first start it installs Ubuntu Desktop and the QEMU guest agent" +
+                     (", and turns on Ubuntu's own Remote Desktop (RDP, with that user and password)"
+                      if a.get("remote_desktop") else "") + (", with the dark theme" if a.get("dark_theme") else "") +
+                     ", then restarts by itself")
     else:
-        lines.append("Ready about a minute after it starts")
+        lines.append("On the first start it installs the updates and the QEMU guest agent (2–5 minutes; it restarts "
+                     "once if an update needs it)")
+    lines.append(f"From a setup disc on {_seed_storage(ctx, node)} (the password as a hash" +
+                 ("; for Remote Desktop the password itself too" if a.get("remote_desktop") else "") +
+                 "), deleted by the app once the agent answers")
     return f"Create VM {p['vmid']} ({p['name']}) — Ubuntu {'Desktop' if desktop else 'Server'} — on {node}", lines
 
 
@@ -808,24 +809,18 @@ def _cloud_vm(ctx: Context, a: dict):
     node, p, disk = _cloud_vm_params(ctx, a)
     vmid, desktop, rdp = p["vmid"], a.get("edition") == "desktop", bool(a.get("remote_desktop"))
     user = a.get("username", "user")
-    volid = ""
-    if desktop:
-        place = timezones.region(timezones.host_zone(ctx.admin or ctx.pve, node))
-        seed = cloudseed.seed_files(vm_name=p["name"], vmid=vmid, user=user, password=ctx.secret,
-                                    ssh_keys=[a.get("ssh_public_key", "")], remote_desktop=rdp,
-                                    dark=bool(a.get("dark_theme")), time_zone=place["iana"],
-                                    keyboard=place["keyboard"])
-        volid = setupdisc.upload(ctx.pve, node, _seed_storage(ctx, node), vmid, seed, cloudseed.SEED_LABEL)
-        p["ide2"] = f"{volid},media=cdrom"
-    elif ctx.secret:
-        p["cipassword"] = ctx.secret  # (Proxmox keeps only a hash of it)
+    place = timezones.region(timezones.host_zone(ctx.admin or ctx.pve, node))
+    seed = cloudseed.seed_files(vm_name=p["name"], vmid=vmid, user=user, password=ctx.secret,
+                                ssh_keys=[a.get("ssh_public_key", "")], desktop=desktop, remote_desktop=rdp,
+                                dark=bool(a.get("dark_theme")), time_zone=place["iana"], keyboard=place["keyboard"])
+    volid = setupdisc.upload(ctx.pve, node, _seed_storage(ctx, node), vmid, seed, cloudseed.SEED_LABEL)
+    p["ide2"] = f"{volid},media=cdrom"
     try:
         made = finish(ctx, node, ctx.pve.create_vm(node, p), wait=WAIT_S * 3)
     except Exception:
-        if volid:
-            setupdisc.delete(ctx.admin or ctx.pve, node, volid)  # (deleting an ISO needs the user's token)
+        setupdisc.delete(ctx.admin or ctx.pve, node, volid)  # (deleting an ISO needs the user's token)
         raise
-    if volid and ctx.remember is not None:
+    if ctx.remember is not None:
         ctx.remember(setupdisc.entry(ctx.host.id, node, vmid, volid, "ide2", True))
     out = {"vmid": vmid, "name": p["name"], "node": node, "user": user,
            "password": "set by the user (not shown to you)" if ctx.secret else "none", **made}
@@ -849,10 +844,10 @@ def _cloud_vm(ctx: Context, a: dict):
                               "and sign in with the user and its password, then once more at the Ubuntu login screen. "
                               "Sound comes over it too (in Remmina: Audio output mode Local).")
     else:
-        next_steps = ["It boots in about a minute; cloud-init sets the user, the password and the network on the first "
-                      "start. Its console (console_screenshot) shows the address it got.",
-                      "qemu-guest-agent is not in Ubuntu's cloud image: install it (sudo apt install -y "
-                      "qemu-guest-agent) so its address shows in Proxmox Controller and Commands can work."]
+        next_steps = ["On the first start cloud-init sets the user and the network, then installs the updates and the "
+                      "QEMU guest agent — 2 to 5 minutes; it restarts once if an update needs it. The app deletes the "
+                      "setup disc once the agent answers; its address then shows in Proxmox Controller, and Commands "
+                      "work."]
     out["next_steps"] = next_steps
     return out
 
@@ -1617,11 +1612,12 @@ def _tools() -> list[Tool]:
              "26.04), once, to make VMs from with create_cloud_vm.",
              {**host, "release": {"type": "string", "enum": list(CLOUD_IMAGES)}, "storage": {"type": "string"},
               "node": {"type": "string"}}, ("host",), _cloud_image, _cloud_words),
-        Tool("create_cloud_vm", "change", "Create an Ubuntu VM from a cloud image (see get_cloud_image) — ready in "
-             "about a minute, no installer: a user, its password (the USER types it in Proxmox Controller's window; "
-             "you never give or see a password), optionally an SSH public key, network by DHCP. edition 'desktop' "
-             "adds a SPICE display, sound and a USB tablet, and installs Ubuntu Desktop and the QEMU guest agent by "
-             "itself on the first start (from a setup disc the app makes and deletes afterwards); remote_desktop "
+        Tool("create_cloud_vm", "change", "Create an Ubuntu VM from a cloud image (see get_cloud_image) — no "
+             "installer: a user, its password (the USER types it in Proxmox Controller's window; you never give or see "
+             "a password), optionally an SSH public key, network by DHCP. It sets itself up on the first start, from a "
+             "setup disc the app makes and deletes afterwards: the updates and the QEMU guest agent (a server: 2-5 "
+             "minutes). edition 'desktop' adds a SPICE display, sound and a USB tablet, and installs Ubuntu Desktop "
+             "too (10-20 minutes); remote_desktop "
              "turns on Ubuntu's own Remote Desktop (GNOME Remote Desktop: RDP, port 3389, the Ubuntu desktop itself "
              "with its sound) with the same user and password; dark_theme makes the desktop dark.",
              {**host, "name": {"type": "string"}, "image": {"type": "string", "description": "The image's volid."},

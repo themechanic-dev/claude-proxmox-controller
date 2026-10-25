@@ -513,8 +513,8 @@ class CreateVmDialog(_Busy, QDialog):
             self.hint.setText("On the first start it installs the desktop and the guest agent by itself (10–20 "
                               "minutes), then restarts into the login screen. The app then deletes its setup disc.")
         elif cloud:
-            self.hint.setText("Proxmox's cloud-init sets the user, the password (or SSH key) and the network on the "
-                              "first start; it is ready about a minute after.")
+            self.hint.setText("On the first start it installs the updates and the guest agent by itself (2–5 "
+                              "minutes; it restarts once if an update needs it). The app then deletes its setup disc.")
         elif setup:
             self.hint.setText(("Windows 11 gets UEFI with Secure Boot and a TPM 2.0. "
                                if self.profile.currentData() == "win11" else "") +
@@ -727,8 +727,8 @@ class CreateVmDialog(_Busy, QDialog):
                         "Give the user a password, or an SSH key to sign in with.")
             if password and any(ord(c) < 32 for c in password):
                 return "The password cannot hold control characters."
-            if self.desktop() and not self.iso_storages:
-                return "No storage on this host takes ISO images, which the desktop's setup disc needs."
+            if not self.iso_storages:
+                return "No storage on this host takes ISO images, which the setup disc needs."
         if (self.windows_setup() or self.from_cloud.isChecked()) and password != again:
             return "The two passwords are not the same."
         return ""
@@ -825,8 +825,9 @@ class CreateVmDialog(_Busy, QDialog):
         return job
 
     def _cloud_job(self, pve: Pve, node: str, vmid: int, name: str) -> Callable[[], tuple]:
-        """Ubuntu from its cloud image: Server with Proxmox's cloud-init drive, Desktop with the app's setup disc."""
-        desktop, rdp, dark = self.desktop(), self.rdp.isChecked(), self.dark.isChecked()
+        """Ubuntu from its cloud image, set up by the app's setup disc (Server and Desktop alike)."""
+        desktop = self.desktop()
+        rdp, dark = desktop and self.rdp.isChecked(), desktop and self.dark.isChecked()
         user, password, key = self.user.text(), self.password.text(), self.ssh_key.text().strip()
         disk, start = self.disk.value(), self.start.isChecked()
         params = {**cloudvm.vm_params(vmid=vmid, name=name, image=cloudvm.find_image(self.cloud_images,
@@ -834,31 +835,26 @@ class CreateVmDialog(_Busy, QDialog):
                                       storage=self.storage.currentData(),
                                       bridge=self.bridge.currentText().strip() or "vmbr0", cores=self.cores.value(),
                                       memory=self.memory.value(), user=user, ssh_key=key, desktop=desktop,
-                                      onboot=self.onboot.isChecked(), seed="pending" if desktop else "",
+                                      onboot=self.onboot.isChecked(), seed="pending",
                                       host_cpu=self.host_cpu.isChecked()),
                   **self.startup.params()}
         seed_storage = self.iso_storages[0] if self.iso_storages else ""
         self.done_text = (f"Created VM {vmid} ({name}) — " +
                           ("Ubuntu Desktop installs itself on the first start (10–20 minutes)" if desktop else
-                           "Ubuntu Server is ready about a minute after it starts"))
+                           "Ubuntu Server sets itself up on the first start (2–5 minutes)"))
 
         def job():
-            disc = None
-            if desktop:
-                place = timezones.region(timezones.host_zone(pve, node))
-                files = cloudseed.seed_files(vm_name=name, vmid=vmid, user=user, password=password, ssh_keys=[key],
-                                             remote_desktop=rdp, dark=dark, time_zone=place["iana"],
-                                             keyboard=place["keyboard"])
-                volid = setupdisc.upload(pve, node, seed_storage, vmid, files, cloudseed.SEED_LABEL)
-                params["ide2"] = f"{volid},media=cdrom"
-                disc = setupdisc.entry("", node, vmid, volid, "ide2", True)
-            elif password:
-                params["cipassword"] = password  # (Proxmox keeps only a hash of it)
+            place = timezones.region(timezones.host_zone(pve, node))
+            files = cloudseed.seed_files(vm_name=name, vmid=vmid, user=user, password=password, ssh_keys=[key],
+                                         desktop=desktop, remote_desktop=rdp, dark=dark, time_zone=place["iana"],
+                                         keyboard=place["keyboard"])
+            volid = setupdisc.upload(pve, node, seed_storage, vmid, files, cloudseed.SEED_LABEL)
+            params["ide2"] = f"{volid},media=cdrom"
+            disc = setupdisc.entry("", node, vmid, volid, "ide2", True)
             try:
                 pve.wait_task(node, pve.create_vm(node, params), timeout=1800)  # (the image is copied first)
             except Exception:
-                if disc is not None:
-                    setupdisc.delete(pve, node, disc["volid"])
+                setupdisc.delete(pve, node, volid)
                 raise
             if disk > 3:  # the image's own disk is ~3.5 GB
                 pve.put(f"/nodes/{q(node)}/qemu/{int(vmid)}/resize", disk="scsi0", size=f"{disk}G")

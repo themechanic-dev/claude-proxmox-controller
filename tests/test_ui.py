@@ -28,8 +28,8 @@ if QApplication is not None:
     from proxmox_controller.core.pve import Host, PveError
     from proxmox_controller import app as app_module
     import threading
-    from proxmox_controller.core import (claude_access, claude_policy, connector_link, connector_log, setupdisc,
-                                         sounds, screen as screen_core, ssh as ssh_core, vault)
+    from proxmox_controller.core import (claude_access, claude_policy, cloudseed, connector_link, connector_log,
+                                         setupdisc, sounds, screen as screen_core, ssh as ssh_core, vault)
     from proxmox_controller.ui import (backup_jobs, backups, bulk, claude_window, connector, console, geometry,
                                        agent_setup, files_window, graph_wall, guest_dialogs, hazard, host_dialog,
                                        host_shell, host_view, main_window, tasks_panel, theme, vault_dialogs,
@@ -1311,9 +1311,12 @@ class VmDialogTest(UiCase):
         dlg.create()
         self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
         cfg, g = self.cluster().guests[103]["cfg"], self.cluster().guests[103]
-        self.assertEqual((cfg["ciuser"], cfg["ide2"], self.cluster().secrets[103], g["disk_gb"], g["status"]),
-                         ("user", "local-lvm:cloudinit", "srv-pw", 20, "running"))
-        self.assertEqual(kept, [])  # Proxmox's own cloud-init: no disc of the app's
+        self.assertEqual((g["disk_gb"], g["status"]), (20, "running"))
+        self.assertNotIn("ciuser", cfg)  # a server too sets itself up from the app's disc (25/10)
+        self.assertEqual((len(kept), kept[0]["volid"]), (1, cfg["ide2"].split(",")[0]))
+        srv = test_core_read_iso(self.cluster().files[kept[0]["volid"].split("/")[1]])
+        self.assertIn(b"installing the updates and the QEMU guest agent", srv["user-data"])
+        self.assertNotIn(b"srv-pw", srv["user-data"])
         desk = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"], remember=kept.append)
         self.assertTrue(wait_until(lambda: desk.isEnabled() and desk.iso.count()))
         desk.from_cloud.setChecked(True)
@@ -1336,7 +1339,7 @@ class VmDialogTest(UiCase):
         self.assertTrue(wait_until(lambda: desk.result() == desk.DialogCode.Accepted))
         cfg = self.cluster().guests[104]["cfg"]
         disc = cfg["ide2"].split(",")[0]
-        self.assertEqual((kept[0]["volid"], kept[0]["drive"], self.cluster().guests[104]["disk_gb"]),
+        self.assertEqual((kept[-1]["volid"], kept[-1]["drive"], self.cluster().guests[104]["disk_gb"]),
                          (disc, "ide2", 32))
         self.assertNotIn("ciuser", cfg)
         self.assertEqual((cfg["cpu"], str(cfg["cores"])), ("host", "4"))
@@ -2809,7 +2812,10 @@ class ConnectorTest(UiCase):
         self.assertTrue(wait_until(lambda: "answer" in box, 10))
         self.assertFalse(box["answer"]["result"]["isError"], self.text(box))
         vmid = json.loads(self.text(box))["vmid"]
-        self.assertEqual(self.admin.cluster.secrets[vmid], "s3cret pass")
+        disc = self.admin.cluster.guests[vmid]["cfg"]["ide2"].split(",")[0]
+        data = test_core_read_iso(self.admin.cluster.files[disc.split("/")[1]])["user-data"].decode()
+        salted = json.loads(data.split("\n", 1)[1])["password"]
+        self.assertEqual(salted, cloudseed.sha512_crypt("s3cret pass", salted.split("$")[2]))  # it reached the VM
         self.assertNotIn("s3cret", json.dumps(box["answer"]))  # Claude is told only that it was set
         self.assertNotIn("s3cret", connector_log.path().read_text())  # nor is it in the log
         self.assertEqual(self.admin.cluster.guests[vmid]["status"], "running")  # its start lent Power for a moment

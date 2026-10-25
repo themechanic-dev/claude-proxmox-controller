@@ -1,9 +1,9 @@
-"""A VM from Ubuntu's official cloud image — ready in about a minute, no installer. Shared by the New VM window and
-the connector (get_cloud_image, create_cloud_vm).
+"""A VM from Ubuntu's official cloud image — no installer. Shared by the New VM window and the connector
+(get_cloud_image, create_cloud_vm).
 
-Ubuntu Server: Proxmox's own cloud-init drive sets the user, its password, SSH keys and the network. Ubuntu Desktop:
-the app's setup disc instead (core/cloudseed.py), which also installs the desktop, the QEMU guest agent and, if asked,
-Remote Desktop on the first start."""
+The app's setup disc (core/cloudseed.py) sets the user, its password, SSH keys and the network, and installs the
+updates and the QEMU guest agent on the first start — for the desktop also the desktop itself and, if asked, Remote
+Desktop. (vm_params can still give a VM Proxmox's own cloud-init drive instead, without a seed.)"""
 
 from __future__ import annotations
 

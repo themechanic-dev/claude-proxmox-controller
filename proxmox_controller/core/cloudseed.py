@@ -1,11 +1,12 @@
-"""An Ubuntu desktop VM that sets itself up: the cloud-init disc ("cidata") the app makes for a VM from Ubuntu's cloud
-image when Proxmox's own cloud-init drive is not enough.
+"""An Ubuntu VM that sets itself up: the cloud-init disc ("cidata") the app makes for a VM from Ubuntu's cloud image,
+in place of Proxmox's own cloud-init drive.
 
-Proxmox's drive sets the user, the password, SSH keys and the network — that is all an Ubuntu Server VM needs, and
-the app keeps using it there. A desktop needs packages installed on the first start (the desktop itself, the QEMU
-guest agent), which Proxmox's drive cannot ask for (only a "snippet" file on the host could, and the API cannot write
-one). So for the desktop edition the app writes the whole cloud-init configuration itself, onto a small disc of its
-own (core/isofs.py), with the same user settings Proxmox would write.
+Proxmox's drive sets the user, the password, SSH keys and the network, but it cannot install packages (only a
+"snippet" file on the host could ask for them, and the API cannot write one) — and both editions need some on the
+first start: the QEMU guest agent (without it the app shows no address, and Commands and Files cannot work), and for
+the desktop the desktop itself. So the app writes the whole cloud-init configuration itself, onto a small disc of its
+own (core/isofs.py), with the same user settings Proxmox would write. A server too since 25/10 (the user's choice): it
+then sets itself up in a few minutes instead of one, and Proxmox's Cloud-Init tab no longer manages it.
 
 The user's password goes into that configuration only as a SHA-512 crypt hash (made here: Python no longer has the
 crypt module), and the disc is taken away once the VM is set up (core/setupdisc.py).
@@ -54,9 +55,15 @@ NETWORK_CONFIG = {"version": 2, "ethernets": {"ens18": {"dhcp4": True, "dhcp6": 
 # (dhcp-identifier is networkd's only): measured 24/10, the same address, booted in 10 s.
 NETWORK_HANDOVER = ("grep -rqs 'renderer: NetworkManager' /usr/lib/netplan /etc/netplan && systemctl disable "
                     "systemd-networkd.service systemd-networkd.socket systemd-networkd-wait-online.service; true")
-SETUP_MESSAGE = ("Proxmox Controller is setting up this VM in the background: installing Ubuntu Desktop (10-20 min).\n"
-                 "It restarts into the desktop by itself.\n"
-                 "Please do not sign in here or turn it off.\n\n")
+SETUP_MESSAGES = {
+    "desktop": "Proxmox Controller is setting up this VM in the background: installing Ubuntu Desktop (10-20 min).\n"
+               "It restarts into the desktop by itself.\n"
+               "Please do not sign in here or turn it off.\n\n",
+    "server": "Proxmox Controller is setting up this VM in the background: installing the updates and the QEMU guest "
+              "agent (2-5 min).\n"
+              "It restarts by itself if an update needs it.\n"
+              "Please do not sign in here or turn it off.\n\n"}
+REBOOT_REQUIRED = "/var/run/reboot-required"  # (left by an update that needs a restart, such as a new kernel)
 
 
 def sha512_crypt(password: str, salt: str | None = None, rounds: int = 5000) -> str:
@@ -150,26 +157,23 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], de
     keys = [k.strip() for k in ssh_keys if k.strip()]
     if keys:
         cfg["ssh_authorized_keys"] = keys
-    if desktop:
-        # The guest agent waits for the restart: its package starts it at once, minutes before the desktop is in (the
-        # app reads an answering agent as "set up", and the address it shows changes with the restart). A runtime mask
-        # ends with that restart by itself; once per VM, as the disc may still be there at the next boot.
-        cfg["bootcmd"] = [["cloud-init-per", "instance", "pvc-agent-later", "systemctl", "mask", "--runtime",
-                           "qemu-guest-agent.service"]]
+    # The guest agent waits for the end: its package starts it at once, minutes before the desktop is in (the app reads
+    # an answering agent as "set up", and the address it shows changes with the restart). A runtime mask ends with a
+    # restart by itself; once per VM, as the disc may still be there at the next boot.
+    cfg["bootcmd"] = [["cloud-init-per", "instance", "pvc-agent-later", "systemctl", "mask", "--runtime",
+                       "qemu-guest-agent.service"]]
     if remote_desktop:
         fetch, rdp = _rdp_commands(host, user)
         cfg["bootcmd"] = cfg.get("bootcmd", []) + fetch
         cfg["runcmd"] += rdp
-    files = []
-    if desktop:
-        files.append({"path": SETUP_ISSUE, "content": SETUP_MESSAGE, "permissions": "0644"})
+    files = [{"path": SETUP_ISSUE, "content": SETUP_MESSAGES["desktop" if desktop else "server"],
+              "permissions": "0644"}]
     if dark:
         files += [{"path": "/etc/dconf/profile/user", "content": DCONF_PROFILE, "permissions": "0644"},
                   {"path": "/etc/dconf/db/local.d/00-proxmox-controller", "content": DARK_DEFAULTS,
                    "permissions": "0644"}]
         cfg["runcmd"].append(["dconf", "update"])
-    if files:
-        cfg["write_files"] = files
+    cfg["write_files"] = files
     if desktop:
         # No "Welcome" on the first sign-in, it is all set already: gnome-initial-setup-done skips the one for a new
         # user, and on Ubuntu 26.04 it then shows the one for an upgraded user unless upgrade-<release>-done is there
@@ -181,12 +185,15 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], de
                               f". /etc/os-release && mkdir -p {home}/.config/gnome-initial-setup && "
                               f"printf yes > {home}/.config/gnome-initial-setup-done && "
                               f"touch {home}/.config/gnome-initial-setup/upgrade-$VERSION_ID-done"])
-        cfg["runcmd"].append(["rm", "-f", SETUP_ISSUE])
-        # the login screen starts with the next boot, once everything is in
+    cfg["runcmd"].append(["rm", "-f", SETUP_ISSUE])
+    if desktop:  # the login screen starts with the next boot, once everything is in
         cfg["power_state"] = {"mode": "reboot", "condition": True, "timeout": 120,
                               "message": "Proxmox Controller: the desktop is installed, restarting"}
-    else:
-        cfg["runcmd"].append(["systemctl", "start", "qemu-guest-agent"])  # (a desktop has it after its restart)
+    else:  # a server restarts only for an update that needs it (a new kernel); else its agent starts now
+        cfg["runcmd"].append(["sh", "-c", f"[ -e {REBOOT_REQUIRED} ] || {{ systemctl unmask --runtime "
+                              "qemu-guest-agent.service; systemctl start qemu-guest-agent.service; }"])
+        cfg["power_state"] = {"mode": "reboot", "condition": ["test", "-e", REBOOT_REQUIRED], "timeout": 60,
+                              "message": "Proxmox Controller: the updates are installed, restarting"}
     return "#cloud-config\n" + json.dumps(cfg, indent=2) + "\n"
 
 
@@ -196,10 +203,11 @@ def meta_data(vm_name: str, vmid: int) -> str:
                        "local-hostname": hostname_of(vm_name)}) + "\n"
 
 
-def seed_files(*, vm_name: str, vmid: int, user: str, password: str, ssh_keys: list[str], remote_desktop: bool = False,
-               dark: bool = False, time_zone: str = "", keyboard: str = "") -> dict[str, bytes]:
-    """The setup disc's files for an Ubuntu Desktop VM."""
-    files = {"user-data": user_data(vm_name=vm_name, user=user, password=password, ssh_keys=ssh_keys,
+def seed_files(*, vm_name: str, vmid: int, user: str, password: str, ssh_keys: list[str], desktop: bool = True,
+               remote_desktop: bool = False, dark: bool = False, time_zone: str = "",
+               keyboard: str = "") -> dict[str, bytes]:
+    """The setup disc's files for an Ubuntu VM."""
+    files = {"user-data": user_data(vm_name=vm_name, user=user, password=password, ssh_keys=ssh_keys, desktop=desktop,
                                     remote_desktop=remote_desktop, dark=dark, time_zone=time_zone,
                                     keyboard=keyboard).encode(),
              "meta-data": meta_data(vm_name, vmid).encode(),

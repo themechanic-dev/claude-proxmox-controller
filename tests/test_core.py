@@ -1292,11 +1292,19 @@ class ConnectorToolsTest(unittest.TestCase):
                              ssh_public_key="ssh-ed25519 AAAA me@pc", reason="r")
         vmid = made["vmid"]
         self.assertNotIn("my pass", json.dumps(made))  # never handed back to Claude
-        self.assertEqual(self.cluster.secrets[vmid], "my pass")  # it reached Proxmox
+        self.assertNotIn(vmid, self.cluster.secrets)  # not through Proxmox's cloud-init drive any more
         cfg = self.pve.guest_config("pve", "qemu", vmid)
-        self.assertEqual((cfg["cipassword"], cfg["ciuser"], cfg["ide2"], cfg["ipconfig0"]),
-                         ("**********", "user", "local-lvm:cloudinit", "ip=dhcp"))
-        self.assertEqual(cfg["sshkeys"], "ssh-ed25519%20AAAA%20me%40pc")  # URL-encoded, as Proxmox wants
+        self.assertNotIn("ciuser", cfg)
+        disc = cfg["ide2"].split(",")[0]
+        self.assertRegex(disc, r"^local:iso/pvc-setup-\d+-[0-9a-f]{6}\.iso$")  # the app's setup disc, a server too
+        _, files = read_iso(self.cluster.files[disc.split("/")[1]], joliet=True)
+        self.assertNotIn(b"my pass", files["user-data"])
+        data = json.loads(files["user-data"].decode().split("\n", 1)[1])
+        self.assertEqual(data["password"], cloudseed.sha512_crypt("my pass", data["password"].split("$")[2]))
+        self.assertEqual((data["ssh_authorized_keys"], data["packages"]), (["ssh-ed25519 AAAA me@pc"],
+                                                                          ["qemu-guest-agent"]))
+        self.assertNotIn("rdp-password", files)
+        self.assertIn("installs the updates and the QEMU guest agent", " ".join(made["next_steps"]))
         self.assertIn(f"import-from={image}", cfg["scsi0"])
         self.assertEqual((self.cluster.guests[vmid]["disk_gb"], self.status(vmid)), (20, "running"))
         self.assertNotIn("tablet", cfg)  # the server edition: the default display, which keeps Proxmox's tablet
@@ -3062,13 +3070,32 @@ class CloudSeedTest(unittest.TestCase):
         self.assertEqual(len(cfg["bootcmd"]), 1)  # the agent's mask alone
         self.assertEqual([f["path"] for f in cfg["write_files"]], [cloudseed.SETUP_ISSUE])
         self.assertEqual(cfg["runcmd"][-1], ["rm", "-f", cloudseed.SETUP_ISSUE])
-        server = self.config(desktop=False)
-        self.assertNotIn("power_state", server)
-        self.assertNotIn("write_files", server)
-        self.assertNotIn("bootcmd", server)
-        self.assertEqual(server["runcmd"], [["systemctl", "start", "qemu-guest-agent"]])
         with self.assertRaises(ValueError):
             cloudseed.user_data(vm_name="d", user="u", password="", ssh_keys=[], remote_desktop=True)
+
+    def test_server(self):
+        """A server sets itself up too (25/10): the updates and the guest agent, nothing of the desktop's."""
+        server = self.config(desktop=False)
+        self.assertEqual(server["packages"], ["qemu-guest-agent"])
+        self.assertTrue(server["package_upgrade"])
+        self.assertEqual(len(server["bootcmd"]), 1)  # the agent waits for the end here too
+        self.assertIn("installing the updates and the QEMU guest agent", server["write_files"][0]["content"])
+        self.assertEqual(len(server["write_files"]), 1)  # no dark theme
+        run = server["runcmd"]
+        self.assertEqual(run[0], ["rm", "-f", cloudseed.SETUP_ISSUE])
+        # the agent now, unless an update needs a restart — then it comes with the restart
+        self.assertEqual(run[-1], ["sh", "-c", "[ -e /var/run/reboot-required ] || { systemctl unmask --runtime "
+                                   "qemu-guest-agent.service; systemctl start qemu-guest-agent.service; }"])
+        self.assertEqual(server["power_state"]["condition"], ["test", "-e", "/var/run/reboot-required"])
+        dumped = json.dumps(server)
+        for desktop_only in ("gnome-initial-setup", "NetworkManager", "dconf", "grdctl"):
+            self.assertNotIn(desktop_only, dumped)
+        files = cloudseed.seed_files(vm_name="srv", vmid=7, user="u", password="", ssh_keys=["ssh-ed25519 K"],
+                                     desktop=False)
+        self.assertIn("network-config", files)  # the same address after a restart, a server too
+        self.assertNotIn(b'"password"', files["user-data"])  # an SSH key alone: no password at all
+
+    def test_meta_data(self):
         one, two = (json.loads(cloudseed.meta_data("desk.lan", 120)) for _ in range(2))
         self.assertNotEqual(one["instance-id"], two["instance-id"])
         self.assertEqual(one["local-hostname"], "desk")
