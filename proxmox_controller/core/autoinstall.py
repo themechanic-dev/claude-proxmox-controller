@@ -20,7 +20,7 @@ import time
 from . import cloudseed, screen, store
 from .pve import Pve
 
-# the live-server ISOs from 24.04 on (the release that asks the question; 26.04 measured, 24.04 not yet)
+# the live-server ISOs from 24.04 on (the releases that ask the question: 24.04.3 and 26.04 measured, 26/10)
 ISO = re.compile(r"ubuntu-(\d\d)\.\d\d(\.\d+)?-live-server-amd64[^/]*\.iso$", re.IGNORECASE)
 ANSWER = ("y", "e", "s", "enter")
 QUESTION_WAIT_S = 900  # it came ~2½ minutes after the start on the user's host
