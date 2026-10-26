@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QLineEdit, QVBoxLayo
 from ..core import guestfiles, screen
 from ..core.pve import Pve, PveError, agent_enabled
 from . import theme
-from .widgets import DialogHead, button, card, error, guest_card, label
+from .widgets import DialogHead, button, card, error, fit_to_width, guest_card, label
 
 VIRTIO_URL = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 LINUX_COMMAND = ("sudo sh -c 'if command -v apt-get >/dev/null; then apt-get install -y qemu-guest-agent; "
@@ -34,6 +34,8 @@ CD_KEYS = [f"ide{i}" for i in range(4)] + [f"sata{i}" for i in range(6)] + [f"sc
 WAIT_S = 300
 POLL_S = 5.0
 START_WAIT_S = 45.0  # after a restart for a new CD drive: Windows signs in before the installer is typed
+PICTURE_H = 200  # the console's picture, scaled into this height: the window fits a 768-pixel screen (~730)
+WIDTH = 660
 PENDING, RUNNING, DONE, FAILED, SKIPPED = "○", "…", "✓", "✗", "—"
 
 
@@ -72,7 +74,8 @@ class AgentSetupDialog(QDialog):
         lay.addWidget(holder)
         self.picture = QLabel()
         self.picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.picture.setMinimumHeight(200)
+        self.picture.setFixedHeight(PICTURE_H)  # (the screen scaled into it: it never runs over what is below)
+        self.shot = QPixmap()
         self.picture.setStyleSheet(f"border: 1px solid {theme.colors().border};")
         self.picture.setToolTip("The VM's screen, every few seconds")
         lay.addWidget(self.picture)
@@ -111,7 +114,7 @@ class AgentSetupDialog(QDialog):
         for w in (self.password, self.type_password, self.yes_btn, self.restart_btn):
             w.hide()
         self.install_btn.setEnabled(False)
-        self.setMinimumWidth(660)
+        self.setMinimumWidth(WIDTH)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh_picture)
         self.timer.start(3000)
@@ -150,11 +153,14 @@ class AgentSetupDialog(QDialog):
             lbl = label(f"{PENDING}  {t}", wrap=True)
             self.steps.append(lbl)
             self.steps_box.addWidget(lbl)
+            lbl.show()  # (now: a widget added to an open window shows only later, and the height is measured now)
+        fit_to_width(self, WIDTH)  # taller now — not squeezed, nothing over the picture (the live test of 26/10)
         if self.agent_was_on:
             self._mark(0, SKIPPED, "already on")
         if answers:
             for i in range(len(self.steps)):
                 self._mark(i, DONE)
+            self.need.hide()
             self.status.setText("✓ The agent already answers — nothing to install.")
             return
         self.install_btn.setEnabled(True)
@@ -166,7 +172,7 @@ class AgentSetupDialog(QDialog):
         self.steps[i].setText(f"{sign}  {text}" + (f"  ({note})" if note else ""))
 
     def _refresh_picture(self) -> None:
-        if not self.isVisible() and self.picture.pixmap() is not None and not self.picture.pixmap().isNull():
+        if not self.isVisible() and not self.shot.isNull():
             return
         pve = self.client()
 
@@ -176,11 +182,24 @@ class AgentSetupDialog(QDialog):
 
         def show(png, err):
             if err is None and png:
-                pm = QPixmap()
-                pm.loadFromData(png)
-                self.picture.setPixmap(pm)
+                self.shot.loadFromData(png)
+                self._fit_picture()
 
         self.runner.run(grab, show)
+
+    def _fit_picture(self) -> None:
+        """The last picture, as large as the box allows, its proportions kept."""
+        if self.shot.isNull():
+            return
+        box = self.picture.contentsRect().size()
+        w, h = max(1, box.width() - 2), max(1, box.height() - 2)
+        self.picture.setPixmap(self.shot.scaled(min(w, self.shot.width()), min(h, self.shot.height()),
+                                                Qt.AspectRatioMode.KeepAspectRatio,
+                                                Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        self._fit_picture()
 
     def _opener(self):
         pve = self.client()
@@ -338,8 +357,8 @@ class AgentSetupDialog(QDialog):
                                           "did the installation finish? (press Install again to retry)")
                 return
             self._mark(last, DONE)
-            for w in (self.password, self.type_password, self.yes_btn, self.restart_btn):
-                w.hide()
+            for w in (self.password, self.type_password, self.yes_btn, self.restart_btn, self.need):
+                w.hide()  # (what the console must show is past: the agent answers)
             self.status.setText("✓ The agent answers. Files, the VM's addresses and commands work now.")
 
         self.runner.run(wait, done)

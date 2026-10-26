@@ -1021,6 +1021,26 @@ class AgentSetupTest(UiCase):
         self.cluster().guests[201]["agent_down"] = False
         self.assertTrue(wait_until(lambda: dlg.status.text().startswith("✓"), 10))
         self.assertTrue(all(s.text()[0] in "✓—" for s in dlg.steps))
+        self.assertFalse(dlg.need.isVisibleTo(dlg))  # what the console must show is past
+
+    def test_nothing_squeezed_over_the_picture(self):
+        """26/10, the live test on Windows: the steps came after the window opened, it stayed as tall as before, and
+        the note under the console's picture lay over it."""
+        g = self.cluster().guests[200]
+        g.update(status="running", agent=1, agent_down=True)
+        g.setdefault("extra", {}).update(ostype="win11")
+        dlg = agent_setup.AgentSetupDialog(None, self.client, self.runner, self.guest(200))
+        self.addCleanup(dlg.close)
+        dlg.show()
+        self.assertTrue(wait_until(lambda: dlg.install_btn.isEnabled() and not dlg.shot.isNull()))
+        QApplication.processEvents()
+        lay = dlg.layout()
+        self.assertGreaterEqual(dlg.height(), lay.totalHeightForWidth(dlg.width()) if lay.hasHeightForWidth()
+                                else lay.minimumSize().height())
+        self.assertLessEqual(dlg.picture.geometry().bottom(), dlg.need.geometry().top())  # one under the other
+        pm = dlg.picture.pixmap()
+        self.assertLessEqual((pm.width(), pm.height()), (dlg.picture.width(), dlg.picture.height()))
+        self.assertTrue(dlg.need.isVisibleTo(dlg))  # (before the install: it says what the console must show)
 
     def test_linux_with_the_agent_off_restarts_once(self):
         self.cluster().guests[201]["agent"] = 0
