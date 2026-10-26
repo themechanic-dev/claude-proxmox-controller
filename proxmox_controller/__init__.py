@@ -2,4 +2,4 @@
 
 APP_ID = "store.themechanic.ProxmoxController"
 APP_NAME = "Proxmox Controller"
-VERSION = "0.1.0"
+VERSION = "1.0.0"

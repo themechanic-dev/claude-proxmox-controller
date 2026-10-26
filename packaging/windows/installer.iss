@@ -11,6 +11,10 @@
 #endif
 #define AppExe "Proxmox Controller.exe"
 #define BridgeExe "proxmox-controller-mcp.exe"
+; virt-viewer, the SPICE console the app opens (sound, clipboard, USB): downloaded while installing when it is not
+; on the computer yet, checked against this SHA-256 (measured 26/10 on virt-manager's official 11.0 release, 84 MB)
+#define ViewerUrl "https://gitlab.com/virt-viewer/virt-viewer/-/releases/v11.0/downloads/virt-viewer-x64-11.0-1.0.msi"
+#define ViewerSha256 "b7de0474e97fe1e81101f2406fcf603fe08666bcb3816c3c465c8d64330be610"
 
 [Setup]
 ; The same AppId for every version: an install replaces the one before it.
@@ -46,6 +50,7 @@ BeveledLabel=HOME LAB · by the mechanic
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "virtviewer"; Description: "Install virt-viewer, the SPICE console — sound, clipboard and USB (downloads 84 MB from virt-manager's site; Windows asks for an administrator)"; GroupDescription: "SPICE console:"; Check: not ViewerInstalled
 
 [Files]
 Source: "..\..\dist\pyinstaller\{#AppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -59,6 +64,63 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: "
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+var
+  DownloadPage: TDownloadWizardPage;
+
+function ViewerInstalled(): Boolean;
+var
+  Found: TFindRec;
+begin
+  { where its installer puts it: C:\Program Files\VirtViewer v11.0-256\ (the app looks there too) }
+  Result := FindFirst(ExpandConstant('{commonpf64}\VirtViewer*'), Found);
+  if Result then
+    FindClose(Found);
+end;
+
+function OnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
+begin
+  Result := True;
+end;
+
+procedure InitializeWizard;
+begin
+  DownloadPage := CreateDownloadPage('Downloading virt-viewer', 'The SPICE console, from virt-manager''s site.', @OnDownloadProgress);
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (CurPageID = wpReady) and WizardIsTaskSelected('virtviewer') and not ViewerInstalled() then
+  begin
+    DownloadPage.Clear;
+    DownloadPage.Add('{#ViewerUrl}', 'virt-viewer.msi', '{#ViewerSha256}');
+    DownloadPage.Show;
+    try
+      try
+        DownloadPage.Download;  { the checksum is checked as it comes: a cut or altered file is refused }
+      except
+        if not DownloadPage.AbortedByUser then
+          SuppressibleMsgBox('virt-viewer could not be downloaded (' + GetExceptionMessage + ').' + #13#10 +
+                             'Proxmox Controller installs anyway; its built-in console works without it.',
+                             mbInformation, MB_OK, IDOK);
+      end;
+    finally
+      DownloadPage.Hide;
+    end;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+  Msi: String;
+begin
+  Msi := ExpandConstant('{tmp}\virt-viewer.msi');
+  if (CurStep = ssPostInstall) and FileExists(Msi) then
+    { its own installer, for all users: Windows asks for an administrator }
+    ShellExec('runas', 'msiexec.exe', '/i "' + Msi + '" /passive /norestart', '', SW_SHOW, ewWaitUntilTerminated, Code);
+end;
+
 procedure StopRunning();
 var
   Code: Integer;

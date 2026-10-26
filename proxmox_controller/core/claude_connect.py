@@ -27,8 +27,10 @@ MCP_EXE = "proxmox-controller-mcp.exe"  # the Windows build's console program: t
 
 def bridge_command() -> list[str]:
     """The program (and its first arguments) that starts the bridge; Claude adds nothing but --mcp."""
-    if getattr(sys, "frozen", False):  # the Windows installer's build: its console program beside the app
-        return [str(Path(sys.executable).with_name(MCP_EXE))]
+    if getattr(sys, "frozen", False):
+        if WINDOWS:  # the Windows installer's build: its console program beside the app
+            return [str(Path(sys.executable).with_name(MCP_EXE))]
+        return [sys.executable]  # the Linux package's build: the same program (no console windows there)
     if WINDOWS:  # the source tree on Windows: its own Python — the console one, not pythonw
         python = Path(sys.executable)
         if python.name.lower() == "pythonw.exe":

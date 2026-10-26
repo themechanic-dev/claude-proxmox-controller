@@ -24,7 +24,7 @@ from unittest import mock
 from proxmox_controller.core import apt, ssh as sshmod
 from proxmox_controller.core import (autostart, claude_access, claude_policy, connector_link, connector_tools, jobs,
                                      mcp, netinfo, screen, sounds, spice, startup, store, tasks, vault, vmhw, wol)
-from proxmox_controller.core import ubuntu_releases, updates
+from proxmox_controller.core import claude_connect, ubuntu_releases, updates
 from proxmox_controller.core import (autoinstall, cloudseed, guestfiles, isofs, setupdisc, staticnet, timezones,
                                      winsetup)
 from proxmox_controller.core.des import encrypt_block, vnc_response
@@ -2869,6 +2869,36 @@ class GuestFilesLinuxTest(unittest.TestCase):
             self.assertTrue(all(ord(c) < 128 for a in argv for c in a), argv)
         with self.assertRaisesRegex(guestfiles.GuestError, "No such folder"):
             ct.properties(str(self.root / "nope"), ["x"])
+
+
+class PackagingTest(unittest.TestCase):
+    """The Linux package's parts that do not need a build: its control file, its menu entry, and the bridge Claude
+    starts from the frozen program."""
+
+    def test_deb_control_and_menu_entry(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("build_deb", Path(__file__).resolve().parents[1] / "packaging"
+                                                      / "linux" / "build_deb.py")
+        build_deb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build_deb)
+        control = build_deb.control_text(123456, "1.0.0")
+        self.assertIn("Package: proxmox-controller\nVersion: 1.0.0\n", control)
+        self.assertIn("Installed-Size: 123456", control)
+        self.assertIn("Depends: virt-viewer, ", control)  # (the SPICE console comes with the app)
+        self.assertTrue(control.endswith("\n") and all(line.startswith(" ") for line in
+                                                         control.split("Description:")[1].splitlines()[1:]))
+        self.assertEqual(build_deb.PACKAGE, updates.PACKAGE)  # (what the app's updates look for in dpkg)
+        desktop = build_deb.desktop_text()
+        self.assertIn("Exec=/usr/bin/proxmox-controller\n", desktop)
+        self.assertNotIn("@ROOT@", desktop)
+
+    def test_the_frozen_bridge(self):
+        with mock.patch.object(claude_connect.sys, "frozen", True, create=True), \
+                mock.patch.object(claude_connect, "WINDOWS", False):
+            self.assertEqual(claude_connect.bridge_command(), [sys.executable])  # Linux: the same program, --mcp
+        with mock.patch.object(claude_connect.sys, "frozen", True, create=True), \
+                mock.patch.object(claude_connect, "WINDOWS", True):
+            self.assertEqual(Path(claude_connect.bridge_command()[0]).name, claude_connect.MCP_EXE)
 
 
 class UpdatesTest(unittest.TestCase):
