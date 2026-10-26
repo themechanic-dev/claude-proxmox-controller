@@ -351,6 +351,17 @@ class CreateVmDialog(_Busy, QDialog):
         self.static_flow = flow
         self.hw = HardwareFields(form)
         self.hw.set_defaults()
+        # the hardware rows folded into one line until Change… — they are rarely changed, and the window must fit a
+        # 768-high screen (the user's choice, 26/10: 905 points tall with them, ~700 without)
+        self.hw_open = False
+        self.hw_summary = label("", "dim", wrap=True)
+        self.hw_change = button("Change…", tooltip="The display, the pointer, the sound and USB devices")
+        self.hw_change.clicked.connect(self._open_hardware)
+        hw_row = QHBoxLayout()
+        hw_row.setSpacing(8)
+        hw_row.addWidget(self.hw_summary, 1)
+        hw_row.addWidget(self.hw_change, 0, Qt.AlignmentFlag.AlignTop)
+        form.insertRow(self._row_of(self.hw.display), "Hardware", hw_row)
         form.addRow("", self.agent)
         start_row = QHBoxLayout()
         start_row.setSpacing(16)
@@ -514,6 +525,10 @@ class CreateVmDialog(_Busy, QDialog):
             self.language.setCurrentText(winsetup.language_of_iso(self.iso.currentData()))
         self._mode_changed()  # (an Ubuntu Server ISO can install itself)
 
+    def _open_hardware(self) -> None:
+        self.hw_open = True
+        self._mode_changed()
+
     def _static_changed(self) -> None:
         on = self.static.isChecked()
         self.static_ip.setVisible(on)
@@ -586,7 +601,10 @@ class CreateVmDialog(_Busy, QDialog):
         self.rdp.setToolTip("" if setup or not cloud or desktop else "Remote Desktop needs the Desktop edition")
         self.host_cpu.setVisible(not copy)  # a copy keeps the template's
         form.setRowVisible(self._row_of(self.agent), iso and not lsetup)  # (that setup installs the agent)
-        self.hw.set_visible(iso)  # a copy keeps the template's display, sound and USB; a cloud VM gets its own
+        # (a copy keeps the template's display, sound and USB; a cloud VM gets its own)
+        self.hw.set_visible(iso and self.hw_open)
+        form.setRowVisible(self._row_of(self.hw_summary), iso and not self.hw_open)
+        self.hw_summary.setText(self.hw.summary())
         self.disk.setVisible(not copy)  # a copy keeps the template's disk size
         self.disk_label.setText("Copy to" if copy else "on")
         self.storage.setEnabled(not copy or self.full.isChecked())  # a linked copy lives next to its template

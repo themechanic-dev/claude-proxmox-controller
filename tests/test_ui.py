@@ -1519,6 +1519,15 @@ class VmDialogTest(UiCase):
     def test_new_vm_display_sound_and_usb(self):
         dlg = self.dialog()
         hw = dlg.hw
+        # folded into one line until Change… (26/10: the window must fit a small screen)
+        self.assertFalse(self.visible(dlg, hw.display) or self.visible(dlg, hw.usb_box))
+        self.assertTrue(self.visible(dlg, dlg.hw_summary))
+        self.assertEqual(dlg.hw_summary.text(), "SPICE display · USB tablet · Intel HD Audio (ich9) · no USB devices")
+        folded = dlg.layout().totalMinimumHeightForWidth(680)
+        dlg.hw_change.click()
+        self.assertTrue(self.visible(dlg, hw.display) and self.visible(dlg, hw.usb_box))
+        self.assertFalse(self.visible(dlg, dlg.hw_summary))
+        self.assertGreater(dlg.layout().totalMinimumHeightForWidth(680), folded + 150)
         self.assertEqual((hw.display.currentData(), hw.sound.currentData(), hw.output.currentData()),
                          ("qxl", "ich9-intel-hda", "spice"))  # his choice: SPICE and sound by default
         items = self.usb_items(hw)

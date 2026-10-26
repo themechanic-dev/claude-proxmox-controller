@@ -83,6 +83,17 @@ class HardwareFields:
         self.form.setRowVisible(self.hint, self.shown and bool(self.hint.text()))  # no empty gap when silent
         self.spice_usb.setEnabled(spice)
 
+    def summary(self) -> str:
+        """What is chosen, in one line — "SPICE display · USB tablet · Intel HD Audio (ich9) · no USB devices" — for a
+        window that folds these rows away (New VM)."""
+        n = len(self.chosen())
+        parts = [f"{self.display.currentText()} display", "USB tablet" if self.tablet.isChecked() else "no USB tablet",
+                 self.sound.currentText() if self.sound.currentData() else "no sound",
+                 "no USB devices" if not n else f"{n} USB device{'s' if n != 1 else ''}"]
+        if self.spice_usb.isChecked() and self.spice_usb.isEnabled():
+            parts.append("USB of this computer through SPICE")
+        return " · ".join(parts)
+
     def set_defaults(self) -> None:
         """A new VM: the SPICE display (with the USB tablet: Proxmox would leave it out) and an Intel HD Audio card
         that plays through SPICE."""
