@@ -25,6 +25,8 @@ except ImportError:  # pragma: no cover - the core tests still run with plain py
 if QApplication is not None:
     from proxmox_controller.core import store
     from proxmox_controller.core import ubuntu_releases
+    from proxmox_controller.core import updates as updates_core
+    from proxmox_controller.ui import update_window
     from proxmox_controller.core.demo import DEMO_HOSTS, DemoPve
     from proxmox_controller.core.pve import Host, PveError
     from proxmox_controller import app as app_module
@@ -134,6 +136,14 @@ class UiCase(unittest.TestCase):
             return self.ubuntu_index
         self.patches.append(mock.patch.object(ubuntu_releases, "fetch_index", ubuntu_index))
         self.patches.append(mock.patch.object(ubuntu_releases, "fetch_size_mb", lambda url: 905))
+        self.update_feed = None  # the app's update feed as the tests want it (never the network)
+
+        def update_feed():
+            if self.update_feed is None:
+                raise OSError("no network in tests")
+            return json.dumps(self.update_feed)
+        self.patches.append(mock.patch.object(updates_core, "fetch_feed", update_feed))
+        self.patches.append(mock.patch.object(updates_core, "how_installed", lambda: "deb"))
         self.patches.append(mock.patch.object(console, "clipboard_text", lambda: self.copied))
         for p in self.patches:
             p.start()
@@ -2231,6 +2241,95 @@ class ConsoleTest(UiCase):
         self.assertIn("Disconnected", win.status.text())
         win.connect_now()
         self.assertTrue(wait_until(lambda: win.client is not None and win.status.text() == "Connected"))
+
+
+class UpdateTest(UiCase):
+    """A newer version (the user's choice, 26/10, from a mockup): the striped tab beside the ☰ of every page, the
+    title says it, and the window its click opens — Install, or the download page where the app cannot update
+    itself."""
+
+    FEED = {"version": "9.1.0", "notes": ["Files: right-click menu", "Console: Paste…"], "page": "https://themechanic.store/pc",
+            "linux": {"url": "https://themechanic.store/d/pc_9.1.0_amd64.deb", "sha256": "a" * 64, "size": 41_000_000},
+            "windows": {"url": "https://themechanic.store/d/pc-9.1.0-setup.exe", "sha256": "b" * 64, "size": 38_000_000}}
+
+    def test_tab_and_title(self):
+        win = MainWindow(list(DEMO_HOSTS), DemoPve, demo=True)
+        self.addCleanup(win.close)
+        self.assertFalse(any(t.isVisibleTo(win) for t in win.update_tabs))  # (the demo reads no feed)
+        win.show_update(dict(self.FEED), "deb")
+        tabs = [t for t in win.update_tabs if t.window() is win]
+        self.assertTrue(tabs and all(not t.isHidden() for t in tabs))
+        self.assertEqual(tabs[0].text(), "Update 9.1")
+        self.assertTrue(win.windowTitle().endswith(" — Update 9.1 available"))
+        win.show_host(DEMO_HOSTS[1].id)  # another host's page: its own tab, the title still says it
+        self.assertTrue(win.windowTitle().endswith(" — Update 9.1 available"))
+        self.assertTrue(all(not t.isHidden() for t in win.update_tabs))
+        win.show_update(None, "")
+        self.assertTrue(all(t.isHidden() for t in win.update_tabs))
+        self.assertNotIn("Update", win.windowTitle())
+
+    def test_read_at_the_start_and_kept(self):
+        self.update_feed = dict(self.FEED)
+        win = MainWindow([], DemoPve)
+        self.addCleanup(win.close)
+        win.check_updates()
+        self.assertTrue(wait_until(lambda: win.update_feed is not None))
+        self.assertEqual(win.update_how, "deb")
+        self.assertFalse(win.update_tabs[0].isHidden())
+        win.close()
+        self.update_feed = None  # no network now: what was read is shown at the next start, at once
+        again = MainWindow([], DemoPve)
+        self.addCleanup(again.close)
+        self.assertEqual(again.update_feed["version"], "9.1.0")
+        self.assertFalse(again.update_tabs[0].isHidden())
+        self.update_feed = dict(self.FEED, version="0.0.1")  # not newer: nothing
+        again.check_updates()
+        self.assertTrue(wait_until(lambda: again.update_feed is None))
+        self.assertTrue(again.update_tabs[0].isHidden())
+
+    def test_install_through_the_system(self):
+        dlg = update_window.UpdateDialog(None, dict(self.FEED), "deb")
+        self.addCleanup(dlg.close)
+        self.assertIn("installed through the system (it asks for your password)",
+                      " ".join(lbl.text() for lbl in dlg.findChildren(QLabel)))
+        self.assertEqual(dlg.install_btn.text(), "Install")
+        self.assertIn("about 41 MB", " ".join(l.text() for l in dlg.findChildren(QLabel)))
+        installed, started, quit_ = [], [], []
+
+        def download(feed, progress, cancel):
+            progress(5, 10)
+            return Path("/x.deb")
+        with mock.patch.object(updates_core, "download", download), \
+                mock.patch.object(updates_core, "install_deb", installed.append), \
+                mock.patch("PySide6.QtCore.QProcess.startDetached", lambda *a: started.append(a) or True), \
+                mock.patch.object(update_window.QApplication, "quit", lambda: quit_.append(1)):
+            dlg.install_btn.click()
+            self.assertTrue(wait_until(lambda: quit_, 5))
+        self.assertEqual(installed, [Path("/x.deb")])
+        self.assertEqual(started[0][0], updates_core.restart_command()[0])  # the app opens again
+        self.assertEqual(dlg.state.text(), "Done — the app closes now and opens again.")
+
+    def test_a_failed_download_says_why(self):
+        dlg = update_window.UpdateDialog(None, dict(self.FEED), "setup")
+        self.addCleanup(dlg.close)
+        with mock.patch.object(updates_core, "download", side_effect=updates_core.UpdateError("its SHA-256 differs")), \
+                mock.patch.object(updates_core, "start_setup") as setup:
+            dlg.install_btn.click()
+            self.assertTrue(wait_until(lambda: dlg.state.text().startswith("⚠")))
+        self.assertEqual(dlg.state.text(), "⚠ its SHA-256 differs")
+        self.assertTrue(dlg.install_btn.isEnabled())
+        self.assertFalse(setup.called)
+
+    def test_a_copy_that_cannot_update_itself(self):
+        opened = []
+        with mock.patch.object(update_window, "QDesktopServices", types.SimpleNamespace(
+                openUrl=lambda url: opened.append(url.toString()) or True)):
+            dlg = update_window.UpdateDialog(None, dict(self.FEED), "")
+            self.addCleanup(dlg.close)
+            self.assertEqual(dlg.install_btn.text(), "Download Page")
+            self.assertIn("does not update itself", " ".join(l.text() for l in dlg.findChildren(QLabel)))
+            dlg.install_btn.click()
+        self.assertEqual(opened, ["https://themechanic.store/pc"])
 
 
 class ConsoleChoiceTest(UiCase):

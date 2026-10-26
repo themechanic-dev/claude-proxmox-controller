@@ -2,6 +2,7 @@
 server that answers like Proxmox, settings storage and MAC discovery. No real Proxmox is touched."""
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -23,7 +24,7 @@ from unittest import mock
 from proxmox_controller.core import apt, ssh as sshmod
 from proxmox_controller.core import (autostart, claude_access, claude_policy, connector_link, connector_tools, jobs,
                                      mcp, netinfo, screen, sounds, spice, startup, store, tasks, vault, vmhw, wol)
-from proxmox_controller.core import ubuntu_releases
+from proxmox_controller.core import ubuntu_releases, updates
 from proxmox_controller.core import (autoinstall, cloudseed, guestfiles, isofs, setupdisc, staticnet, timezones,
                                      winsetup)
 from proxmox_controller.core.des import encrypt_block, vnc_response
@@ -2868,6 +2869,89 @@ class GuestFilesLinuxTest(unittest.TestCase):
             self.assertTrue(all(ord(c) < 128 for a in argv for c in a), argv)
         with self.assertRaisesRegex(guestfiles.GuestError, "No such folder"):
             ct.properties(str(self.root / "nope"), ["x"])
+
+
+class UpdatesTest(unittest.TestCase):
+    """A newer Proxmox Controller: the feed read and checked, the file downloaded and its SHA-256 checked — never the
+    network or the app's own files here."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        patch = mock.patch.object(updates, "_cache_path", lambda: self.dir / "update.json")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def feed(self, **more):
+        good = {"url": "https://themechanic.store/d/pc-9.1.0.deb", "sha256": "a" * 64, "size": 1000}
+        return {"version": "9.1.0", "notes": ["One", "Two"], "linux": dict(good), "windows": dict(good), **more}
+
+    def test_versions_and_the_feed(self):
+        self.assertEqual(updates.version_key("1.10.2"), (1, 10, 2))
+        self.assertGreater(updates.version_key("1.10.0"), updates.version_key("1.9.9"))  # (not as text)
+        self.assertTrue(updates.newer({"version": "0.2.0"}, "0.1.0"))
+        self.assertFalse(updates.newer({"version": "0.1.0"}, "0.1.0") or updates.newer(None, "0.1.0"))
+        bad = self.feed(windows={"url": "https://elsewhere.example/x.exe", "sha256": "a" * 64},
+                        linux={"url": "https://themechanic.store/x.deb"}, notes="just one line")
+        feed = updates.parse(json.dumps(bad))
+        self.assertNotIn("windows", feed)  # a file from elsewhere is not offered
+        self.assertNotIn("linux", feed)  # nor one without its checksum
+        self.assertEqual(feed["notes"], ["just one line"])
+        for text in ('{"notes": []}', '[1]', 'not json'):
+            with self.assertRaises(ValueError):
+                updates.parse(text)
+        self.assertFalse(updates.allowed("http://themechanic.store/x"))  # HTTPS only
+
+    def test_check_keeps_what_it_read(self):
+        with mock.patch.object(updates, "fetch_feed", return_value=json.dumps(self.feed())):
+            self.assertEqual(updates.check()["version"], "9.1.0")
+        with mock.patch.object(updates, "fetch_feed", side_effect=OSError("offline")):
+            self.assertEqual(updates.check()["version"], "9.1.0")  # what was read last
+        self.assertEqual(updates.kept()["notes"], ["One", "Two"])
+        (self.dir / "update.json").write_text("garbage")
+        with mock.patch.object(updates, "fetch_feed", side_effect=OSError("offline")):
+            self.assertIsNone(updates.check())
+
+    def test_download_checks_the_file(self):
+        import http.server
+        body, hits = os.urandom(300_000), []
+
+        class Serve(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Serve)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/pc-9.1.0.deb"
+        sha = hashlib.sha256(body).hexdigest()
+        feed = {"version": "9.1.0", updates.platform_key(): {"url": url, "sha256": sha, "size": len(body)}}
+        seen = []
+        with mock.patch.object(updates, "allowed", lambda u: True):  # (the test's own server, not the website)
+            path = updates.download(feed, lambda d, t: seen.append((d, t)), threading.Event(), self.dir)
+            self.assertEqual((path.read_bytes(), seen[-1]), (body, (len(body), len(body))))
+            updates.download(feed, lambda d, t: None, threading.Event(), self.dir)
+            self.assertEqual(len(hits), 1)  # whole already: not fetched again
+            path.unlink()
+            feed[updates.platform_key()]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(updates.UpdateError, "SHA-256 differs"):
+                updates.download(feed, lambda d, t: None, threading.Event(), self.dir)
+            stop = threading.Event()
+            stop.set()
+            with self.assertRaisesRegex(updates.UpdateError, "Cancelled"):
+                updates.download(feed, lambda d, t: None, stop, self.dir)
+        self.assertEqual(os.listdir(self.dir), [])  # nothing cut or altered left behind
+        with self.assertRaisesRegex(updates.UpdateError, "no file for this system"):
+            updates.download({"version": "9.1.0"}, lambda d, t: None, threading.Event(), self.dir)
+        with self.assertRaisesRegex(updates.UpdateError, "not on the app's website"):
+            updates.download(feed, lambda d, t: None, threading.Event(), self.dir)
 
 
 class UbuntuReleasesTest(unittest.TestCase):

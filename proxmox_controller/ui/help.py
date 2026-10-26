@@ -320,6 +320,14 @@ SECTIONS = [
      "password with the password you give once (it is not kept), and from then on opens at once. <b>Your password "
      "always keeps working</b> — the host's SSH settings are never changed. <b>SSH Settings…</b> (the arrow of "
      "Console) shows the key and has <b>Remove Key</b>. Without a key, the terminal asks for the password."),
+    ("Updates",
+     "A few seconds after it starts, and every six hours, the app reads a small file on its website that tells the "
+     "newest version. When it is newer than yours, a tab in yellow and black stripes — <b>Update 1.1</b> — shows "
+     "beside the ☰ button, and the window's title says it. A click shows what is new and <b>Install</b>: the "
+     "update downloads, its SHA-256 is checked (a cut or altered file is never installed), and then — on Windows "
+     "its setup starts, closes the app and offers to open it again; on Linux it is installed through the system, "
+     "which asks for your password, and the app opens again. Nothing installs without your click. A copy run from "
+     "its source offers the download page instead.<br>"),
     ("What it stores on your computer",
      "• Linux: <tt>~/.config/proxmox-controller/</tt> · Windows: <tt>%APPDATA%\\ProxmoxController\\</tt><br>"
      "• <tt>hosts.json</tt> — addresses, token IDs, certificate fingerprints, MAC addresses.<br>"
@@ -333,6 +341,8 @@ SECTIONS = [
      "While the app runs, Claude's bridge reaches it through <tt>/run/user/&lt;id&gt;/proxmox-controller/"
      "connector.sock</tt> (Windows: the named pipe <tt>\\\\.\\pipe\\proxmox-controller-&lt;you&gt;</tt>), open to your "
      "user only.<br>"
+     "• Beside it: <tt>update.json</tt> (what the update file said last), <tt>updates/</tt> (an update downloaded "
+     "for Install) and <tt>ubuntu-releases.json</tt> (the Ubuntu releases offered, read once a day).<br>"
      "• <tt>ssh/</tt> — the app's own SSH key (<tt>id_ed25519</tt>) and the host keys you confirmed "
      "(<tt>known_hosts</tt>); your own <tt>~/.ssh</tt> is never touched.<br>"
      "Nothing is installed on the Proxmox hosts — only, if you choose <b>Set up a key</b>, the app's key in root's "

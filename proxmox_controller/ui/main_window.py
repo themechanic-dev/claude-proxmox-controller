@@ -10,13 +10,14 @@ from PySide6.QtGui import QAction, QFont, QIcon, QKeySequence, QPainter, QPalett
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QMainWindow, QMenu, QStackedWidget, QToolButton, QVBoxLayout, QWidget
 
 from .. import APP_NAME
-from ..core import store
+from ..core import store, updates
 from ..core.pve import Host, Pve
 from . import geometry, theme
 from .help import HelpDialog
 from .host_dialog import HostDialog
 from .host_view import HostView
 from .settings import SettingsDialog
+from .update_window import UpdateDialog, UpdateTab, short_version
 from .widgets import button, card, confirm, dot_icon, label
 from .worker import Runner
 
@@ -71,6 +72,11 @@ class MainWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.setCentralWidget(self.pages)
+        # a newer version (core/updates): the striped tab beside each page's ☰, and the title says it
+        self.update_feed: dict | None = None
+        self.update_how = ""
+        self.update_tabs: list[UpdateTab] = []
+        self.title_base = APP_NAME
 
         self.menu = QMenu(self)
         self.menu.aboutToShow.connect(self._fill_menu)
@@ -99,13 +105,20 @@ class MainWindow(QMainWindow):
         self.ping_timer = QTimer(self)
         self.ping_timer.timeout.connect(self.ping_all)
         self.ping_timer.start(PING_EVERY_MS)
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.check_updates)
         self._restart_timer()
         self.show_host(self.settings.get("selected_host", ""))
         geometry.restore(self, "main", self.settings)  # the size and screen it was closed on
         QTimer.singleShot(200, self.ping_all)
-        if not demo:
+        if not demo:  # (the demo touches no network)
             self.connector.start()
             QTimer.singleShot(1500, self._claude_tidy)
+            known = updates.kept()  # what the feed said last time: the tab at once, before it is read again
+            if updates.newer(known):
+                self.show_update(known, "")
+            QTimer.singleShot(updates.FIRST_CHECK_S * 1000, self.check_updates)
+            self.update_timer.start(updates.CHECK_EVERY_S * 1000)
 
     # -- pages -------------------------------------------------------------------------------------
 
@@ -115,7 +128,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(24, 20, 24, 24)
         top = QHBoxLayout()
         top.addStretch(1)
-        top.addWidget(MenuButton(self.menu))
+        top.addWidget(self._corner())
         lay.addLayout(top)
         lay.addStretch(1)
         box = card(label("No Proxmox hosts yet", "title"),
@@ -128,6 +141,50 @@ class MainWindow(QMainWindow):
         lay.addWidget(box, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addStretch(2)
         return w
+
+    # -- a newer version -----------------------------------------------------------------------------
+
+    def _corner(self) -> QWidget:
+        """A page's top right: the update's tab (shown when there is one) and the ☰ menu."""
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        tab = UpdateTab()
+        tab.clicked.connect(self.open_update)
+        if self.update_feed is not None:
+            tab.show_version(self.update_feed["version"])
+            tab.show()
+        self.update_tabs.append(tab)
+        lay.addWidget(tab)
+        lay.addWidget(MenuButton(self.menu))
+        return w
+
+    def set_title(self, base: str) -> None:
+        self.title_base = base
+        feed = self.update_feed
+        self.setWindowTitle(base + (f" — Update {short_version(feed['version'])} available" if feed else ""))
+
+    def check_updates(self) -> None:
+        self.runner.run(lambda: (updates.check(), updates.how_installed()), self._updates_checked)
+
+    def _updates_checked(self, result, err) -> None:
+        if err is None and result is not None:
+            feed, how = result
+            self.show_update(feed if updates.newer(feed) else None, how)
+
+    def show_update(self, feed: dict | None, how: str) -> None:
+        """The tab beside every ☰, and the title — or neither, when there is no newer version."""
+        self.update_feed, self.update_how = feed, how
+        for tab in self.update_tabs:
+            if feed is not None:
+                tab.show_version(feed["version"])
+            tab.setVisible(feed is not None)
+        self.set_title(self.title_base)
+
+    def open_update(self) -> None:
+        if self.update_feed is not None:
+            UpdateDialog(self, self.update_feed, self.update_how).exec()
 
     def _fill_menu(self) -> None:
         """Built each time it opens, so host names and their dots are current."""
@@ -160,13 +217,13 @@ class MainWindow(QMainWindow):
         if not ids:
             self.current_id = ""
             self.pages.setCurrentWidget(self.empty)
-            self.setWindowTitle(APP_NAME + suffix)
+            self.set_title(APP_NAME + suffix)
             return
         h = self.hosts[ids.index(host_id) if host_id in ids else 0]
         view = self.views.get(h.id)
         if view is None:
             view = HostView(h, self.make_client, self.runner, self.notify, self.edit_host, self._set_state,
-                            corner=MenuButton(self.menu), prefs=self.settings, on_prefs_changed=self._save_settings,
+                            corner=self._corner(), prefs=self.settings, on_prefs_changed=self._save_settings,
                             on_host_changed=self._save_hosts)
             self.views[h.id] = view
             self.pages.addWidget(view)
@@ -174,7 +231,7 @@ class MainWindow(QMainWindow):
             view.refresh()
         self.pages.setCurrentWidget(view)
         self.current_id = h.id
-        self.setWindowTitle(f"{h.name} — {APP_NAME}{suffix}")
+        self.set_title(f"{h.name} — {APP_NAME}{suffix}")
         if self.settings.get("selected_host") != h.id:
             self.settings["selected_host"] = h.id
             self._save_settings()
@@ -227,7 +284,7 @@ class MainWindow(QMainWindow):
         if host.id in self.views:
             self.views[host.id].set_host(new)
         if self.current_id == new.id:
-            self.setWindowTitle(f"{new.name} — {APP_NAME}{' (demo)' if self.demo else ''}")
+            self.set_title(f"{new.name} — {APP_NAME}{' (demo)' if self.demo else ''}")
         self.notify(f"Saved {new.name}")
         return new
 
@@ -339,6 +396,7 @@ class MainWindow(QMainWindow):
         geometry.remember(self, "main", self.settings, self._save_settings)
         self.timer.stop()
         self.ping_timer.stop()
+        self.update_timer.stop()
         self.runner.close()
         self.connector.stop()
         if self.help_dialog is not None:
