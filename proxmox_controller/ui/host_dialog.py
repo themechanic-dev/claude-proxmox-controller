@@ -46,7 +46,7 @@ class HostDialog(QDialog):
         self.name = QLineEdit(host.name if host else "")
         self.name.setPlaceholderText("Home server")
         self.address = QLineEdit(host.address if host else "")
-        self.address.setPlaceholderText("192.168.1.80  (port 8006 unless you add :port)")
+        self.address.setPlaceholderText("192.168.1.10  (port 8006 unless you add :port)")
         self.token_id = QLineEdit(host.token_id if host else "root@pam!controller")
         self.secret = QLineEdit(host.token_secret if host else "")
         self.secret.setEchoMode(QLineEdit.EchoMode.Password)
@@ -79,7 +79,7 @@ class HostDialog(QDialog):
         wform = QFormLayout()
         wform.setVerticalSpacing(8)
         self.mac = QLineEdit(host.mac if host else "")
-        self.mac.setPlaceholderText("3c:ec:ef:6e:a7:96")
+        self.mac.setPlaceholderText("a0:b1:c2:d3:e4:f5")
         detect = button("Detect", tooltip="Read it from this computer's network table (open the host's web page "
                                           "first if it is not found)")
         detect.clicked.connect(self.detect_mac)
@@ -169,7 +169,7 @@ class HostDialog(QDialog):
             try:
                 mac = wol.normalize_mac(mac)
             except ValueError:
-                return "The MAC address looks like 3c:ec:ef:6e:a7:96."
+                return "The MAC address looks like a0:b1:c2:d3:e4:f5."
         return Host(id=self.host.id if self.host else new_host_id(), name=name or addr, address=addr,
                     token_id=self.token_id.text().strip(), token_secret=self.secret.text().strip(),
                     fingerprint=self.fp_value, mac=mac, broadcast=self.broadcast.text().strip() or "255.255.255.255",

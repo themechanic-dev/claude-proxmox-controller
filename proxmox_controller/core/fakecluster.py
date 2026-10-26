@@ -315,7 +315,7 @@ class FakeCluster:
         return None
 
     def network(self, p, node):
-        nets = [{"iface": "vmbr0", "type": "bridge", "active": 1, "cidr": "192.168.1.80/24", "gateway": "192.168.1.1"},
+        nets = [{"iface": "vmbr0", "type": "bridge", "active": 1, "cidr": "192.168.1.10/24", "gateway": "192.168.1.1"},
                 {"iface": "eno1", "type": "eth", "active": 1}]
         if p.get("type") == "any_bridge":
             nets = [n for n in nets if n["type"] == "bridge"]

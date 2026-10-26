@@ -1,6 +1,6 @@
 """A small WebSocket (RFC 6455) speaker over an already connected socket — Proxmox carries consoles through one.
 
-    ws = client_handshake(tls_socket, "192.168.1.80:8006", "/api2/json/…/vncwebsocket?…", {"Authorization": …})
+    ws = client_handshake(tls_socket, "192.168.1.10:8006", "/api2/json/…/vncwebsocket?…", {"Authorization": …})
     ws.send(b"…");  data = ws.recv()   # None once the other side closed
 """
 

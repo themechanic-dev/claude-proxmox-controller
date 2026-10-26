@@ -44,31 +44,31 @@ except ImportError:  # pragma: no cover
 
 class WolTest(unittest.TestCase):
     def test_mac_formats(self):
-        for text in ("3c:ec:ef:6e:a7:96", "3C-EC-EF-6E-A7-96", "3cecef6ea796", " 3c:ec:ef:6e:a7:96 "):
-            self.assertEqual(wol.normalize_mac(text), "3c:ec:ef:6e:a7:96")
-        for bad in ("3c:ec:ef:6e:a7", "zz:ec:ef:6e:a7:96", "3c:ec-ef:6e:a7:96", ""):
+        for text in ("a0:b1:c2:d3:e4:f5", "A0-B1-C2-D3-E4-F5", "a0b1c2d3e4f5", " a0:b1:c2:d3:e4:f5 "):
+            self.assertEqual(wol.normalize_mac(text), "a0:b1:c2:d3:e4:f5")
+        for bad in ("a0:b1:c2:d3:e4", "zz:b1:c2:d3:e4:f5", "a0:b1-c2:d3:e4:f5", ""):
             with self.assertRaises(ValueError):
                 wol.normalize_mac(bad)
 
     def test_magic_packet(self):
-        p = wol.magic_packet("3c:ec:ef:6e:a7:96")
+        p = wol.magic_packet("a0:b1:c2:d3:e4:f5")
         self.assertEqual(len(p), 102)
         self.assertEqual(p[:6], b"\xff" * 6)
-        self.assertEqual(p[6:12], bytes.fromhex("3cecef6ea796"))
-        self.assertEqual(p[6:], bytes.fromhex("3cecef6ea796") * 16)
+        self.assertEqual(p[6:12], bytes.fromhex("a0b1c2d3e4f5"))
+        self.assertEqual(p[6:], bytes.fromhex("a0b1c2d3e4f5") * 16)
 
     def test_send_reaches_a_listener(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rx:
             rx.bind(("127.0.0.1", 0))
             rx.settimeout(2)
             port = rx.getsockname()[1]
-            self.assertEqual(wol.send("3c:ec:ef:6e:a7:96", broadcast="127.0.0.1", ports=(port,), repeat=2), 2)
-            self.assertEqual(rx.recv(200), wol.magic_packet("3c:ec:ef:6e:a7:96"))
+            self.assertEqual(wol.send("a0:b1:c2:d3:e4:f5", broadcast="127.0.0.1", ports=(port,), repeat=2), 2)
+            self.assertEqual(rx.recv(200), wol.magic_packet("a0:b1:c2:d3:e4:f5"))
 
 
 class AddressTest(unittest.TestCase):
     def test_split_address(self):
-        self.assertEqual(split_address("192.168.1.80"), ("192.168.1.80", 8006))
+        self.assertEqual(split_address("192.168.1.10"), ("192.168.1.10", 8006))
         self.assertEqual(split_address("https://pve.lan:8443/"), ("pve.lan", 8443))
         self.assertEqual(split_address("[fd00::5]:8006"), ("fd00::5", 8006))
         self.assertEqual(split_address("fd00::5"), ("fd00::5", 8006))
@@ -406,8 +406,8 @@ class StoreTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_hosts_roundtrip_secrets_apart(self):
-        h = Host(id=store.new_host_id(), name="Home", address="192.168.1.80", token_id="root@pam!c",
-                 token_secret="s3cret", fingerprint="AB:CD", mac="3c:ec:ef:6e:a7:96")
+        h = Host(id=store.new_host_id(), name="Home", address="192.168.1.10", token_id="root@pam!c",
+                 token_secret="s3cret", fingerprint="AB:CD", mac="a0:b1:c2:d3:e4:f5")
         store.save_hosts([h])
         folder = store.config_dir()
         hosts_text = (folder / "hosts.json").read_text()
@@ -481,7 +481,7 @@ class VaultTest(unittest.TestCase):
         self.assertEqual((vault.KDF["n"], vault.KDF["r"]), (1 << 17, 8))  # what real passwords get
 
     def test_lock_the_store(self):
-        h = Host(id="h1", name="Home", address="192.168.1.80", token_id="root@pam!c", token_secret="s3cret",
+        h = Host(id="h1", name="Home", address="192.168.1.10", token_id="root@pam!c", token_secret="s3cret",
                  fingerprint="AB:CD")
         store.save_hosts([h])
         store.save_claude_token("h1", "claude-secret")
@@ -1479,7 +1479,7 @@ class ConnectorToolsTest(unittest.TestCase):
                            ({"linux_user": "Root!"}, "linux_user: small letters"),
                            ({"linux_user": None}, "give linux_user too"),
                            ({"static_ip": "10.0.0.5"}, "not in the host's network"),
-                           ({"static_ip": "192.168.1.80"}, "the Proxmox host's own address")):
+                           ({"static_ip": "192.168.1.10"}, "the Proxmox host's own address")):
             a = {k: v for k, v in {**args, "name": "srv-2", **bad}.items() if v is not None}
             self.cluster.isos.append("local:iso/ubuntu-22.04.5-live-server-amd64.iso")
             with self.assertRaises(connector_tools.ToolError) as caught:
@@ -2252,13 +2252,13 @@ class NetinfoTest(unittest.TestCase):
         self.assertEqual(netinfo.ips_for_macs([], tables["ip neigh"]), [])
 
     def test_linux_and_windows_tables(self):
-        linux = ["192.168.1.80 dev enp5s0 lladdr 3c:ec:ef:6e:a7:96 REACHABLE",
+        linux = ["192.168.1.10 dev enp5s0 lladdr a0:b1:c2:d3:e4:f5 REACHABLE",
                  "192.168.1.8 dev enp5s0 lladdr aa:bb:cc:dd:ee:ff STALE"]
-        windows = ["  192.168.1.80          3c-ec-ef-6e-a7-96     dynamic"]
+        windows = ["  192.168.1.10          a0-b1-c2-d3-e4-f5     dynamic"]
         for lines in (linux, windows):
             with mock.patch.object(netinfo, "_neighbour_lines", return_value=lines), \
-                    mock.patch.object(netinfo, "resolve", return_value="192.168.1.80"):
-                self.assertEqual(netinfo.mac_for("pve"), "3c:ec:ef:6e:a7:96")
+                    mock.patch.object(netinfo, "resolve", return_value="192.168.1.10"):
+                self.assertEqual(netinfo.mac_for("pve"), "a0:b1:c2:d3:e4:f5")
         with mock.patch.object(netinfo, "_neighbour_lines", return_value=linux), \
                 mock.patch.object(netinfo, "resolve", return_value="192.168.1.99"):
             self.assertIsNone(netinfo.mac_for("other"))
@@ -2948,8 +2948,13 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("Installed-Size: 123456", control)
         self.assertIn("Depends: virt-viewer, ", control)  # (the SPICE console comes with the app)
         depends = control.split("Depends: ")[1].split("\n")[0].split(", ")
-        for lib in ("libxcb-icccm4", "libxcb-keysyms1", "libxcb-shape0", "libxcb-xkb1", "libxkbcommon-x11-0"):
-            self.assertIn(lib, depends)  # Qt's X11 side: not in the package, not on Ubuntu Desktop 26.04 (26/10)
+        for lib in ("libxcb-icccm4", "libxcb-keysyms1", "libxcb-shape0", "libxcb-xkb1", "libxkbcommon-x11-0",
+                    "libxkbcommon0", "libx11-6", "libxcb-cursor0", "libxcb-render-util0"):
+            self.assertIn(lib, depends)  # Qt's X11 side: from the system, one version (26/10, 27/10)
+        spec = (Path(__file__).resolve().parents[1] / "packaging" / "linux" / "proxmox-controller.spec").read_text(
+            encoding="utf-8")
+        for lib in ('"libxkbcommon"', '"libxcb"', '"libX11."'):
+            self.assertIn(lib, spec)  # never carried: 24.04's libxkbcommon with 26.04's libxkbcommon-x11 crashed
         self.assertTrue(control.endswith("\n") and all(line.startswith(" ") for line in
                                                          control.split("Description:")[1].splitlines()[1:]))
         self.assertEqual(build_deb.PACKAGE, updates.PACKAGE)  # (what the app's updates look for in dpkg)
@@ -3791,7 +3796,7 @@ class StaticNetTest(unittest.TestCase):
         self.net = staticnet.host_network(DemoPve(DEMO_HOSTS[0]), "pve")
 
     def test_from_the_host(self):
-        self.assertEqual(self.net, {"bridges": {"vmbr0": {"cidr": "192.168.1.80/24", "gateway": "192.168.1.1"}},
+        self.assertEqual(self.net, {"bridges": {"vmbr0": {"cidr": "192.168.1.10/24", "gateway": "192.168.1.1"}},
                                     "dns": ["192.168.1.1"], "search": ["lan"]})
         info = staticnet.for_bridge(self.net, "vmbr0")
         self.assertEqual(staticnet.describe(info), "/24 · gateway 192.168.1.1 · DNS 192.168.1.1 (from the Proxmox host)")
@@ -3811,7 +3816,7 @@ class StaticNetTest(unittest.TestCase):
         self.assertEqual(staticnet.check("192.168.1.50", info), "")
         for address, words in (("192.168.1", "an address such as"), ("hello", "an address such as"),
                                ("10.1.2.3", "not in the host's network"), ("192.168.1.0", "network's own address"),
-                               ("192.168.1.255", "broadcast"), ("192.168.1.80", "host's own"),
+                               ("192.168.1.255", "broadcast"), ("192.168.1.10", "host's own"),
                                ("192.168.1.1", "gateway")):
             self.assertIn(words, staticnet.check(address, info), address)
         self.assertIn("in use", staticnet.check("192.168.1.26", info, frozenset({"192.168.1.26"})))

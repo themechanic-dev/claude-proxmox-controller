@@ -32,10 +32,13 @@ from proxmox_controller import APP_ID, APP_NAME, VERSION  # noqa: E402
 
 DEPENDS = ["virt-viewer", "libegl1", "libgl1", "libxkbcommon0", "libfontconfig1", "libdbus-1-3",
            # Qt's X11 side, which the app uses on GNOME's Wayland too (through XWayland: windows reopen where they
-           # were). PyInstaller carries some xcb libraries but not these, and Ubuntu Desktop 26.04 has none of them:
-           # the app did not start from its menu there (26/10, VM 109). Listed with ldd over the whole package.
+           # were). Ubuntu Desktop 26.04 has few of these: the app did not start from its menu there (26/10, VM 109).
+           # Listed with ldd over the whole package.
            "libxcb1", "libxcb-icccm4", "libxcb-keysyms1", "libxcb-shape0", "libxcb-xkb1", "libxkbcommon-x11-0",
-           "libwayland-client0", "libwayland-cursor0", "libwayland-egl1"]
+           "libwayland-client0", "libwayland-cursor0", "libwayland-egl1",
+           # ... and the X11 libraries the package no longer carries (the spec's DROP: one version, the system's)
+           "libx11-6", "libx11-xcb1", "libxcb-cursor0", "libxcb-glx0", "libxcb-image0", "libxcb-randr0",
+           "libxcb-render0", "libxcb-render-util0", "libxcb-shm0", "libxcb-sync1", "libxcb-util1", "libxcb-xfixes0"]
 RECOMMENDS = ["openssh-client"]  # (the host's Console and Upgrade)
 
 

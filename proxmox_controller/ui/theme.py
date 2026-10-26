@@ -37,11 +37,19 @@ LIGHT = Colors(window="#fafafb", view="#ffffff", card="#ffffff", card_hover="#f0
                success="#26a269", warning="#9c6e03")
 
 
+_OWN_PALETTE = False  # apply() has put the app's own palette in place of the system's
+
+
 def is_dark() -> bool:
     scheme = QGuiApplication.styleHints().colorScheme()
     if scheme == Qt.ColorScheme.Dark:
         return True
     if scheme == Qt.ColorScheme.Light:
+        return False
+    # No preference said — what GNOME's "default" (Ubuntu's Light) reaches Qt as. The system's palette decides, but
+    # only before apply() replaced it with the app's own: read after that, it was the app's dark one, and the app
+    # stayed dark when the desktop went back to Light (Ubuntu 26.04, 27/10). No preference then means light.
+    if _OWN_PALETTE:
         return False
     return QGuiApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
 
@@ -65,6 +73,8 @@ def apply(app: QApplication, dark: bool | None = None) -> Colors:
     for role in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText, QPalette.ColorRole.ButtonText):
         pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(c.dim))
     app.setPalette(pal)
+    global _OWN_PALETTE
+    _OWN_PALETTE = True
     app.setStyleSheet(stylesheet(c))
     return c
 

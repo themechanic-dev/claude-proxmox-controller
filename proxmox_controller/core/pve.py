@@ -57,7 +57,7 @@ class CertificateMismatch(PveError):
 class Host:
     id: str
     name: str
-    address: str  # "192.168.1.80" or "pve.lan:8006"
+    address: str  # "192.168.1.10" or "pve.lan:8006"
     token_id: str = ""  # "root@pam!controller"
     token_secret: str = ""
     fingerprint: str = ""  # "AB:CD:…" SHA-256 of the certificate, as Proxmox shows it

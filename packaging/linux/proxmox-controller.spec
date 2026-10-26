@@ -18,7 +18,12 @@ a = Analysis(
 DROP = ("libqgtk3.so", "libgtk-3.", "libgdk-3.", "libgdk_pixbuf", "libatk-", "libatspi.", "libcairo", "libpango",
         "libharfbuzz.", "libepoxy.", "libfribidi.", "libdatrie.", "libthai.", "libgraphite2.", "libpixman-", "libjpeg.",
         "libXcomposite.", "libXdamage.", "libXi.", "libXinerama.", "libXrandr.", "libXcursor.", "libXfixes.",
-        "libXext.", "libXrender.")
+        "libXext.", "libXrender.",
+        # The X11 side (xcb, xkb, X11) comes from the system too, all of it: those libraries must be one version.
+        # The package carried 24.04's libxkbcommon while 26.04's libxkbcommon-x11 came from the system; the two share
+        # their structures, and the first key pressed after a dialog closed crashed the app (SIGSEGV in
+        # xkb_state_key_get_layout, measured with gdb on Ubuntu Desktop 26.04, 27/10). build_deb's Depends name them.
+        "libxkbcommon", "libX11.", "libX11-xcb.", "libXau.", "libXdmcp.", "libxcb")
 a.binaries = [b for b in a.binaries if not os.path.basename(b[0]).startswith(DROP)]
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], name="proxmox-controller", exclude_binaries=True, console=True, upx=False, strip=False)

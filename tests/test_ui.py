@@ -2568,6 +2568,25 @@ class WindowsLookTest(UiCase):
         self.assertFalse(connector._TRAY["icon"].visible)
 
 
+class ThemeTest(UiCase):
+    def test_no_preference_after_dark_is_light(self):
+        # GNOME's "default" (Ubuntu's Light) reaches Qt as no preference. Coming back to it from dark, the app went
+        # light only in its title bar (Ubuntu 26.04, 27/10): it took its own dark palette for the system's
+        def hints(scheme):
+            return types.SimpleNamespace(styleHints=lambda: types.SimpleNamespace(colorScheme=lambda: scheme),
+                                         palette=theme.QGuiApplication.palette)
+
+        theme.apply(APP, dark=True)
+        try:
+            with mock.patch.object(theme, "QGuiApplication", hints(Qt.ColorScheme.Unknown)):
+                self.assertFalse(theme.is_dark())
+                self.assertEqual(theme.apply(APP), theme.LIGHT)
+            with mock.patch.object(theme, "QGuiApplication", hints(Qt.ColorScheme.Dark)):
+                self.assertEqual(theme.apply(APP), theme.DARK)
+        finally:
+            theme.apply(APP, dark=True)
+
+
 class WindowPlaceTest(UiCase):
     def test_xwayland_only_where_it_helps(self):
         on = {"remember_place": True}
@@ -3278,7 +3297,7 @@ class VaultDialogTest(UiCase):
         store.lock_session()
         self.addCleanup(store.lock_session)
         self.addCleanup(self.tmp.cleanup)
-        store.save_hosts([Host(id="h1", name="Home", address="192.168.1.80", token_id="root@pam!c",
+        store.save_hosts([Host(id="h1", name="Home", address="192.168.1.10", token_id="root@pam!c",
                                token_secret="s3cret", fingerprint="AB:CD")])
 
     def test_set_change_and_remove(self):
@@ -3951,16 +3970,16 @@ class HostDialogTest(UiCase):
         dlg.fp_value = "DEMO"
         self.assertIn("tick the box", dlg.build())
         dlg.fp_ok.setChecked(True)
-        dlg.mac.setText("3c:ec:ef")
+        dlg.mac.setText("a0:b1:c2")
         self.assertIn("MAC", dlg.build())
-        dlg.mac.setText("3C-EC-EF-6E-A7-96")
+        dlg.mac.setText("A0-B1-C2-D3-E4-F5")
         h = dlg.build()
-        self.assertEqual((h.name, h.mac, h.port), ("192.0.2.80", "3c:ec:ef:6e:a7:96", 8006))
+        self.assertEqual((h.name, h.mac, h.port), ("192.0.2.80", "a0:b1:c2:d3:e4:f5", 8006))
 
     def test_whole_fingerprint_is_visible(self):
         # the real pve-ssl.pem fingerprint of the user's host (public): on one line its last 5 bytes were cut off
         fp = "2B:1E:01:0A:8C:97:D5:65:89:37:E5:74:07:02:F8:DF:9E:B4:68:07:2B:7B:34:DD:04:43:3D:C7:36:2D:39:D4"
-        host = Host(id="h", name="Home", address="192.168.1.80", token_id="root@pam!controller", token_secret="s",
+        host = Host(id="h", name="Home", address="192.168.1.10", token_id="root@pam!controller", token_secret="s",
                     fingerprint=fp)
         dlg = HostDialog(None, self.runner, DemoPve, host)
         dlg.show()

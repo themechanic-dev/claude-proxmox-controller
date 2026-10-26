@@ -15,7 +15,7 @@ _MAC = re.compile(r"^[0-9a-f]{2}([:-]?)[0-9a-f]{2}(?:\1[0-9a-f]{2}){4}$", re.IGN
 
 
 def normalize_mac(mac: str) -> str:
-    """'3C-EC-EF-6E-A7-96' / '3cecef6ea796' / '3c:ec:ef:6e:a7:96' → '3c:ec:ef:6e:a7:96'. ValueError if not a MAC."""
+    """'A0-B1-C2-D3-E4-F5' / 'a0b1c2d3e4f5' / 'a0:b1:c2:d3:e4:f5' → 'a0:b1:c2:d3:e4:f5'. ValueError if not a MAC."""
     text = mac.strip()
     if not _MAC.match(text):
         raise ValueError(f"not a MAC address: {mac!r}")
