@@ -52,7 +52,9 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], ti
                               "password": cloudseed.sha512_crypt(password)},
                  "ssh": {"install-server": True, "authorized-keys": keys, "allow-pw": not keys},
                  "packages": ["qemu-guest-agent"], "storage": STORAGE,
-                 "network": cloudseed.network_config(static)}
+                 "network": cloudseed.network_config(static),
+                 # (merged into what the installed system's first boot runs: a clean text login there too)
+                 "user-data": dict(cloudseed.QUIET_KEYS)}
     if time_zone:
         cfg["timezone"] = time_zone
     return "#cloud-config\n" + json.dumps({"autoinstall": cfg}, indent=2) + "\n"

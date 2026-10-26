@@ -3080,6 +3080,9 @@ class CloudSeedTest(unittest.TestCase):
         self.assertNotIn(["systemctl", "start", "qemu-guest-agent"], run)  # (masked until the restart)
         self.assertEqual(cfg["power_state"]["mode"], "reboot")
         self.assertTrue(cfg["package_upgrade"])  # the image on the host ages: the VM starts up to date
+        # the SSH keys made without printing over the text login (26/10)
+        self.assertEqual((cfg["ssh_quiet_keygen"], cfg["ssh"], cfg["no_ssh_fingerprints"]),
+                         (True, {"emit_keys_to_console": False}, True))
         # the text login says the work goes on behind it, until the end
         self.assertEqual([f["path"] for f in cfg["write_files"]], [cloudseed.SETUP_ISSUE])
         self.assertIn("in the background", cfg["write_files"][0]["content"])
@@ -3244,6 +3247,7 @@ class AutoinstallTest(unittest.TestCase):
         self.assertEqual(ai["packages"], ["qemu-guest-agent"])
         self.assertEqual(ai["storage"], {"layout": {"name": "lvm", "sizing-policy": "all"}})  # the whole disk
         self.assertEqual(ai["network"]["ethernets"]["ens18"]["dhcp-identifier"], "mac")
+        self.assertEqual(ai["user-data"], cloudseed.QUIET_KEYS)  # a clean login on the installed system too
         keyed = self.config(ssh_keys=["ssh-ed25519 AAAA me@pc", " "], keyboard="us")
         self.assertEqual(keyed["ssh"]["authorized-keys"], ["ssh-ed25519 AAAA me@pc"])
         self.assertFalse(keyed["ssh"]["allow-pw"])  # a key: no password over SSH, as the installer does

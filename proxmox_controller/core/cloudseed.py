@@ -64,6 +64,9 @@ SETUP_MESSAGES = {
               "It restarts by itself if an update needs it.\n"
               "Please do not sign in here or turn it off.\n\n"}
 REBOOT_REQUIRED = "/var/run/reboot-required"  # (left by an update that needs a restart, such as a new kernel)
+# The first boot's SSH keys made without a word on the console: cloud-init printed their fingerprints and pictures
+# over the text login, which then looked broken (the user's test, 26/10). Still in /var/log/cloud-init-output.log
+QUIET_KEYS = {"ssh_quiet_keygen": True, "ssh": {"emit_keys_to_console": False}, "no_ssh_fingerprints": True}
 
 
 def sha512_crypt(password: str, salt: str | None = None, rounds: int = 5000) -> str:
@@ -147,7 +150,7 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], de
                  "user": {"name": user, "gecos": user},  # (else the login screen calls the user "Ubuntu")
                  "chpasswd": {"expire": False}, "users": ["default"], "package_update": True,
                  "package_upgrade": True,  # (as Proxmox's own: the image on the host ages, the VM starts up to date)
-                 "packages": packages, "runcmd": []}
+                 "packages": packages, "runcmd": [], **QUIET_KEYS}
     if password:
         cfg["password"] = sha512_crypt(password)
     if time_zone:
