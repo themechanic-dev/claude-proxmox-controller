@@ -14,7 +14,14 @@ from typing import Callable
 from .rfb import RfbClient, RfbError, qnum_from_evdev
 
 MAX_WIDTH = 1280  # wider screens are halved (or more): enough to read, and lighter for Claude to look at
-KEY_GAP_S = 0.012  # between keys, so a busy guest misses none
+KEY_GAP_S = 0.03  # between typed keys, so a busy guest misses none (slow on purpose — the user, 26/10: "as slowly as
+# it takes to do it right; nobody minds waiting for long texts")
+# QEMU's PS/2 keyboard holds 16 bytes for the guest; a text console busy redrawing long lines drains it late, and what
+# does not fit is dropped — a lost Shift release left every later key shifted, on screen and in the next command
+# (measured 26/10 on the 24.04 build VM, at 12 ms a key). So a breath every few characters and after Enter, and Shift
+# let go at both ends of every typing.
+BREATH_EVERY = 20
+BREATH_S = 0.25
 KEY_HOLD_S = 0.08  # a key held as a hand holds it: answer_prompt's keys (Windows' boot question took no shorter one)
 # Linux input codes of the keys answer_prompt may press, for their keyboard scan codes (QEMU's extended key event):
 # sent as the built-in console sends a key typed by the user — which Windows' boot question took, when a key sent by
@@ -134,22 +141,31 @@ def type_keys(key: Callable[[bool, int], None], text: str, stop: threading.Event
     """Types `text` with key(down, keysym) — Shift held where a US keyboard needs it — a key every KEY_GAP_S;
     stops before the next key once `stop` is set; `count(n)` hears how many were typed. Returns that number."""
     typed = 0
-    for ch in text:
-        if stop is not None and stop.is_set():
-            break
-        sym = keysym_of(ch)
-        shift = ch in SHIFTED
-        if shift:
-            key(True, SHIFT)
-        key(True, sym)
-        key(False, sym)
-        if shift:
-            key(False, SHIFT)
-        typed += 1
-        if count is not None:
-            count(typed)
-        time.sleep(KEY_GAP_S)
+    key(False, SHIFT)  # (a Shift left down by an earlier typing whose release was lost)
+    try:
+        for ch in text:
+            if stop is not None and stop.is_set():
+                break
+            sym = keysym_of(ch)
+            shift = ch in SHIFTED
+            if shift:
+                key(True, SHIFT)
+            key(True, sym)
+            key(False, sym)
+            if shift:
+                key(False, SHIFT)
+            typed += 1
+            if count is not None:
+                count(typed)
+            time.sleep(BREATH_S if ch == "\n" or typed % BREATH_EVERY == 0 else KEY_GAP_S)
+    finally:
+        key(False, SHIFT)
     return typed
+
+
+def seconds_to_type(n: int) -> float:
+    """About how long type_keys takes for n characters."""
+    return n * KEY_GAP_S + (n // BREATH_EVERY) * (BREATH_S - KEY_GAP_S)
 
 
 def parse_combo(combo: str) -> list[int]:

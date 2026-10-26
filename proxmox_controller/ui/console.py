@@ -363,7 +363,7 @@ class PasteDialog(QDialog):
         text, bad = self.to_type()
         lines = text.rstrip("\n").count("\n") + 1 if text else 0
         words = [f"{lines} line{'s' if lines != 1 else ''}, {len(text):,} characters — about "
-                 f"{max(1, round(len(text) / 70))} s."] if text else ["Nothing to type."]
+                 f"{max(1, round(screen.seconds_to_type(len(text))))} s."] if text else ["Nothing to type."]
         if lines > 1:
             words.append("In a terminal each line runs as its Enter is typed.")
         if bad:

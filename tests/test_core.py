@@ -3045,10 +3045,13 @@ class TypingTest(unittest.TestCase):
         keys, stop = [], threading.Event()
         with mock.patch.object(screen, "KEY_GAP_S", 0.0):
             self.assertEqual(screen.type_keys(lambda d, s: keys.append((d, s)), "a:\n"), 3)
-            self.assertEqual(keys, [(True, ord("a")), (False, ord("a")), (True, screen.SHIFT), (True, ord(":")),
-                                    (False, ord(":")), (False, screen.SHIFT), (True, 0xFF0D), (False, 0xFF0D)])
+            self.assertEqual(keys, [(False, screen.SHIFT),  # (a Shift left down by an earlier typing: let go)
+                                    (True, ord("a")), (False, ord("a")), (True, screen.SHIFT), (True, ord(":")),
+                                    (False, ord(":")), (False, screen.SHIFT), (True, 0xFF0D), (False, 0xFF0D),
+                                    (False, screen.SHIFT)])
             stop.set()
             self.assertEqual(screen.type_keys(lambda d, s: None, "abc", stop), 0)  # stopped: nothing more
+        self.assertAlmostEqual(screen.seconds_to_type(60), 60 * 0.03 + 3 * 0.22)  # (a breath every 20)
 
 
 class GuestFilesTest(unittest.TestCase):

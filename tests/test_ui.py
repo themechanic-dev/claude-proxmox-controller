@@ -2140,7 +2140,7 @@ class ConsoleTest(UiCase):
         self.assertNotIn(ord("V"), [k[2] for k in srv.keys])  # the shortcut is the app's, not the guest's
         first = next(i for i, k in enumerate(srv.keys) if k[2] == ord("u"))
         held = [k for k in srv.keys[:first] if 0xFFE1 <= k[2] <= 0xFFEE]
-        self.assertEqual(sum(1 if k[1] else -1 for k in held), 0)  # Ctrl and Shift let go before the typing
+        self.assertLessEqual({k[2] for k in held if k[1]}, {k[2] for k in held if not k[1]})  # let go before typing
         self.assertIsNone(win.paste_dialog)
         self.copied = "one\ntwo"  # more than one line: Paste… first
         QTest.keyClick(win.view, Qt.Key.Key_V, ctrl_shift)
