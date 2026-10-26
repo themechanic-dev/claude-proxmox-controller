@@ -19,9 +19,10 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import (autoinstall, claude_policy, cloudseed, cloudvm, guestfiles, screen, setupdisc, ssh, startup, staticnet,
+               ubuntu_releases,
                tasks, timezones, vmhw,
                winsetup, wol)
-from .cloudvm import CLOUD_IMAGES, CLOUD_URL, USERNAME
+from .cloudvm import CLOUD_URL, USERNAME
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
 from .vmspec import PROFILES, VIRTIO_AS_SYSTEM, VMNAME, WINDOWS, is_virtio_disc, iso_name_from_url, vm_params
@@ -325,7 +326,7 @@ def _media(ctx: Context, a: dict):
     return {"node": node, "next_free_vmid": ctx.pve.next_id(),
             "isos": [i["volid"] for i in ctx.pve.isos(node) if not setupdisc.is_setup_disc(i["volid"] or "")],
             "cloud_images": [i["volid"] for i in ctx.pve.images(node)],
-            "cloud_images_offered": {v: CLOUD_URL.format(v=v) for v in CLOUD_IMAGES},
+            "cloud_images_offered": {v: CLOUD_URL.format(v=v) for v in ubuntu_releases.refresh()},
             "container_templates": [t["volid"] for t in ctx.pve.templates(node)],
             "vm_disk_storages": [s["storage"] for s in ctx.pve.storages(node, content="images")],
             "container_storages": [s["storage"] for s in ctx.pve.storages(node, content="rootdir")],
@@ -836,14 +837,25 @@ def _create_ct(ctx: Context, a: dict):
     return out
 
 
+def _release(a: dict) -> str:
+    """The Ubuntu release asked for — one of those offered now (core/ubuntu_releases) — or the first of them."""
+    offered = ubuntu_releases.releases()
+    v = a.get("release") or offered[0]
+    if v not in offered:
+        raise ToolError(f"Ubuntu {v} is not offered: the LTS releases now are {', '.join(offered)} "
+                        "(list_install_media: cloud_images_offered).")
+    return v
+
+
 def _cloud_words(ctx: Context, a: dict):
-    v = a.get("release", "24.04")
-    return f"Download Ubuntu {v} Server (cloud image, {CLOUD_IMAGES[v]} MB) onto {ctx.host.name}", [
+    v = _release(a)
+    mb = ubuntu_releases.size_mb(v)
+    return f"Download Ubuntu {v} Server (cloud image{f', {mb} MB' if mb else ''}) onto {ctx.host.name}", [
         CLOUD_URL.format(v=v), "Downloaded once; new VMs are made from it in about a minute."]
 
 
 def _cloud_image(ctx: Context, a: dict):
-    node, v = ctx.node(a.get("node", "")), a.get("release", "24.04")
+    node, v = ctx.node(a.get("node", "")), _release(a)
     name = cloudvm.image_name(v)
     there = cloudvm.find_image(ctx.pve.images(node), v)
     if there:
@@ -1729,9 +1741,11 @@ def _tools() -> list[Tool]:
                                if a.get("windows_user") else
                                f"Password for the user '{a['linux_user']}' in the new VM {a.get('name', '')}"
                                if a.get("linux_user") else "")),
-        Tool("get_cloud_image", "change", "Have the host download Ubuntu Server's official cloud image (24.04 or "
-             "26.04), once, to make VMs from with create_cloud_vm.",
-             {**host, "release": {"type": "string", "enum": list(CLOUD_IMAGES)}, "storage": {"type": "string"},
+        Tool("get_cloud_image", "change", "Have the host download Ubuntu Server's official cloud image — an LTS "
+             "release still supported (list_install_media: cloud_images_offered) — once, to make VMs from with "
+             "create_cloud_vm.",
+             {**host, "release": {"type": "string", "description": "Such as 24.04 or 26.04; a new LTS shows in "
+                                  "list_install_media by itself."}, "storage": {"type": "string"},
               "node": {"type": "string"}}, ("host",), _cloud_image, _cloud_words),
         Tool("create_cloud_vm", "change", "Create an Ubuntu VM from a cloud image (see get_cloud_image) — no "
              "installer: a user, its password (the USER types it in Proxmox Controller's window; you never give or see "

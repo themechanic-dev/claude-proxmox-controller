@@ -13,7 +13,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QLineEdit, QProgressDialog, QRadioButton, QSpinBox, QVBoxLayout, QWidget)
 
-from ..core import autoinstall, cloudseed, cloudvm, setupdisc, staticnet, timezones, winsetup
+from ..core import autoinstall, cloudseed, cloudvm, setupdisc, staticnet, timezones, ubuntu_releases, winsetup
 from ..core.pve import Pve, PveError, q, upload_name
 from ..core.vmspec import (PROFILES, VIRTIO_AS_SYSTEM, VMNAME, WINDOWS, is_virtio_disc,  # noqa: F401 (tests too)
                            iso_name_from_url, looks_like_windows, vm_params)
@@ -137,6 +137,12 @@ class DownloadIsoDialog(_Busy, QDialog):
         self.runner.run(job, finished)
 
 
+def size_words(release: str) -> str:
+    """" (about 626 MB)", or "" where the size is not known."""
+    mb = ubuntu_releases.size_mb(release)
+    return f" (about {mb} MB)" if mb else ""
+
+
 # -- the new VM ------------------------------------------------------------------------------------
 
 class CreateVmDialog(_Busy, QDialog):
@@ -229,9 +235,10 @@ class CreateVmDialog(_Busy, QDialog):
         win_row.addWidget(self.edition, 1)
         win_row.addWidget(self.language)
         # a ready-made Ubuntu
-        self.release = QComboBox()
-        for v in cloudvm.CLOUD_IMAGES:
+        self.release = QComboBox()  # the LTS releases offered now (core/ubuntu_releases), read again below
+        for v in ubuntu_releases.releases():
             self.release.addItem(f"{v} LTS", v)
+        self.runner.run(ubuntu_releases.refresh, self._releases_read)
         self.cloud_edition = QComboBox()
         self.cloud_edition.addItem("Server", "server")
         self.cloud_edition.addItem("Desktop", "desktop")
@@ -572,6 +579,20 @@ class CreateVmDialog(_Busy, QDialog):
     def desktop(self) -> bool:
         return self.from_cloud.isChecked() and self.cloud_edition.currentData() == "desktop"
 
+    def _releases_read(self, versions, err) -> None:
+        """Ubuntu's image index read (at most once a day): a new LTS shows, a release past its support goes."""
+        have = [self.release.itemData(i) for i in range(self.release.count())]
+        if err is not None or not versions or versions == have:
+            return
+        chosen = self.release.currentData()
+        self.release.blockSignals(True)
+        self.release.clear()
+        for v in versions:
+            self.release.addItem(f"{v} LTS", v)
+        self.release.setCurrentIndex(max(0, self.release.findData(chosen)))
+        self.release.blockSignals(False)
+        self._show_image()
+
     def _show_image(self) -> None:
         there = bool(cloudvm.find_image(self.cloud_images, self.release.currentData()))
         self.image_state.setText("image on the host" if there else "")
@@ -726,8 +747,8 @@ class CreateVmDialog(_Busy, QDialog):
             return
         storage = self.import_storages[0]
         if not confirm(self, "Download Ubuntu's cloud image?",
-                       f"The host downloads Ubuntu {release} Server's official cloud image (about "
-                       f"{cloudvm.CLOUD_IMAGES[release]} MB) from cloud-images.ubuntu.com into “{storage}”, once. "
+                       f"The host downloads Ubuntu {release} Server's official cloud image"
+                       f"{size_words(release)} from cloud-images.ubuntu.com into “{storage}”, once. "
                        "New VMs are then made from it in about a minute.", "Download"):
             return
         pve, node = self.client(), self.current_node()

@@ -23,6 +23,7 @@ from unittest import mock
 from proxmox_controller.core import apt, ssh as sshmod
 from proxmox_controller.core import (autostart, claude_access, claude_policy, connector_link, connector_tools, jobs,
                                      mcp, netinfo, screen, sounds, spice, startup, store, tasks, vault, vmhw, wol)
+from proxmox_controller.core import ubuntu_releases
 from proxmox_controller.core import (autoinstall, cloudseed, guestfiles, isofs, setupdisc, staticnet, timezones,
                                      winsetup)
 from proxmox_controller.core.des import encrypt_block, vnc_response
@@ -909,6 +910,12 @@ class ConnectorToolsTest(unittest.TestCase):
         self.pve = DemoPve(DEMO_HOSTS[0])
         self.cluster = self.pve.cluster
         self.woken = []
+        self.releases = Path(tempfile.mkdtemp())  # Ubuntu's release list: never the network, never the app's own file
+        self.addCleanup(shutil.rmtree, self.releases, True)
+        for patch in (mock.patch.object(ubuntu_releases, "fetch_index", side_effect=OSError("no network in tests")),
+                      mock.patch.object(ubuntu_releases, "_cache_path", lambda: self.releases / "ubuntu-releases.json")):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def ctx(self, host=DEMO_HOSTS[0]):
         return connector_tools.Context(host=host, pve=self.pve, admin=self.pve,
@@ -1293,6 +1300,24 @@ class ConnectorToolsTest(unittest.TestCase):
         self.run_tool("stop_task", host="demo-pve", upid=upid, reason="r")
         self.assertEqual(self.cluster.tasks[upid], "interrupted by signal")
         self.assertEqual(self.run_tool("host_power", host="demo-pve", action="reboot", reason="r")["sent"], "reboot")
+
+    def test_cloud_image_releases(self):
+        """The LTS releases offered (core/ubuntu_releases): those Ubuntu's index names, still supported — 22.04 is
+        older than the app's ready-made VMs, an interim release is not an LTS."""
+        self.assertEqual(list(self.run_tool("list_install_media", host="demo-pve")["cloud_images_offered"]),
+                         ["24.04", "26.04"])  # (no network: the list built in)
+        with self.assertRaisesRegex(connector_tools.ToolError, "Ubuntu 22.04 is not offered: .*24.04, 26.04"):
+            self.words("get_cloud_image", host="demo-pve", release="22.04", reason="r")
+        index = {"index": {ubuntu_releases.IMAGES: {"products": [f"com.ubuntu.cloud:server:{v}:amd64" for v in
+                                                                ("22.04", "24.04", "26.04", "26.10", "28.04")]}}}
+        with mock.patch.object(ubuntu_releases, "fetch_index", return_value=index), \
+                mock.patch.object(ubuntu_releases, "fetch_size_mb", return_value=912):
+            offered = self.run_tool("list_install_media", host="demo-pve")["cloud_images_offered"]
+        self.assertEqual(list(offered), ["24.04", "26.04", "28.04"])  # a new LTS, by itself
+        self.assertEqual(offered["28.04"], "https://cloud-images.ubuntu.com/releases/28.04/release/"
+                                           "ubuntu-28.04-server-cloudimg-amd64.img")
+        what, _ = self.words("get_cloud_image", host="demo-pve", release="28.04", reason="r")
+        self.assertEqual(what, "Download Ubuntu 28.04 Server (cloud image, 912 MB) onto Home server (demo)")
 
     def test_cloud_images_and_passwords(self):
         what, _ = self.words("get_cloud_image", host="demo-pve", release="26.04", reason="r")
@@ -2843,6 +2868,59 @@ class GuestFilesLinuxTest(unittest.TestCase):
             self.assertTrue(all(ord(c) < 128 for a in argv for c in a), argv)
         with self.assertRaisesRegex(guestfiles.GuestError, "No such folder"):
             ct.properties(str(self.root / "nope"), ["x"])
+
+
+class UbuntuReleasesTest(unittest.TestCase):
+    """Which Ubuntu releases a ready-made VM can be: read from Ubuntu's image index at most once a day, kept, and
+    offered without the network too (the user's choice, 26/10)."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        patch = mock.patch.object(ubuntu_releases, "_cache_path", lambda: self.dir / "ubuntu-releases.json")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.reads = []
+
+    def index(self, *versions):
+        return {"index": {ubuntu_releases.IMAGES: {"products": [f"com.ubuntu.cloud:server:{v}:{arch}" for v in versions
+                                                               for arch in ("amd64", "arm64")]},
+                          "com.ubuntu.cloud:released:aws": {"products": ["com.ubuntu.cloud:server:30.04:amd64"]}}}
+
+    def fetch(self, *versions):
+        def read():
+            self.reads.append(versions)
+            if not versions:
+                raise OSError("no network")
+            return self.index(*versions)
+        return read
+
+    def test_which_are_offered(self):
+        from datetime import date
+        R = ubuntu_releases
+        self.assertEqual(R.versions_in(self.index("20.04", "24.04", "26.10")), ["20.04", "24.04", "26.10"])
+        every = ["20.04", "22.04", "23.10", "24.04", "24.10", "26.04", "26.10", "28.04"]
+        self.assertEqual(R.offered(every, date(2026, 10, 26)), ["24.04", "26.04", "28.04"])
+        self.assertEqual(R.offered(every, date(2029, 4, 30)), ["24.04", "26.04", "28.04"])  # its last month
+        self.assertEqual(R.offered(every, date(2029, 5, 1)), ["26.04", "28.04"])  # five years on: gone
+        self.assertFalse(R.is_lts("25.04") or R.is_lts("26.10") or R.is_lts("x"))
+
+    def test_read_once_a_day_and_kept(self):
+        from datetime import date
+        R, today = ubuntu_releases, date(2028, 5, 1)
+        self.assertEqual(R.releases(today), ["24.04", "26.04"])  # never read: the list built in
+        with mock.patch.object(R, "fetch_index", self.fetch("24.04", "26.04", "28.04")), \
+                mock.patch.object(R, "fetch_size_mb", return_value=905) as size:
+            self.assertEqual(R.refresh(now=1000, today=today), ["24.04", "26.04", "28.04"])
+            self.assertEqual(R.refresh(now=1000 + 3600, today=today), ["24.04", "26.04", "28.04"])
+        self.assertEqual(len(self.reads), 1)  # not again within a day
+        size.assert_called_once_with("https://cloud-images.ubuntu.com/releases/28.04/release/"
+                                     "ubuntu-28.04-server-cloudimg-amd64.img")  # (only what the app does not know)
+        self.assertEqual((R.size_mb("28.04"), R.size_mb("24.04")), (905, 626))
+        with mock.patch.object(R, "fetch_index", self.fetch()):  # a day on, no network: what was known
+            self.assertEqual(R.refresh(now=1000 + 86400, today=today), ["24.04", "26.04", "28.04"])
+        self.assertEqual(len(self.reads), 2)
+        self.assertEqual(R.releases(today), ["24.04", "26.04", "28.04"])  # (kept: no network needed)
 
 
 class TypingTest(unittest.TestCase):

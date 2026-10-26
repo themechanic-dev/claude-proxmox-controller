@@ -49,7 +49,7 @@ Edit, notes, snapshots, Back Up Now, new VMs and containers, copies, ISOs.
 | `take_snapshot` | Take a snapshot of a guest. |
 | `backup_now` | Back a guest up now (it keeps running in snapshot mode). |
 | `create_vm` | Create a VM that boots an ISO image (see list_install_media). *(starting it also needs Power not Off)* |
-| `get_cloud_image` | Have the host download Ubuntu Server's official cloud image (24.04 or 26.04), once, to make VMs from with create_cloud_vm. |
+| `get_cloud_image` | Have the host download Ubuntu Server's official cloud image — an LTS release still supported (list_install_media: cloud_images_offered) — once, to make VMs from with create_cloud_vm. |
 | `create_cloud_vm` | Create an Ubuntu VM from a cloud image (see get_cloud_image) — no installer: a user, its password (the USER types it in Proxmox Controller's window; you never give or see a password), optionally an SSH public key, network by DHCP. *(starting it also needs Power not Off; asks you for a password)* |
 | `create_container` | Create an unprivileged container from a template (see list_install_media). *(starting it also needs Power not Off; asks you for a password)* |
 | `clone_vm` | Copy a VM or a template as a new VM. |

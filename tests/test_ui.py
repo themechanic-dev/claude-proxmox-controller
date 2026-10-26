@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - the core tests still run with plain py
 
 if QApplication is not None:
     from proxmox_controller.core import store
+    from proxmox_controller.core import ubuntu_releases
     from proxmox_controller.core.demo import DEMO_HOSTS, DemoPve
     from proxmox_controller.core.pve import Host, PveError
     from proxmox_controller import app as app_module
@@ -125,6 +126,14 @@ class UiCase(unittest.TestCase):
         self.patches.append(mock.patch.object(files_window, "QGuiApplication", types.SimpleNamespace(
             clipboard=lambda: types.SimpleNamespace(setText=self.clipboard.append))))
         self.copied = ""  # what "this computer has copied", for the console's Paste… (never the real clipboard)
+        self.ubuntu_index = None  # Ubuntu's image index as the tests want it (never the network)
+
+        def ubuntu_index():
+            if self.ubuntu_index is None:
+                raise OSError("no network in tests")
+            return self.ubuntu_index
+        self.patches.append(mock.patch.object(ubuntu_releases, "fetch_index", ubuntu_index))
+        self.patches.append(mock.patch.object(ubuntu_releases, "fetch_size_mb", lambda url: 905))
         self.patches.append(mock.patch.object(console, "clipboard_text", lambda: self.copied))
         for p in self.patches:
             p.start()
@@ -1676,6 +1685,23 @@ class VmDialogTest(UiCase):
 
     def visible(self, dlg, field):
         return dlg.form.isRowVisible(dlg._row_of(field))
+
+    def test_ubuntu_releases_from_ubuntus_index(self):
+        """The ready-made Ubuntu's releases: the list kept (here the one built in) at once, then Ubuntu's index read
+        in the background — a new LTS shows, what was chosen stays chosen."""
+        self.ubuntu_index = {"index": {ubuntu_releases.IMAGES: {"products": [
+            f"com.ubuntu.cloud:server:{v}:amd64" for v in ("22.04", "24.04", "26.04", "26.10", "28.04")]}}}
+        with mock.patch.object(ubuntu_releases, "supported", lambda v, today=None: True):  # (whatever today is)
+            dlg = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"])
+            self.addCleanup(dlg.close)
+            first = [dlg.release.itemData(i) for i in range(dlg.release.count())]
+            dlg.release.setCurrentIndex(dlg.release.findData("26.04"))
+            self.assertTrue(wait_until(lambda: dlg.release.count() == 3))
+        self.assertEqual(first, ["24.04", "26.04"])
+        self.assertEqual([dlg.release.itemText(i) for i in range(3)], ["24.04 LTS", "26.04 LTS", "28.04 LTS"])
+        self.assertEqual(dlg.release.currentData(), "26.04")
+        self.assertEqual(vm_dialog.size_words("28.04"), " (about 905 MB)")  # (asked of the image's server)
+        self.assertEqual(vm_dialog.size_words("24.04"), " (about 626 MB)")
 
     def test_linux_vm_from_iso(self):
         dlg = self.dialog()
