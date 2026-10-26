@@ -543,7 +543,7 @@ class BridgeEncodingTest(unittest.TestCase):
         self.assertNotIn(b"\r\n", data)  # a message a line, ended by \n alone
         answers = [json.loads(line) for line in text.splitlines()]
         self.assertEqual([a["id"] for a in answers], [1, 2])
-        self.assertEqual(len(answers[1]["result"]["tools"]), len(connector_tools.TOOLS))
+        self.assertEqual(len(answers[1]["result"]["tools"]), len(connector_tools.TOOLS) + 1)  # + wait_for_request
 
     def test_askpass_gives_the_passwords_own_bytes(self):
         from proxmox_controller.core import claude_connect
@@ -585,7 +585,10 @@ class McpBridgeTest(unittest.TestCase):
         self.assertEqual(init["serverInfo"]["name"], "proxmox-controller")
         self.assertIn("list_hosts", init["instructions"])
         tools = {t["name"]: t for t in by_id[2]["result"]["tools"]}
-        self.assertEqual(len(tools), len(connector_tools.TOOLS))
+        self.assertEqual(len(tools), len(connector_tools.TOOLS) + 1)
+        self.assertEqual(tools["wait_for_request"]["inputSchema"]["required"], ["request"])  # the bridge's own
+        self.assertNotIn("reason", tools["wait_for_request"]["inputSchema"]["properties"])
+        self.assertIn("wait_for_request", init["instructions"])
         self.assertTrue(tools["list_guests"]["annotations"]["readOnlyHint"])
         self.assertTrue(tools["delete_guest"]["annotations"]["destructiveHint"])
         self.assertIn("reason", tools["guest_power"]["inputSchema"]["required"])  # every non-read request says why
@@ -633,6 +636,58 @@ class McpBridgeTest(unittest.TestCase):
         self.assertTrue(progress and progress[0]["params"]["progressToken"] == "p1")
         self.assertEqual([p["params"]["progress"] for p in progress], list(range(1, len(progress) + 1)))
         self.assertIn("Cancelled", lines[-1]["result"]["content"][0]["text"])
+
+
+    def test_waiting_answered_before_the_clients_limit(self):
+        # Claude's desktop app gives up on a request at 60 s (26/10), the approval window gives the user two minutes:
+        # still going after ANSWER_BY_S, the request is answered "waiting", and wait_for_request gives its answer
+        seen, release = [], threading.Event()
+
+        def app(message, timeout=600):
+            seen.append(message)
+            if "cancel" in message:
+                return {"result": {}}
+            release.wait(5)
+            return {"result": {"content": [{"type": "text", "text": "VM 109 made"}], "isError": False}}
+
+        out = io.StringIO()
+        bridge = mcp.Bridge(out=out, call=app)
+
+        def ask(mid, name, arguments):
+            bridge.handle({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                           "params": {"name": name, "arguments": arguments}})
+            bridge.threads[-1].join(5)
+            answer = [json.loads(x) for x in out.getvalue().splitlines() if json.loads(x).get("id") == mid]
+            return answer[0]["result"]
+
+        with mock.patch.object(mcp, "ANSWER_BY_S", 0.1):
+            first = ask(1, "create_cloud_vm", {"host": "h1", "name": "pc-test-desktop", "reason": "a test"})
+            self.assertFalse(first["isError"])
+            waiting = json.loads(first["content"][0]["text"])
+            self.assertEqual((waiting["status"], waiting["tool"]), ("waiting", "create_cloud_vm"))
+            ticket = waiting["request"]
+            again = json.loads(ask(2, "wait_for_request", {"request": ticket})["content"][0]["text"])
+            self.assertEqual((again["status"], again["request"]), ("waiting", ticket))  # still not answered
+            release.set()
+            done = ask(3, "wait_for_request", {"request": ticket})
+            self.assertEqual(done["content"][0]["text"], "VM 109 made")
+            self.assertEqual(len(seen), 1)  # asked of the app once, however long Claude waited
+            gone = ask(4, "wait_for_request", {"request": ticket})  # answered already: no second answer
+            self.assertTrue(gone["isError"])
+            self.assertIn("list_tasks", gone["content"][0]["text"])
+            self.assertTrue(ask(5, "wait_for_request", {"request": "nope"})["isError"])
+            # Claude stopped while waiting: the app hears which request was given up, and closes its window
+            release.clear()
+            ticket = json.loads(ask(6, "guest_power", {"reason": "x"})["content"][0]["text"])["request"]
+            bridge.handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                           "params": {"name": "wait_for_request", "arguments": {"request": ticket}}})
+            time.sleep(0.02)
+            bridge.handle({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}})
+            release.set()
+            for t in bridge.threads:
+                t.join(5)
+        self.assertEqual(seen[-1], {"cancel": seen[-2]["key"]})
+        self.assertEqual(seen[-2]["tool"], "guest_power")
 
 
 class ConnectorLinkTest(unittest.TestCase):

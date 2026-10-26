@@ -1955,6 +1955,12 @@ def access_markdown() -> str:
             notes = f" *({'; '.join(t['notes'])})*" if t["notes"] else ""
             lines.append(f"| `{t['name']}` | {t['does'].replace('|', '/')}{notes} |")
         lines.append("")
+    lines += ["## Waiting for an answer — no switch", "",
+              "A request not done within about 45 seconds — you have not answered its window yet, or its work goes on "
+              "— is answered *waiting*, with an id, and Claude goes on waiting with `wait_for_request`. It asks you "
+              "nothing and does nothing: it only gives the answer of a request already made, when there is one. "
+              "(Some of Claude's apps give up on a request after 60 seconds, while the window gives you two minutes.)",
+              ""]
     return "\n".join(lines)
 
 
@@ -1965,5 +1971,9 @@ INSTRUCTIONS = (
     "'ask' means the user approves each request in a window of the app (it may take a while, and they may deny it); "
     "'off' means it will be refused — tell the user instead of trying another way. Every request other than reading "
     "needs a short reason, shown to the user. Long Proxmox tasks come back as running: follow them with task_log. "
+    "A request not done within about 45 seconds (the user has not answered its window yet, or its work goes on) comes "
+    "back with status 'waiting' and an id: call wait_for_request with it until the answer comes — never send the "
+    "request again, or it is asked or done twice. If a request ever fails with a timeout on your side, it may still "
+    "have been approved and done: check (list_guests, list_tasks) before asking again. "
     "You never give or see a password: where one is needed (a new VM's user, a container's root, a console prompt) "
     "the user types it in the app's window.")

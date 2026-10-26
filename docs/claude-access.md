@@ -126,3 +126,7 @@ Run commands on the host itself, as root, over the app's SSH key.
 |---|---|
 | `host_command` | Run a shell command on the Proxmox host itself, as root, over the SSH key the user set up in Proxmox Controller, and get its output and exit code — for what the API cannot do (installed programs, services, logs, files). |
 | `set_container_root_password` | Set a running container's root password to one the USER types in Proxmox Controller's window (you never give or see it) — for a container whose root password is lost, or to give it a new one. *(asks you for a password)* |
+
+## Waiting for an answer — no switch
+
+A request not done within about 45 seconds — you have not answered its window yet, or its work goes on — is answered *waiting*, with an id, and Claude goes on waiting with `wait_for_request`. It asks you nothing and does nothing: it only gives the answer of a request already made, when there is one. (Some of Claude's apps give up on a request after 60 seconds, while the window gives you two minutes.)
