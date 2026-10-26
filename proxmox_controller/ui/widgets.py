@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLayout, QLayoutItem, QMessageBox, QProgressBar,
-                               QPushButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QLayout, QLayoutItem,
+                               QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget)
 
 from .theme import refresh_widget_style
 
@@ -265,20 +265,159 @@ def row(*widgets: QWidget, spacing: int = 8, stretch_after: int | None = None) -
     return lay
 
 
-def confirm(parent: QWidget, title: str, text: str, action: str, destructive: bool = False) -> bool:
-    """Ask before doing something. The safe answer (Cancel) is the default."""
-    box = QMessageBox(parent)
-    box.setWindowTitle(title)
-    box.setIcon(QMessageBox.Icon.Warning if destructive else QMessageBox.Icon.Question)
-    box.setText(f"<b>{title}</b>")
-    box.setInformativeText(text)
-    go = box.addButton(action, QMessageBox.ButtonRole.AcceptRole)
-    go.setProperty("kind", "destructive" if destructive else "suggested")
-    cancel = box.addButton(QMessageBox.StandardButton.Cancel)
-    box.setDefaultButton(cancel)
-    box.setEscapeButton(cancel)
-    box.exec()
-    return box.clickedButton() is go
+def badge(glyph: str, color: str, size: int = 40) -> QPixmap:
+    """A round badge for a question's window: `glyph` drawn in `color` on a pale disc of the same colour — stop,
+    power, reboot, trash, host, warning or question."""
+    from PySide6.QtCore import QPointF, QRectF
+    from PySide6.QtGui import QFont, QPen, QPolygonF
+    pm = QPixmap(QSize(size * 2, size * 2))
+    pm.setDevicePixelRatio(2.0)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.scale(size / 40, size / 40)  # drawn on a 40-point grid
+    col = QColor(color)
+    disc = QColor(col)
+    disc.setAlphaF(0.18)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(disc)
+    p.drawEllipse(QRectF(0, 0, 40, 40))
+    pen = QPen(col, 2.2)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    if glyph == "stop":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawRoundedRect(QRectF(14, 14, 12, 12), 2.5, 2.5)
+    elif glyph == "power":
+        p.drawArc(QRectF(12, 13, 16, 16), 125 * 16, 290 * 16)
+        p.drawLine(QPointF(20, 10.5), QPointF(20, 19))
+    elif glyph == "reboot":
+        p.drawArc(QRectF(12, 12, 16, 16), 70 * 16, 290 * 16)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawPolygon(QPolygonF([QPointF(21, 8.5), QPointF(26.5, 12.5), QPointF(20.5, 15.5)]))
+    elif glyph == "trash":
+        p.drawLine(QPointF(12, 14), QPointF(28, 14))
+        p.drawPolyline(QPolygonF([QPointF(17.5, 14), QPointF(17.5, 11.5), QPointF(22.5, 11.5), QPointF(22.5, 14)]))
+        p.drawPolygon(QPolygonF([QPointF(14, 16), QPointF(15.5, 28.5), QPointF(24.5, 28.5), QPointF(26, 16)]))
+        p.drawLine(QPointF(18.5, 19), QPointF(18.5, 25.5))
+        p.drawLine(QPointF(21.5, 19), QPointF(21.5, 25.5))
+    elif glyph == "host":
+        for top in (12, 21):
+            p.drawRoundedRect(QRectF(12, top, 16, 7), 2, 2)
+            p.drawPoint(QPointF(16, top + 3.5))
+    elif glyph == "warning":
+        p.drawPolygon(QPolygonF([QPointF(20, 10.5), QPointF(29.5, 27.5), QPointF(10.5, 27.5)]))
+        p.drawLine(QPointF(20, 16.5), QPointF(20, 21.5))
+        p.drawPoint(QPointF(20, 24.5))
+    else:  # a question
+        font = QFont(p.font())
+        font.setPixelSize(20)
+        font.setBold(True)
+        p.setFont(font)
+        p.drawText(QRectF(0, 0, 40, 40), Qt.AlignmentFlag.AlignCenter, "?")
+    p.end()
+    return pm
+
+
+def guest_card(g: dict) -> QFrame:
+    """A guest as a question's window shows it: its status dot, its name, and "VM 108 · running · pve ·
+    192.168.1.50" (g: a guest of the list, with "ips" where the app knows them)."""
+    from .theme import colors
+    c = colors()
+    frame = QFrame()
+    frame.setObjectName("guestCard")
+    lay = QHBoxLayout(frame)
+    lay.setContentsMargins(12, 10, 12, 10)
+    lay.setSpacing(10)
+    running = g.get("status") == "running"
+    dot = QLabel()
+    dot.setPixmap(dot_icon(c.success if running else c.dim).pixmap(16, 16))
+    lay.addWidget(dot, 0, Qt.AlignmentFlag.AlignTop)
+    words = QVBoxLayout()
+    words.setSpacing(0)
+    words.addWidget(label(f"<b>{g.get('name', '') or '—'}</b>"))
+    kind = "VM" if g.get("type") == "qemu" else "Container"
+    sub = [f"{kind} {g.get('vmid', '')}", str(g.get("status", "") or ""), str(g.get("node", "") or "")]
+    sub += [ip for ip in (g.get("ips") or [])[:1]]
+    words.addWidget(label(" · ".join(x for x in sub if x), "dim"))
+    lay.addLayout(words, 1)
+    return frame
+
+
+class ConfirmDialog(QDialog):
+    """A question before a change (the user's wish, 26/10: the old message boxes looked rough): a round badge, the
+    question in bold and what follows from it, the guests it is about as cards, an optional note, and the buttons —
+    Cancel by default and on Escape; the action blue, or red where it destroys something; and optionally a second,
+    gentler way (`instead`, such as "Shut Down Instead" beside Stop). `choice` is then "go", "instead" or ""."""
+
+    CARDS = 4  # guests shown as cards; the rest are counted
+
+    def __init__(self, parent: QWidget | None, title: str, text: str, action: str, destructive: bool = False,
+                 icon: str = "", guests=(), note: str = "", instead: str = ""):
+        from .theme import colors
+        super().__init__(parent)
+        c = colors()
+        self.choice = ""
+        self.setWindowTitle(title.rstrip("?"))
+        self.setModal(True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 16)
+        lay.setSpacing(14)
+        head = QHBoxLayout()
+        head.setSpacing(14)
+        self.badge = QLabel()
+        self.badge.setPixmap(badge(icon or ("warning" if destructive else "question"),
+                                   c.danger if destructive else c.accent))
+        head.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignTop)
+        words = QVBoxLayout()
+        words.setSpacing(4)
+        self.title = label(title, "confirmTitle", wrap=True)
+        words.addWidget(self.title)
+        self.text = label(text, "dim", wrap=True)
+        words.addWidget(self.text)
+        head.addLayout(words, 1)
+        lay.addLayout(head)
+        guests = list(guests)
+        for g in guests[:self.CARDS]:
+            lay.addWidget(guest_card(g))
+        if len(guests) > self.CARDS:
+            lay.addWidget(label(f"…and {len(guests) - self.CARDS} more", "dim"))
+        self.note = label(f"ⓘ  {note}", "dim", wrap=True) if note else None
+        if self.note is not None:
+            lay.addWidget(self.note)
+        buttons = QDialogButtonBox()
+        self.instead = None
+        if instead:
+            self.instead = buttons.addButton(instead, QDialogButtonBox.ButtonRole.ResetRole)
+            self.instead.clicked.connect(lambda: self._done("instead"))
+        self.cancel = buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        self.go = buttons.addButton(action, QDialogButtonBox.ButtonRole.AcceptRole)
+        self.go.setProperty("kind", "destructive" if destructive else "suggested")
+        self.go.clicked.connect(lambda: self._done("go"))
+        self.cancel.clicked.connect(self.reject)
+        for b in buttons.buttons():
+            b.setAutoDefault(False)
+        self.cancel.setDefault(True)  # the safe answer, on Enter too
+        lay.addWidget(buttons)
+        fit_to_width(self, 460)
+
+    def _done(self, choice: str) -> None:
+        self.choice = choice
+        self.accept()
+
+
+def confirm(parent: QWidget, title: str, text: str, action: str, destructive: bool = False, *, icon: str = "",
+            guests=(), note: str = "", instead: str = "") -> bool | str:
+    """Ask before doing something (ConfirmDialog); Cancel is the default. True to go on, False not to — or
+    "instead" when the second way `instead` was chosen."""
+    dlg = ConfirmDialog(parent, title, text, action, destructive, icon=icon, guests=guests, note=note,
+                        instead=instead)
+    dlg.exec()
+    return {"go": True, "instead": "instead"}.get(dlg.choice, False)
 
 
 def fit_to_width(dialog: QWidget, width: int) -> None:

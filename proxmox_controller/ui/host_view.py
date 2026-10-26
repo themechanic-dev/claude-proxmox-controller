@@ -869,18 +869,25 @@ class HostView(QWidget):
         g = self.selected()
         if g is None:
             return
-        what = f"{'container' if g['type'] == 'lxc' else 'VM'} {g['vmid']} ({g.get('name', '')})"
+        short = f"{'container' if g['type'] == 'lxc' else 'VM'} {g['vmid']}"
+        what = f"{short} ({g.get('name', '')})"
         if key in ("start", "shutdown", "stop", "reboot"):
+            # (title, what follows, action, destructive, badge, note, a gentler way)
             texts = {
-                "shutdown": ("Shut it down?", "Asks the operating system inside to shut down cleanly.", "Shut Down",
-                             False),
-                "stop": ("Stop it at once?", "Cuts it off immediately, like pulling the plug: unsaved work is lost. "
-                         "Use this only if Shut Down does not work.", "Stop", True),
-                "reboot": ("Reboot it?", "Restarts it cleanly.", "Reboot", False),
+                "shutdown": (f"Shut down {short}?", "Asks the operating system inside to shut down cleanly.",
+                             "Shut Down", False, "power", "", ""),
+                "stop": (f"Stop {short} now?", "Cuts it off at once, like pulling the plug: unsaved work inside is "
+                         "lost.", "Stop Now", True, "stop", "Shut Down closes it cleanly — try that first.",
+                         "Shut Down Instead"),
+                "reboot": (f"Reboot {short}?", "Restarts it cleanly.", "Reboot", False, "reboot", "", ""),
             }
             if key in texts:
-                title, body, action, destructive = texts[key]
-                if not confirm(self, title, f"{what}\n\n{body}", action, destructive):
+                title, body, action, destructive, icon, note, instead = texts[key]
+                answer = confirm(self, title, body, action, destructive, icon=icon, guests=[self.card_of(g)],
+                                 note=note, instead=instead)
+                if answer == "instead":
+                    key = "shutdown"
+                elif not answer:
                     return
             self._run_task(lambda pve: pve.guest_action(g["node"], g["type"], g["vmid"], key),
                            g["node"], f"{key.capitalize()} sent to {what}", f"{key.capitalize()} {what}",
@@ -927,13 +934,18 @@ class HostView(QWidget):
         up = [g for g in many if g.get("status") == "running"]
         if not up:
             return
-        names = ", ".join(f"{g.get('name', '')} ({g['vmid']})" for g in up)
         count = f"{len(up)} guest{'s' if len(up) != 1 else ''}"
+        cards = [self.card_of(g) for g in up]
         if key == "stop":
-            ok = confirm(self, f"Stop {count} at once?", f"{names}\n\nCuts them off immediately, like pulling the "
-                         "plug: unsaved work is lost. Use this only if Shut Down does not work.", "Stop", True)
+            ok = confirm(self, f"Stop {count} now?", "Cuts them off at once, like pulling the plug: unsaved work "
+                         "inside is lost.", "Stop Now", True, icon="stop", guests=cards,
+                         note="Shut Down closes them cleanly — try that first.", instead="Shut Down Instead")
+            if ok == "instead":
+                self.open_bulk("shutdown", [g["vmid"] for g in up])
+                return
         else:
-            ok = confirm(self, f"Reboot {count}?", f"{names}\n\nRestarts them cleanly.", "Reboot", False)
+            ok = confirm(self, f"Reboot {count}?", "Restarts them cleanly.", "Reboot", False, icon="reboot",
+                         guests=cards)
         if not ok:
             return
         pve = self.client()
@@ -1103,6 +1115,11 @@ class HostView(QWidget):
 
     # -- setup discs of new VMs --------------------------------------------------------------------
 
+    def card_of(self, g: dict) -> dict:
+        """A guest for a question's window: with the addresses the app knows of it (widgets.guest_card)."""
+        d = self.details.get(g["vmid"]) or {}
+        return {**g, "ips": d.get("ips", []) if g.get("status") == "running" else []}
+
     def setting_up(self) -> set[int]:
         """This host's VMs that still have their setup disc: they install themselves in the background."""
         return {d["vmid"] for d in self.prefs.get("setup_discs") or [] if d.get("host") == self.host.id}
@@ -1193,14 +1210,14 @@ class HostView(QWidget):
         running = sum(1 for g in self.guests if g.get("status") == "running")
         node = self.nodes[0]
         if command == "shutdown":
-            ok = confirm(self, "Shut down the host?",
-                         f"{self.host.name} ({node}) shuts down its {running} running guest(s) first and then turns "
+            ok = confirm(self, f"Shut down {self.host.name}?",
+                         f"The host ({node}) shuts down its {running} running guest(s) first and then turns "
                          f"off.{' It can be woken again with Wake-on-LAN.' if self.host.mac else ''}",
-                         "Shut Down Host", destructive=True)
+                         "Shut Down Host", destructive=True, icon="power")
         else:
-            ok = confirm(self, "Reboot the host?",
-                         f"{self.host.name} ({node}) shuts down its {running} running guest(s) and restarts.",
-                         "Reboot Host", destructive=True)
+            ok = confirm(self, f"Reboot {self.host.name}?",
+                         f"The host ({node}) shuts down its {running} running guest(s) and restarts.",
+                         "Reboot Host", destructive=True, icon="reboot")
         if not ok:
             return
         pve = self.client()

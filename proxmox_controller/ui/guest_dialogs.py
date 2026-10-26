@@ -10,16 +10,17 @@ from typing import Callable
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFontDatabase, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-                               QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton,
-                               QRadioButton, QSpinBox, QSplitter, QTextBrowser, QVBoxLayout, QWidget)
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit,
+                               QPushButton, QRadioButton, QSpinBox, QSplitter, QTextBrowser, QVBoxLayout, QWidget)
 
 from ..core import vmhw
 from ..core.pve import Pve, PveError
 from . import geometry
 from .chart import LineChart, align
 from .startup_fields import StartupFields
+from .theme import colors
 from .vm_hardware import HardwareFields
-from .widgets import button, confirm, error, fit_to_width, gib, info, label, mem_text
+from .widgets import badge, button, confirm, error, fit_to_width, gib, guest_card, info, label, mem_text
 from .worker import Runner
 
 HOSTNAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9-]{1,63})*$")
@@ -638,9 +639,24 @@ class DeleteDialog(_GuestDialog):
         super().__init__(parent, client, runner, guest, "Delete")
         name = guest.get("name", "")
         self.backups: list[dict] | None = None  # None while they are being looked for
-        self.lay.addWidget(label(f"<b>Delete {kind_name(guest)} {guest['vmid']} ({name}) for good?</b>", wrap=True))
-        self.gone = label("Its disks, snapshots and settings are removed from the host. This cannot be undone.",
-                          "dim", wrap=True)
+        # as every question before a change (widgets.ConfirmDialog): a red badge, the question, the guest as a card
+        self.lay.setContentsMargins(20, 20, 20, 16)
+        self.lay.setSpacing(12)
+        head = QHBoxLayout()
+        head.setSpacing(14)
+        mark = QLabel()
+        mark.setPixmap(badge("trash", colors().danger))
+        head.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
+        words = QVBoxLayout()
+        words.setSpacing(4)
+        words.addWidget(label(f"Delete {kind_name(guest)} {guest['vmid']} for good?", "confirmTitle", wrap=True))
+        words.addWidget(label("This can't be undone.", "dim", wrap=True))
+        head.addLayout(words, 1)
+        self.lay.addLayout(head)
+        self.lay.addWidget(guest_card(guest))
+        self.lay.addWidget(label("What goes with it", "dim"))
+        disk = f"Its disks ({gib(guest['maxdisk'])})" if guest.get("maxdisk") else "Its disks"
+        self.gone = label(f"• {disk}, snapshots and settings, from the host", wrap=True)
         self.lay.addWidget(self.gone)
         self.with_backups = QCheckBox()
         self.with_backups.setChecked(True)
@@ -649,15 +665,18 @@ class DeleteDialog(_GuestDialog):
         self.found = label("Looking for its backups…", "dim", wrap=True)
         self.found.setTextFormat(Qt.TextFormat.RichText)  # always: an escaped '&' in notes must not show as '&amp;'
         self.lay.addWidget(self.found)
-        self.lay.addWidget(label(f"Type <b>{name}</b> to confirm:", wrap=True))
+        self.lay.addWidget(label(f"Type <b>{name}</b> to confirm", "dim", wrap=True))
         self.typed = QLineEdit()
         self.typed.setPlaceholderText(name)
         self.lay.addWidget(self.typed)
         self.lay.addWidget(self.status)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        self.go = buttons.addButton("Delete", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.go = buttons.addButton(f"Delete {'VM' if guest.get('type') == 'qemu' else 'Container'}",
+                                    QDialogButtonBox.ButtonRole.AcceptRole)
         self.go.setProperty("kind", "destructive")
         self.go.setEnabled(False)
+        for b in buttons.buttons():
+            b.setAutoDefault(False)  # Enter in the name field does not delete: the button does
         buttons.accepted.connect(self.delete)
         buttons.rejected.connect(self.reject)
         self.lay.addWidget(buttons)
@@ -687,8 +706,8 @@ class DeleteDialog(_GuestDialog):
     def _show(self, found: dict) -> None:
         snaps, backups = found.get("snapshots"), found.get("backups")
         if isinstance(snaps, list) and snaps:
-            self.gone.setText(f"Its disks, its {plural(len(snaps), 'snapshot')} and its settings are removed from "
-                              "the host. This cannot be undone.")
+            disk = f"Its disks ({gib(self.g['maxdisk'])})" if self.g.get("maxdisk") else "Its disks"
+            self.gone.setText(f"• {disk}, its {plural(len(snaps), 'snapshot')} and its settings, from the host")
         if not isinstance(backups, list):
             self.backups = []
             self.found.setText(f"Its backups could not be listed, so none are deleted: {html.escape(str(backups))}")

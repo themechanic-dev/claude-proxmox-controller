@@ -18,7 +18,7 @@ try:
     from PySide6.QtCore import QPoint, Qt
     from PySide6.QtGui import QColor, QIcon
     from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QApplication, QDialog, QStyleOptionViewItem, QToolButton
+    from PySide6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QStyleOptionViewItem, QToolButton
 except ImportError:  # pragma: no cover - the core tests still run with plain python3
     QApplication = None
 
@@ -34,7 +34,7 @@ if QApplication is not None:
     from proxmox_controller.ui import (backup_jobs, backups, bulk, claude_window, connector, console, geometry,
                                        agent_setup, files_window, graph_wall, guest_dialogs, hazard, host_dialog,
                                        host_shell, host_view, main_window, tasks_panel, theme, vault_dialogs,
-                                       vm_dialog)
+                                       vm_dialog, widgets)
     from proxmox_controller.ui.chart import nice_ticks
     from proxmox_controller.ui.host_dialog import HostDialog
     from proxmox_controller.ui.host_view import HostView
@@ -76,7 +76,7 @@ class UiCase(unittest.TestCase):
         self.errors, self.asked = [], []
         self.answer = True
 
-        def confirm(_parent, title, _text, _action, destructive=False):
+        def confirm(_parent, title, _text, _action, destructive=False, **_shown):
             self.asked.append(title)
             return self.answer
 
@@ -368,9 +368,13 @@ class HostViewTest(UiCase):
 
         self.answer = False  # "Cancel" on the question: nothing is sent
         view.guest_action("stop")
-        self.assertEqual(self.asked, ["Stop it at once?"])
+        self.assertEqual(self.asked, ["Stop container 102 now?"])
         QTest.qWait(200)
         self.assertEqual(self.cluster().guests[102]["status"], "running")
+        self.answer = "instead"  # "Shut Down Instead": a clean shutdown, not the plug pulled
+        view.guest_action("stop")
+        self.assertTrue(wait_until(lambda: any("Shutdown sent to container 102" in n for n in self.notes)))
+        self.assertTrue(wait_until(lambda: self.cluster().guests[102]["status"] == "stopped"))
 
         self.answer = True
         view.guest_action("stop")
@@ -430,7 +434,7 @@ class HostViewTest(UiCase):
         view = self.loaded_view()
         self.answer = False
         view.node_command("shutdown")
-        self.assertEqual(self.asked, ["Shut down the host?"])
+        self.assertEqual(self.asked, ["Shut down Home server (demo)?"])
         QTest.qWait(200)
         self.assertEqual(self.notes, [])
 
@@ -1111,6 +1115,43 @@ class VmParamsTest(unittest.TestCase):
 def test_core_read_iso(image: bytes) -> dict:
     from tests.test_core import read_iso
     return read_iso(image, joliet=True)[1]
+
+
+class ConfirmDialogTest(UiCase):
+    """The question before a change (26/10: the old message boxes looked rough)."""
+
+    def test_the_window(self):
+        g = {"vmid": 108, "name": "UbuntuServer", "type": "qemu", "status": "running", "node": "pve",
+             "ips": ["192.168.1.50", "fe80::1"]}
+        dlg = widgets.ConfirmDialog(None, "Stop VM 108 now?", "Cuts it off at once.", "Stop Now", True, icon="stop",
+                                    guests=[g], note="Shut Down closes it cleanly — try that first.",
+                                    instead="Shut Down Instead")
+        self.assertEqual(dlg.windowTitle(), "Stop VM 108 now")
+        self.assertEqual((dlg.go.text(), dlg.go.property("kind")), ("Stop Now", "destructive"))  # red
+        self.assertTrue(dlg.cancel.isDefault())  # the safe answer on Enter
+        card = dlg.findChild(QFrame, "guestCard")
+        self.assertIn("VM 108 · running · pve · 192.168.1.50", " ".join(l.text() for l in card.findChildren(QLabel)))
+        self.assertFalse(dlg.badge.pixmap().isNull())
+        dlg.instead.click()
+        self.assertEqual((dlg.choice, dlg.result()), ("instead", QDialog.DialogCode.Accepted))
+        many = [{**g, "vmid": n, "name": f"g{n}"} for n in range(6)]
+        dlg = widgets.ConfirmDialog(None, "Reboot 6 guests?", "Restarts them cleanly.", "Reboot", icon="reboot",
+                                    guests=many)
+        self.assertEqual(len(dlg.findChildren(QFrame, "guestCard")), widgets.ConfirmDialog.CARDS)
+        self.assertEqual(dlg.go.property("kind"), "suggested")  # blue: nothing is destroyed
+        self.assertIsNone(dlg.instead)
+        dlg.go.click()
+        self.assertEqual(dlg.choice, "go")
+        for glyph in ("stop", "power", "reboot", "trash", "host", "warning", "question"):
+            self.assertFalse(widgets.badge(glyph, "#e5484d").isNull(), glyph)
+
+    def test_confirm_answers(self):
+        for clicked, answer in (("go", True), ("instead", "instead"), ("", False)):
+            def run(dlg, clicked=clicked):
+                dlg.choice = clicked
+                return 1
+            with mock.patch.object(widgets.ConfirmDialog, "exec", run):
+                self.assertEqual(widgets.confirm(None, "Q?", "T", "Go", instead="Other"), answer)
 
 
 class SetupDiscViewTest(UiCase):
@@ -2471,7 +2512,7 @@ class BulkAndTasksTest(UiCase):
         dlg.close()
         view._select([100, 101])
         view.guest_action("stop")
-        self.assertEqual(self.asked, ["Stop 2 guests at once?"])
+        self.assertEqual(self.asked, ["Stop 2 guests now?"])
         self.assertTrue(wait_until(lambda: [g["status"] for g in view.guests if g["vmid"] in (100, 101)] ==
                                    ["stopped", "stopped"]))
         view._select([102, 201])

@@ -75,6 +75,8 @@ def stylesheet(c: Colors) -> str:
     QFrame#card {{ background: {c.card}; border: 1px solid {c.border}; border-radius: 12px; }}
     QLabel#title {{ font-size: 17pt; font-weight: 700; }}
     QLabel#heading {{ font-size: 11.5pt; font-weight: 700; }}
+    QLabel#confirmTitle {{ font-size: 12.5pt; font-weight: 700; }}
+    QFrame#guestCard {{ background: {c.card}; border: 1px solid {c.border}; border-radius: 8px; }}
     QLabel#dim, QLabel#caption {{ color: {c.dim}; }}
     QLabel#caption {{ font-size: 9pt; }}
     QLabel#grant {{ color: {c.warning}; font-size: 9pt; }}
