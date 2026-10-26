@@ -10,7 +10,6 @@ desktop, with the English (US) keyboard; a live picture of it is in the window."
 
 from __future__ import annotations
 
-import html
 import time
 from typing import Callable
 
@@ -21,7 +20,7 @@ from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QLineEdit, QVBoxLayo
 from ..core import guestfiles, screen
 from ..core.pve import Pve, PveError, agent_enabled
 from . import theme
-from .widgets import button, card, error, label
+from .widgets import DialogHead, button, card, error, guest_card, label
 
 VIRTIO_URL = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 LINUX_COMMAND = ("sudo sh -c 'if command -v apt-get >/dev/null; then apt-get install -y qemu-guest-agent; "
@@ -57,13 +56,15 @@ class AgentSetupDialog(QDialog):
         self.setWindowTitle(f"Install the guest agent — VM {self.vmid}")
         self.setModal(False)
         lay = QVBoxLayout(self)
-        lay.setSpacing(10)
-        lay.addWidget(label("Install the QEMU guest agent", "title"))
-        self.who = label(f"VM {self.vmid} ({html.escape(g.get('name', ''))})", "dim")
+        lay.setContentsMargins(20, 20, 20, 16)  # as every window of a guest (widgets.DialogHead)
+        lay.setSpacing(12)
+        lay.addWidget(DialogHead("agent", "Install the QEMU guest agent",
+                                 "The guest agent lets this app copy files, show the VM's addresses and run commands "
+                                 "in it. Without it nothing can reach inside, so the app types the installation into "
+                                 "the VM's console — as you would."))
+        lay.addWidget(guest_card(g))
+        self.who = label("Inside: …", "dim")
         lay.addWidget(self.who)
-        lay.addWidget(label("The guest agent lets this app copy files, show the VM's addresses and run commands in it. "
-                            "Without it nothing can reach inside, so the app types the installation into the VM's "
-                            "console — as you would.", wrap=True))
         self.steps_box = QVBoxLayout()
         self.steps: list[QLabel] = []
         holder = card(spacing=6)
@@ -129,8 +130,8 @@ class AgentSetupDialog(QDialog):
         cfg, answers = result
         self.os_name = guestfiles.os_of(cfg)
         self.agent_was_on = agent_enabled(cfg)
-        self.who.setText(f"VM {self.vmid} ({html.escape(self.g.get('name', ''))}) · "
-                         f"{'Windows' if self.os_name == 'windows' else 'Linux'}")
+        # (the VM itself is on the card above: here, what is inside, which decides the steps)
+        self.who.setText(f"Inside: {'Windows' if self.os_name == 'windows' else 'Linux'}")
         if self.os_name == "windows":
             texts = ["Turn the agent on in the VM's settings (agent: 1)",
                      "Put the VirtIO drivers disc in a CD drive (downloaded onto the host first, if it is not there)",

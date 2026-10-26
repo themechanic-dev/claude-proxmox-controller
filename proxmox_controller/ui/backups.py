@@ -4,6 +4,7 @@ And the backups of guests deleted since, which Proxmox keeps: restore (the guest
 
 from __future__ import annotations
 
+import html
 import re
 import time
 from typing import Callable
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
 
 from ..core import jobs
 from ..core.pve import Pve, backup_kind, backup_name
-from .widgets import button, card, confirm, error, fit_to_width, gib, label, lock_icon
+from .widgets import DialogHead, button, card, confirm, error, fit_to_width, gib, guest_line, label, lock_icon
 from .worker import Runner
 
 MODES = (("snapshot", "Snapshot — it keeps running"), ("suspend", "Suspend — paused for a moment"),
@@ -282,7 +283,11 @@ class BackupsDialog(_BackupList, QDialog):
         self.setWindowTitle(f"Backups — {kind_name(guest)} {guest['vmid']} ({guest.get('name', '')})")
         self.setModal(False)  # it can stay open beside the app while a backup runs
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 16)  # as every window of a guest (widgets.DialogHead)
         lay.setSpacing(12)
+        # (the guest named in the head's line, not as a card: the window is tall already)
+        lay.addWidget(DialogHead("archive", "Backups", f"<b>{html.escape(guest.get('name', ''))}</b> — "
+                                 f"{guest_line(guest)}"))
 
         # back up now
         self.storage = QComboBox()
@@ -321,9 +326,10 @@ class BackupsDialog(_BackupList, QDialog):
         self.heading = label("Backups", "heading")
         lay.addWidget(self.heading)
         self.table = self._table(["", "Date", "Size", "Storage", "Note"], 4)
+        self.table.setMinimumHeight(140)  # (with the head, the window still fits a 768-high screen)
         lay.addWidget(self.table, 1)
         lay.addLayout(self._actions())
-        self.resize(720, 680)
+        self.resize(720, 740)
         self.load()
 
     def _node(self, b: dict) -> str:

@@ -266,8 +266,8 @@ def row(*widgets: QWidget, spacing: int = 8, stretch_after: int | None = None) -
 
 
 def badge(glyph: str, color: str, size: int = 40) -> QPixmap:
-    """A round badge for a question's window: `glyph` drawn in `color` on a pale disc of the same colour — stop,
-    power, reboot, trash, host, warning or question."""
+    """A round badge for a window's head: `glyph` drawn in `color` on a pale disc of the same colour — stop, power,
+    reboot, trash, host, warning, question; folder, agent, edit, notes, camera, archive, chart."""
     from PySide6.QtCore import QPointF, QRectF
     from PySide6.QtGui import QFont, QPen, QPolygonF
     pm = QPixmap(QSize(size * 2, size * 2))
@@ -309,6 +309,37 @@ def badge(glyph: str, color: str, size: int = 40) -> QPixmap:
         for top in (12, 21):
             p.drawRoundedRect(QRectF(12, top, 16, 7), 2, 2)
             p.drawPoint(QPointF(16, top + 3.5))
+    elif glyph == "folder":
+        p.drawPolygon(QPolygonF([QPointF(11, 13), QPointF(17, 13), QPointF(19.5, 15.5), QPointF(29, 15.5),
+                                 QPointF(29, 27), QPointF(11, 27)]))
+    elif glyph == "agent":  # a chip with its pins
+        p.drawRoundedRect(QRectF(14, 14, 12, 12), 2, 2)
+        for k in (17, 20, 23):
+            p.drawLine(QPointF(k, 10.5), QPointF(k, 14))
+            p.drawLine(QPointF(k, 26), QPointF(k, 29.5))
+            p.drawLine(QPointF(10.5, k), QPointF(14, k))
+            p.drawLine(QPointF(26, k), QPointF(29.5, k))
+    elif glyph == "edit":  # three sliders
+        for y, knob in ((14, 16), (20, 24), (26, 19)):
+            p.drawLine(QPointF(11, y), QPointF(29, y))
+            p.setBrush(col)
+            p.drawEllipse(QPointF(knob, y), 2.2, 2.2)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+    elif glyph == "notes":
+        p.drawRoundedRect(QRectF(13, 10.5, 14, 19), 2, 2)
+        for y in (15.5, 19.5, 23.5):
+            p.drawLine(QPointF(16.5, y), QPointF(23.5 if y < 23 else 20.5, y))
+    elif glyph == "camera":
+        p.drawRoundedRect(QRectF(10.5, 15, 19, 13), 2.5, 2.5)
+        p.drawPolyline(QPolygonF([QPointF(15.5, 15), QPointF(17, 12.5), QPointF(23, 12.5), QPointF(24.5, 15)]))
+        p.drawEllipse(QPointF(20, 21.5), 3.6, 3.6)
+    elif glyph == "archive":
+        p.drawRoundedRect(QRectF(11, 12, 18, 5), 1.5, 1.5)
+        p.drawPolyline(QPolygonF([QPointF(12.5, 17), QPointF(12.5, 28), QPointF(27.5, 28), QPointF(27.5, 17)]))
+        p.drawLine(QPointF(17.5, 21), QPointF(22.5, 21))
+    elif glyph == "chart":
+        p.drawPolyline(QPolygonF([QPointF(11, 26), QPointF(16, 19.5), QPointF(20.5, 23), QPointF(28.5, 13)]))
+        p.drawLine(QPointF(11, 29), QPointF(29, 29))
     elif glyph == "warning":
         p.drawPolygon(QPolygonF([QPointF(20, 10.5), QPointF(29.5, 27.5), QPointF(10.5, 27.5)]))
         p.drawLine(QPointF(20, 16.5), QPointF(20, 21.5))
@@ -321,6 +352,14 @@ def badge(glyph: str, color: str, size: int = 40) -> QPixmap:
         p.drawText(QRectF(0, 0, 40, 40), Qt.AlignmentFlag.AlignCenter, "?")
     p.end()
     return pm
+
+
+def guest_line(g: dict) -> str:
+    """"VM 108 · running · pve · 192.168.1.50": a guest in one line, as its card shows it under the name."""
+    kind = "VM" if g.get("type") == "qemu" else "Container"
+    parts = [f"{kind} {g.get('vmid', '')}", str(g.get("status", "") or ""), str(g.get("node", "") or "")]
+    parts += [ip for ip in (g.get("ips") or [])[:1]]
+    return " · ".join(x for x in parts if x)
 
 
 def guest_card(g: dict) -> QFrame:
@@ -340,11 +379,44 @@ def guest_card(g: dict) -> QFrame:
     words = QVBoxLayout()
     words.setSpacing(0)
     words.addWidget(label(f"<b>{g.get('name', '') or '—'}</b>"))
-    kind = "VM" if g.get("type") == "qemu" else "Container"
-    sub = [f"{kind} {g.get('vmid', '')}", str(g.get("status", "") or ""), str(g.get("node", "") or "")]
-    sub += [ip for ip in (g.get("ips") or [])[:1]]
-    words.addWidget(label(" · ".join(x for x in sub if x), "dim"))
+    words.addWidget(label(guest_line(g), "dim"))
     lay.addLayout(words, 1)
+    return frame
+
+
+class DialogHead(QWidget):
+    """A window's head, the same in every window of a guest and every question: a round badge, the title in bold and
+    a line under it (dim). `title` and `text` are the labels, for a window that changes them later."""
+
+    def __init__(self, icon: str, title: str, text: str = "", color: str = ""):
+        from .theme import colors
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+        self.badge = QLabel()
+        self.badge.setPixmap(badge(icon, color or colors().accent))
+        lay.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignTop)
+        words = QVBoxLayout()
+        words.setSpacing(4)
+        self.title = label(title, "confirmTitle", wrap=True)
+        words.addWidget(self.title)
+        self.text = label(text, "dim", wrap=True)
+        self.text.setVisible(bool(text))
+        words.addWidget(self.text)
+        lay.addLayout(words, 1)
+
+
+def boxed(content: QLayout | QWidget, margins: int = 14) -> QFrame:
+    """`content` in a card with rounded corners (QFrame#card), as a window's parts sit."""
+    frame = QFrame()
+    frame.setObjectName("card")
+    lay = QVBoxLayout(frame)
+    lay.setContentsMargins(margins, margins, margins, margins)
+    if isinstance(content, QLayout):
+        lay.addLayout(content)
+    else:
+        lay.addWidget(content)
     return frame
 
 
@@ -367,20 +439,10 @@ class ConfirmDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)
         lay.setSpacing(14)
-        head = QHBoxLayout()
-        head.setSpacing(14)
-        self.badge = QLabel()
-        self.badge.setPixmap(badge(icon or ("warning" if destructive else "question"),
-                                   c.danger if destructive else c.accent))
-        head.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignTop)
-        words = QVBoxLayout()
-        words.setSpacing(4)
-        self.title = label(title, "confirmTitle", wrap=True)
-        words.addWidget(self.title)
-        self.text = label(text, "dim", wrap=True)
-        words.addWidget(self.text)
-        head.addLayout(words, 1)
-        lay.addLayout(head)
+        head = DialogHead(icon or ("warning" if destructive else "question"), title, text,
+                          c.danger if destructive else c.accent)
+        self.badge, self.title, self.text = head.badge, head.title, head.text
+        lay.addWidget(head)
         guests = list(guests)
         for g in guests[:self.CARDS]:
             lay.addWidget(guest_card(g))

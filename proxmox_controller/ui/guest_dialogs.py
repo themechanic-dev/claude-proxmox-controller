@@ -10,8 +10,8 @@ from typing import Callable
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFontDatabase, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit,
-                               QPushButton, QRadioButton, QSpinBox, QSplitter, QTextBrowser, QVBoxLayout, QWidget)
+                               QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton,
+                               QRadioButton, QSpinBox, QSplitter, QTextBrowser, QVBoxLayout, QWidget)
 
 from ..core import vmhw
 from ..core.pve import Pve, PveError
@@ -20,7 +20,8 @@ from .chart import LineChart, align
 from .startup_fields import StartupFields
 from .theme import colors
 from .vm_hardware import HardwareFields
-from .widgets import badge, button, confirm, error, fit_to_width, gib, guest_card, info, label, mem_text
+from .widgets import (DialogHead, boxed, button, confirm, error, fit_to_width, gib, guest_card, guest_line, info,
+                      label, mem_text)
 from .worker import Runner
 
 HOSTNAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9-]{1,63})*$")
@@ -68,8 +69,19 @@ class _GuestDialog(QDialog):
         self.setWindowTitle(f"{title} — {kind_name(guest)} {guest['vmid']} ({guest.get('name', '')})")
         self.setModal(True)
         self.lay = QVBoxLayout(self)
+        self.lay.setContentsMargins(20, 20, 20, 16)  # as every question (widgets.ConfirmDialog)
         self.lay.setSpacing(12)
         self.status = label("", "dim", wrap=True)
+
+    def head(self, icon: str, title: str, text: str = "", color: str = "", card: bool = True) -> DialogHead:
+        """The window's head (widgets.DialogHead) and the guest as a card under it — first in the window. Without
+        the card (a window short of height), the head names the guest instead of `text`."""
+        head = DialogHead(icon, title, text if card else f"<b>{self.g.get('name', '')}</b> — {guest_line(self.g)}",
+                          color)
+        self.lay.addWidget(head)
+        if card:
+            self.lay.addWidget(guest_card(self.g))
+        return head
 
     def busy(self, text: str) -> None:
         self.status.setText(text)
@@ -103,6 +115,7 @@ class _GuestDialog(QDialog):
 class EditGuestDialog(_GuestDialog):
     def __init__(self, parent, client, runner, guest):
         super().__init__(parent, client, runner, guest, "Edit")
+        self.head("edit", f"Edit {kind_name(guest)} {guest['vmid']}", card=False)  # (a tall form: no card)
         self.lxc = guest["type"] == "lxc"
         self.original: dict = {}
         self.usb_limit = vmhw.USB_SLOTS
@@ -160,7 +173,7 @@ class EditGuestDialog(_GuestDialog):
         form.addRow("", self.onboot)
         self.startup = StartupFields(form, self.onboot, lambda: fit_to_width(self, self.width_))
         form.addRow("Notes", self.notes)
-        self.lay.addLayout(form)
+        self.lay.addWidget(boxed(form))
         self.lay.addWidget(label("A disk can only grow, never shrink. CPU and memory changes apply at once to "
                                  "containers; a VM may need a restart.", "caption", wrap=True))
         self.lay.addWidget(self.status)
@@ -312,10 +325,13 @@ class NotesDialog(_GuestDialog):
         self.title = self.windowTitle()
         self.original = ""
         self.loaded = False
+        self.head("notes", "Notes", "What Proxmox shows on the guest's Summary page. Ctrl+S saves and keeps the "
+                  "window open.")
         heads = QHBoxLayout()
         heads.addWidget(label("Write", "heading"), 1)
         heads.addWidget(label("As Proxmox shows it", "heading"), 1)
-        self.lay.addLayout(heads)
+        page = QVBoxLayout()
+        page.addLayout(heads)
         split = QSplitter(Qt.Orientation.Horizontal)
         self.editor = QPlainTextEdit()
         self.editor.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
@@ -325,7 +341,8 @@ class NotesDialog(_GuestDialog):
         split.addWidget(self.editor)
         split.addWidget(self.preview)
         split.setSizes([1, 1])
-        self.lay.addWidget(split, 1)
+        page.addWidget(split, 1)
+        self.lay.addWidget(boxed(page), 1)
         self.lay.addWidget(self.status)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Close)
         buttons.button(QDialogButtonBox.StandardButton.Save).setProperty("kind", "suggested")
@@ -398,11 +415,12 @@ class NotesDialog(_GuestDialog):
 class SnapshotsDialog(_GuestDialog):
     def __init__(self, parent, client, runner, guest):
         super().__init__(parent, client, runner, guest, "Snapshots")
-        self.lay.addWidget(label("A snapshot saves the guest's disks and settings as they are now, so you can go "
-                                 "back to this moment later. Take one before risky changes.", "dim", wrap=True))
+        self.head("camera", "Snapshots", "A snapshot saves the guest's disks and settings as they are now, so you can "
+                  "go back to this moment later. Take one before risky changes.")
         self.list = QListWidget()
         self.list.setMinimumHeight(180)
-        self.lay.addWidget(self.list)
+        snaps = QVBoxLayout()
+        snaps.addWidget(self.list)
         new_row = QHBoxLayout()
         self.snap_name = QLineEdit(time.strftime("snap_%Y%m%d_%H%M"))
         self.snap_name.setMinimumWidth(180)
@@ -413,7 +431,8 @@ class SnapshotsDialog(_GuestDialog):
         new_row.addWidget(self.snap_name)
         new_row.addWidget(self.snap_desc, 1)
         new_row.addWidget(take)
-        self.lay.addLayout(new_row)
+        snaps.addLayout(new_row)
+        self.lay.addWidget(boxed(snaps))
         act = QHBoxLayout()
         self.rollback_btn = button("Roll Back…", "destructive")
         self.rollback_btn.clicked.connect(self.rollback)
@@ -531,6 +550,7 @@ class GraphsDialog(_GuestDialog):
         self.save_prefs = None
         self.frame = "hour"
         self.loading = False
+        self.head("chart", "Graphs", card=False)  # (the charts want the height: the guest in the head's line)
         top = QHBoxLayout()
         self.frame_buttons = {}
         group = QButtonGroup(self)
@@ -543,12 +563,14 @@ class GraphsDialog(_GuestDialog):
             self.frame_buttons[key] = b
         top.addStretch(1)
         self.lay.addLayout(top)
-        self.lay.addWidget(label("CPU", "heading"))
         self.cpu = LineChart(lambda v: f"{v:.0f} %", lambda v: f"{v:.0f}%")
-        self.lay.addWidget(self.cpu, 1)  # the charts take the room when the window grows
-        self.lay.addWidget(label("Memory", "heading"))
         self.mem = LineChart(lambda v: f"{v:.2f} GiB", lambda v: f"{v:g} GiB")  # unit set in _loaded
-        self.lay.addWidget(self.mem, 1)
+        for title, chart in (("CPU", self.cpu), ("Memory", self.mem)):
+            chart.setMinimumHeight(150)  # (the whole window fits a 768-high screen)
+            part = QVBoxLayout()
+            part.addWidget(label(title, "heading"))
+            part.addWidget(chart, 1)
+            self.lay.addWidget(boxed(part), 1)  # the charts take the room when the window grows
         self.lay.addWidget(self.status)
         close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close.rejected.connect(self.reject)
@@ -557,7 +579,7 @@ class GraphsDialog(_GuestDialog):
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.load(self.frame, quiet=True))
         self.finished.connect(lambda *_: self._closed())
-        self.resize(760, 560)
+        self.resize(760, 640)
         self.frame_buttons["hour"].setChecked(True)
         self.load("hour")
 
@@ -640,20 +662,8 @@ class DeleteDialog(_GuestDialog):
         name = guest.get("name", "")
         self.backups: list[dict] | None = None  # None while they are being looked for
         # as every question before a change (widgets.ConfirmDialog): a red badge, the question, the guest as a card
-        self.lay.setContentsMargins(20, 20, 20, 16)
-        self.lay.setSpacing(12)
-        head = QHBoxLayout()
-        head.setSpacing(14)
-        mark = QLabel()
-        mark.setPixmap(badge("trash", colors().danger))
-        head.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
-        words = QVBoxLayout()
-        words.setSpacing(4)
-        words.addWidget(label(f"Delete {kind_name(guest)} {guest['vmid']} for good?", "confirmTitle", wrap=True))
-        words.addWidget(label("This can't be undone.", "dim", wrap=True))
-        head.addLayout(words, 1)
-        self.lay.addLayout(head)
-        self.lay.addWidget(guest_card(guest))
+        self.head("trash", f"Delete {kind_name(guest)} {guest['vmid']} for good?", "This can't be undone.",
+                  colors().danger)
         self.lay.addWidget(label("What goes with it", "dim"))
         disk = f"Its disks ({gib(guest['maxdisk'])})" if guest.get("maxdisk") else "Its disks"
         self.gone = label(f"• {disk}, snapshots and settings, from the host", wrap=True)

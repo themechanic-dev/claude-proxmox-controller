@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QGridLayou
 from ..core import guestfiles
 from ..core.guestfiles import Cancelled, Entry, GuestError
 from ..core.pve import PveError
-from .widgets import button, card, confirm, error, label
+from .widgets import DialogHead, button, card, confirm, error, guest_card, label
 
 MIME = "application/x-proxmox-controller-files"
 WAYS = {"network": "over the network", "proxmox": "through Proxmox (slow)", "ssh": "over the host's SSH"}
@@ -184,7 +184,7 @@ class FilesWindow(QDialog):
     """`make_backend` gives the guest's side (guestfiles.VmFiles or ContainerFiles) — called on a worker thread."""
 
     def __init__(self, parent, title: str, subtitle: str, make_backend: Callable[[], object], runner,
-                 local_start: Path | None = None):
+                 local_start: Path | None = None, guest: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"Files — {title}")
         self.setModal(False)
@@ -196,10 +196,13 @@ class FilesWindow(QDialog):
         self.done_bytes, self.way = 0, ""
         self.refresh_after: Pane | None = None
         lay = QVBoxLayout(self)
-        lay.setSpacing(10)
-        lay.addWidget(label(f"Files — {title}", "title"))
-        lay.addWidget(label("Choose on one side, press Send or Receive — or drag from one side to the other. "
-                            "Folders go whole.", "dim", wrap=True))
+        lay.setContentsMargins(20, 20, 20, 16)  # as every window of a guest (widgets.DialogHead)
+        lay.setSpacing(12)
+        lay.addWidget(DialogHead("folder", "Files" if guest else f"Files — {title}",
+                                 "Choose on one side, press Send or Receive — or drag from one side to the other. "
+                                 "Folders go whole."))
+        if guest:
+            lay.addWidget(guest_card(guest))
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
         self.local = Pane("local", "This computer")

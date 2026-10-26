@@ -900,6 +900,7 @@ class HostView(QWidget):
             self.install_agent(g)
         else:
             from . import guest_dialogs
+            g = self.card_of(g)  # (its addresses, for the window's card)
             if key == "graphs":  # a window of its own, for any screen; it holds no reference to this page
                 make, host = self.make_client, self.host
                 guest_dialogs.show_graphs(f"{host.id}/{g['vmid']}", lambda: make(host), self.runner, g, host.name,
@@ -1320,13 +1321,13 @@ class HostView(QWidget):
 
     def _show_files(self, title: str, subtitle: str, make) -> None:
         from . import files_window
-        dlg = files_window.FilesWindow(self, title, subtitle, make, self.runner)
+        dlg = files_window.FilesWindow(self, title, subtitle, make, self.runner, guest=self.card_of(g))
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.show()
 
     def install_agent(self, g: dict) -> None:
         from . import agent_setup
-        dlg = agent_setup.AgentSetupDialog(self, self.client, self.runner, g)
+        dlg = agent_setup.AgentSetupDialog(self, self.client, self.runner, self.card_of(g))
         dlg.finished.connect(lambda *_: self._refresh_details(force=True))
         dlg.show()
 
