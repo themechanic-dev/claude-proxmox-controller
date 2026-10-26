@@ -24,7 +24,7 @@ from ..core.connector_link import LinkServer
 from ..core.connector_tools import TOOLS, Context, Image, ToolError, check
 from ..core.pve import Host, Pve, PveError
 from . import hazard, theme
-from .widgets import button, label
+from .widgets import button, fit_to_width, label
 
 ASK_TIMEOUT_S = 120
 REFUSED_403 = ("Proxmox refused it: Claude's token has no privilege for this. The switch for it may be Off, or "
@@ -129,6 +129,8 @@ class ApprovalDialog(QDialog):
         self.needs_secret = bool(secret_prompt)
         if self.needs_secret:
             form = QFormLayout()
+            form.setVerticalSpacing(10)  # (the two fields lay on each other: the user's screenshot, 26/10)
+            form.setHorizontalSpacing(12)
             form.addRow(label(f"<b>{html.escape(secret_prompt)}</b>", wrap=True))
             form.addRow("Password", self.password)
             if secret_repeat:
@@ -179,7 +181,11 @@ class ApprovalDialog(QDialog):
         self.timer.timeout.connect(self._tick)
         self.timer.start(1000)
         self._tick(first=True)
-        self.setMinimumWidth(520)
+        fit_to_width(self, 560)  # as tall as its wrapped lines need: nothing cut, nothing on top of another
+        screen = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        if self.minimumHeight() > screen.height() * 0.92:  # (a small screen: as tall as it has)
+            self.setMinimumHeight(int(screen.height() * 0.92))
+            self.resize(self.width(), self.minimumHeight())
 
     def _check_secret(self) -> None:
         text = self.password.text()
