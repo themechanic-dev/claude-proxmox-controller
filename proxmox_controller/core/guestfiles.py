@@ -263,6 +263,99 @@ Zip $folder $names '{zip}'
 """
 
 
+# -- changes in the guest's folders (the right-click menu: Rename, Delete, New Folder) ------------------
+# One script for a Linux VM (through the agent) and a container (through pct exec): the operation, the folder, then
+# names — all base64 — and whatever goes wrong comes back base64 too ("ERRB …": a name in it may be Greek).
+
+LINUX_OPS = r"""
+cd -- "$(printf %s "$2" | base64 -d)" 2>/dev/null || { echo "ERR No such folder"; exit 4; }
+fail() { printf 'ERRB %s\n' "$(printf %s "$1" | base64 | tr -d '\n')"; exit 5; }
+case "$1" in
+  rename)
+    a=$(printf %s "$3" | base64 -d); b=$(printf %s "$4" | base64 -d)
+    { [ -e "$b" ] || [ -L "$b" ]; } && { echo "ERR That name is taken in this folder"; exit 6; }
+    e=$(mv -- "$a" "$b" 2>&1) || fail "$e" ;;
+  delete)
+    e=$(printf %s "$3" | base64 -d | xargs -0 -r rm -rf -- 2>&1) || fail "$e" ;;
+  mkdir)
+    n=$(printf %s "$3" | base64 -d)
+    { [ -e "$n" ] || [ -L "$n" ]; } && { echo "ERR That name is taken in this folder"; exit 6; }
+    o=$(stat -c %u:%g .)
+    e=$(mkdir -- "$n" 2>&1) || fail "$e"
+    chown "$o" -- "$n" 2>/dev/null ;;
+esac
+exit 0
+"""
+
+WINDOWS_OPS = r"""
+$ErrorActionPreference = 'Stop'
+function D([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
+function E([string]$s) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s)) }
+$folder = D '{folder}'
+if (-not (Test-Path -LiteralPath $folder -PathType Container)) { 'ERR No such folder'; exit 4 }
+try {
+  switch ('{op}') {
+    'rename' {
+      $b = D '{b}'
+      if (Test-Path -LiteralPath (Join-Path $folder $b)) { 'ERR That name is taken in this folder'; exit 6 }
+      Rename-Item -LiteralPath (Join-Path $folder (D '{a}')) -NewName $b
+    }
+    'delete' {
+      foreach ($n in ((D '{a}') -split [char]0)) { Remove-Item -LiteralPath (Join-Path $folder $n) -Recurse -Force }
+    }
+    'mkdir' {
+      $p = Join-Path $folder (D '{a}')
+      if (Test-Path -LiteralPath $p) { 'ERR That name is taken in this folder'; exit 6 }
+      New-Item -ItemType Directory -Path $p | Out-Null
+    }
+  }
+} catch { 'ERRB ' + (E $_.Exception.Message); exit 5 }
+"""
+
+
+def local_os() -> str:
+    """This computer's own system, for the names its side takes."""
+    return "windows" if os.name == "nt" else "linux"
+
+
+BAD_NAME = {"linux": "/", "windows": '\\/:*?"<>|'}
+
+
+def check_name(os_name: str, name: str) -> str:
+    """"" when `name` will do as a file's or folder's new name in that system, else what is wrong."""
+    if not name.strip() or name in (".", ".."):
+        return "Give it a name."
+    bad = sorted({c for c in name if c in BAD_NAME[os_name] or ord(c) < 32})
+    if bad:
+        return "A name cannot hold " + " ".join(repr(c) for c in bad) + "."
+    if os_name == "windows" and name.rstrip(" .") != name:
+        return "Windows does not allow a name ending in a space or a dot."
+    return ""
+
+
+def ops_argv(os_name: str, op: str, folder: str, *names: str) -> list[str]:
+    """The guest's command for Rename (old, new), Delete (names…) or New Folder (name) in `folder`."""
+    if os_name == "windows":
+        a = _names_b64(names) if op == "delete" else b64(names[0])
+        b = b64(names[1]) if op == "rename" else ""
+        return _ps(WINDOWS_OPS.replace("{folder}", b64(folder)).replace("{op}", op).replace("{a}", a)
+                   .replace("{b}", b))
+    args = [_names_b64(names)] if op == "delete" else [b64(n) for n in names]
+    return ["sh", "-c", LINUX_OPS, "sh", op, b64(folder), *args]
+
+
+def ops_result(code: int, out: str, err: str, what: str) -> None:
+    """Raises GuestError with what the guest said, when an operation failed."""
+    if not code:
+        return
+    for line in out.splitlines():
+        if line.startswith("ERRB "):
+            raise GuestError(f"{what}: {unb64(line[5:]).strip()[:300]}")
+        if line.startswith("ERR "):
+            raise GuestError(f"{what}: {line[4:]}")
+    raise GuestError(f"{what}: {(err or out).strip()[:300] or f'exit code {code}'}")
+
+
 # -- the archive on this computer -----------------------------------------------------------------------
 
 def total_size(paths: Iterable[Path]) -> int:
@@ -512,6 +605,16 @@ class VmFiles:
             raise GuestError((err or out).strip()[:300] or f"The listing failed ({code}).")
         return parse_listing(out, self.os_name)
 
+    # -- changes (the right-click menu)
+    def rename(self, folder: str, old: str, new: str) -> None:
+        ops_result(*self.run(ops_argv(self.os_name, "rename", folder, old, new)), "Renaming failed")
+
+    def delete(self, folder: str, names: list[str]) -> None:
+        ops_result(*self.run(ops_argv(self.os_name, "delete", folder, *names), timeout=600), "Deleting failed")
+
+    def mkdir(self, folder: str, name: str) -> None:
+        ops_result(*self.run(ops_argv(self.os_name, "mkdir", folder, name)), "Making the folder failed")
+
     # -- copies
     def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event) -> str:
         """The chosen files and folders of this computer into the VM's folder `dest`. Returns the way it went."""
@@ -728,6 +831,22 @@ class ContainerFiles:
         if done.returncode == 255:
             raise GuestError(done.stderr.strip()[:300] or "SSH to the host failed.")
         return parse_listing(done.stdout, "linux")
+
+    def _op(self, op: str, folder: str, names: tuple, what: str, timeout: float = 60) -> None:
+        done = subprocess.run(self._argv(ops_argv("linux", op, folder, *names)), capture_output=True, text=True,
+                              errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, **procs.hidden())
+        if done.returncode == 255:
+            raise GuestError(done.stderr.strip()[:300] or "SSH to the host failed.")
+        ops_result(done.returncode, done.stdout, done.stderr, what)
+
+    def rename(self, folder: str, old: str, new: str) -> None:
+        self._op("rename", folder, (old, new), "Renaming failed")
+
+    def delete(self, folder: str, names: list[str]) -> None:
+        self._op("delete", folder, tuple(names), "Deleting failed", timeout=600)
+
+    def mkdir(self, folder: str, name: str) -> None:
+        self._op("mkdir", folder, (name,), "Making the folder failed")
 
     def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event) -> str:
         total = total_size(paths)

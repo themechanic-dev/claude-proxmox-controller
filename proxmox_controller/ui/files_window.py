@@ -1,24 +1,31 @@
 """Files…: this computer on the left, a VM or a container on the right. Choose on one side and press Send → or
 ← Receive — or drag from one side to the other (or files from the desktop's file manager onto the guest). The bar
-shows how far, how fast and which way it goes. The copies themselves are core/guestfiles."""
+shows how far, how fast and which way it goes. The copies themselves are core/guestfiles.
+
+A right click on either side opens what FileZilla's does (the user's wish, 26/10): Open, Send / Receive, Rename…
+(F2), Delete… (Del — on this computer into the Trash, in the guest for good), New Folder…, Refresh (F5) and Copy
+Path."""
 
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QMimeData, QObject, Qt, Signal
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QGridLayout, QHBoxLayout, QHeaderView,
-                               QProgressBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtCore import QFile, QMimeData, QObject, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QGridLayout, QHBoxLayout,
+                               QHeaderView, QLineEdit, QMenu, QProgressBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+                               QWidget)
 
 from ..core import guestfiles
 from ..core.guestfiles import Cancelled, Entry, GuestError
 from ..core.pve import PveError
-from .widgets import DialogHead, button, card, confirm, error, guest_card, label
+from .widgets import DialogHead, button, card, confirm, error, fit_to_width, guest_card, label
 
 MIME = "application/x-proxmox-controller-files"
 WAYS = {"network": "over the network", "proxmox": "through Proxmox (slow)", "ssh": "over the host's SSH"}
@@ -45,6 +52,52 @@ def when_text(ts: int) -> str:
     if (today - d.date()).days == 1:
         return d.strftime("Yesterday %H:%M")
     return d.strftime("%d/%m/%Y")
+
+
+def to_trash(path: Path) -> bool:
+    """This computer's file or folder into the desktop's Trash (False where there is none, as on some mounts)."""
+    return bool(QFile.moveToTrash(str(path)))
+
+
+class NameDialog(QDialog):
+    """A name to give — Rename… and New Folder… — checked as the system it goes to wants it."""
+
+    def __init__(self, parent: QWidget, title: str, text: str, name: str, os_name: str, icon: str = "edit"):
+        super().__init__(parent)
+        self.os_name = os_name
+        self.setWindowTitle(title)
+        self.setModal(True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 16)
+        lay.setSpacing(12)
+        lay.addWidget(DialogHead(icon, title, text))
+        self.name = QLineEdit(name)
+        self.name.selectAll()
+        if "." in name[1:]:  # the name without its extension chosen, as file managers do
+            self.name.setSelection(0, name.rindex("."))
+        lay.addWidget(self.name)
+        self.problem = label("", "dim", wrap=True)
+        lay.addWidget(self.problem)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok.setProperty("kind", "suggested")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.name.textChanged.connect(self._check)
+        self._check()
+        fit_to_width(self, 420)
+
+    def _check(self) -> None:
+        problem = guestfiles.check_name(self.os_name, self.name.text())
+        self.problem.setText(problem)
+        self.ok.setEnabled(not problem)
+
+
+def ask_name(parent: QWidget, title: str, text: str, name: str, os_name: str, icon: str = "edit") -> str:
+    """The name typed, or "" when cancelled."""
+    dlg = NameDialog(parent, title, text, name, os_name, icon)
+    return dlg.name.text().strip() if dlg.exec() == QDialog.DialogCode.Accepted else ""
 
 
 def local_listing(folder: Path) -> list[Entry]:
@@ -81,6 +134,7 @@ class FileTree(QTreeWidget):
         self.header().setSectionResizeMode(SIZE, QHeaderView.ResizeMode.ResizeToContents)
         self.header().setSectionResizeMode(WHEN, QHeaderView.ResizeMode.ResizeToContents)
         self.setMinimumHeight(260)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
     def mimeTypes(self):
         return [MIME]
@@ -195,6 +249,8 @@ class FilesWindow(QDialog):
         self.last_shown = 0.0
         self.done_bytes, self.way = 0, ""
         self.refresh_after: Pane | None = None
+        self.busy = False  # (the guest's side reading or changing)
+        self.reads = 0  # the guest's folder asked for last: an older answer coming after it is not shown
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)  # as every window of a guest (widgets.DialogHead)
         lay.setSpacing(12)
@@ -270,6 +326,12 @@ class FilesWindow(QDialog):
         self.remote.tree.itemDoubleClicked.connect(lambda item, _c: self._open(self.remote, item))
         self.remote.tree.dropped.connect(lambda side, paths: self.send([Path(p) for p in paths] if paths else None))
         self.local.tree.dropped.connect(lambda *_: self.receive())
+        for pane in (self.local, self.remote):  # the right click, and FileZilla's keys
+            pane.tree.customContextMenuRequested.connect(lambda pos, pane=pane: self._menu(pane, pos))
+            for key, act in ((QKeySequence.StandardKey.Delete, self.delete_items), ("F2", self.rename_item),
+                             (QKeySequence.StandardKey.Refresh, self.refresh)):
+                sc = QShortcut(QKeySequence(key), pane.tree, context=Qt.ShortcutContext.WidgetShortcut)
+                sc.activated.connect(lambda act=act, pane=pane: act(pane))
         self.resize(1060, 640)
         start = local_start or (Path.home() / "Downloads" if (Path.home() / "Downloads").is_dir() else Path.home())
         self.go_local(str(start))
@@ -309,9 +371,13 @@ class FilesWindow(QDialog):
         if self.backend is None:
             return
         backend = self.backend
+        self.reads += 1
+        read = self.reads
         self._busy(True, "Reading…")
 
         def done(result, err):
+            if read != self.reads:
+                return  # (a folder opened meanwhile: its own answer counts)
             self._busy(False)
             if err is not None:
                 error(self, "Files", str(err))
@@ -329,6 +395,169 @@ class FilesWindow(QDialog):
             self.go_local(str(Path(self.local.folder) / name))
         else:
             self.go_remote(guestfiles.join(self._os(), self.remote.folder, name))
+
+    # -- the right-click menu -------------------------------------------------------------------------
+
+    def _menu(self, pane: Pane, pos) -> None:
+        """What FileZilla's right click offers, for what is chosen on that side (the item under the pointer chosen
+        first, as file managers do)."""
+        item = pane.tree.itemAt(pos)
+        if item is None:  # (the empty space: the folder itself)
+            pane.tree.clearSelection()
+        elif not item.isSelected():
+            pane.tree.clearSelection()
+            item.setSelected(True)
+            pane.tree.setCurrentItem(item)
+        menu = self.menu_for(pane)
+        menu.exec(pane.tree.viewport().mapToGlobal(pos))
+
+    def menu_for(self, pane: Pane) -> QMenu:
+        chosen, local = pane.chosen(), pane is self.local
+        ready = self._ready(pane)
+        menu = QMenu(self)
+        one = chosen[0] if len(chosen) == 1 else None
+
+        def add(text: str, slot, enabled: bool = True, shortcut: str = ""):
+            a = menu.addAction(text)
+            a.setEnabled(enabled)
+            if shortcut:
+                a.setShortcut(QKeySequence(shortcut))
+            a.triggered.connect(slot)
+            return a
+
+        if one is not None and (one.is_dir or local):
+            add("Open", lambda: self.open_item(pane), ready)
+        if chosen:
+            if local:
+                add("Send  →", lambda: self.send(), ready and self.backend is not None)
+            else:
+                add("←  Receive", lambda: self.receive(), ready)
+            menu.addSeparator()
+            add("Rename…", lambda: self.rename_item(pane), ready and one is not None, "F2")
+            add("Delete…", lambda: self.delete_items(pane), ready, "Del")
+        menu.addSeparator()
+        add("New Folder…", lambda: self.new_folder(pane), ready and bool(pane.folder))
+        add("Refresh", lambda: self.refresh(pane), ready, "F5")
+        add("Copy Path", lambda: self.copy_path(pane), bool(pane.folder))
+        return menu
+
+    def _ready(self, pane: Pane) -> bool:
+        """Whether that side can be changed now: not while a copy goes on, nor the guest's side while it is read."""
+        if self.cancel is not None:
+            return False
+        return pane is self.local or (self.backend is not None and not self.busy)
+
+    def _path(self, pane: Pane, name: str = "") -> str:
+        if pane is self.local:
+            return str(Path(pane.folder) / name) if name else pane.folder
+        return guestfiles.join(self._os(), pane.folder, name) if name else pane.folder
+
+    def open_item(self, pane: Pane) -> None:
+        """A folder: into it. On this computer a file opens in its own app."""
+        chosen = pane.chosen()
+        if len(chosen) != 1 or not self._ready(pane):
+            return
+        if chosen[0].is_dir:
+            (self.go_local if pane is self.local else self.go_remote)(self._path(pane, chosen[0].name))
+        elif pane is self.local:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._path(pane, chosen[0].name)))
+
+    def refresh(self, pane: Pane) -> None:
+        if not self._ready(pane):
+            return
+        (self.go_local if pane is self.local else self.go_remote)(pane.folder)
+
+    def copy_path(self, pane: Pane) -> None:
+        chosen = pane.chosen()
+        paths = [self._path(pane, e.name) for e in chosen] or [pane.folder]
+        QGuiApplication.clipboard().setText("\n".join(paths))
+        self.result.setText(f"Copied: {_short(paths[0])}" + (f" and {len(paths) - 1} more" if len(paths) > 1 else ""))
+
+    def rename_item(self, pane: Pane) -> None:
+        chosen = pane.chosen()
+        if len(chosen) != 1 or not self._ready(pane):
+            return
+        old = chosen[0].name
+        os_name = guestfiles.local_os() if pane is self.local else self._os()
+        new = ask_name(self, "Rename", f"A new name for {old}.", old, os_name)
+        if not new or new == old:
+            return
+        if new in {e.name for e in pane.entries}:
+            error(self, "Rename", f"{new} is already in this folder.")
+            return
+        if pane is self.local:
+            try:
+                os.rename(Path(pane.folder) / old, Path(pane.folder) / new)
+            except OSError as e:
+                error(self, "Rename", e.strerror or str(e))
+            self.go_local(pane.folder)
+            return
+        backend, folder = self.backend, pane.folder
+        self._guest_op(lambda: backend.rename(folder, old, new), f"Renamed {old} to {new}.")
+
+    def delete_items(self, pane: Pane) -> None:
+        chosen = pane.chosen()
+        if not chosen or not self._ready(pane):
+            return
+        names = [e.name for e in chosen]
+        listed = ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+        count = names[0] if len(names) == 1 else f"{len(names)} items"
+        if pane is self.local:
+            if not confirm(self, f"Move {count} to the Trash?", f"{listed} — from {pane.folder}. The Trash can give "
+                           "them back.", "Move to Trash", True, icon="trash"):
+                return
+            stuck = [n for n in names if not to_trash(Path(pane.folder) / n)]
+            if stuck and confirm(self, "Delete for good?", f"{', '.join(stuck[:5])}: this place has no Trash. "
+                                 "Deleted for good, it cannot be undone.", "Delete", True, icon="trash"):
+                for n in stuck:
+                    p = Path(pane.folder) / n
+                    try:
+                        shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+                    except OSError as e:
+                        error(self, "Delete", f"{n}: {e.strerror or e}")
+                        break
+            self.go_local(pane.folder)
+            return
+        where = "the container" if self.remote.subtitle.text().startswith("Container") else "the VM"
+        if not confirm(self, f"Delete {count} for good?", f"{listed} — from {pane.folder} in {where}. There is no "
+                       "Trash there: this cannot be undone.", "Delete", True, icon="trash"):
+            return
+        backend, folder = self.backend, pane.folder
+        self._guest_op(lambda: backend.delete(folder, names), f"Deleted {listed}.")
+
+    def new_folder(self, pane: Pane) -> None:
+        if not pane.folder or not self._ready(pane):
+            return
+        os_name = guestfiles.local_os() if pane is self.local else self._os()
+        name = ask_name(self, "New Folder", f"A folder in {pane.folder}.", "New folder", os_name, icon="folder")
+        if not name:
+            return
+        if name in {e.name for e in pane.entries}:
+            error(self, "New Folder", f"{name} is already in this folder.")
+            return
+        if pane is self.local:
+            try:
+                (Path(pane.folder) / name).mkdir()
+            except OSError as e:
+                error(self, "New Folder", e.strerror or str(e))
+            self.go_local(pane.folder)
+            return
+        backend, folder = self.backend, pane.folder
+        self._guest_op(lambda: backend.mkdir(folder, name), f"Made the folder {name}.")
+
+    def _guest_op(self, job, done_text: str) -> None:
+        """A change in the guest, off the window's thread; then its folder read again."""
+        self._busy(True, "Working…")
+
+        def done(_r, err):
+            self._busy(False)
+            if err is not None:
+                error(self, "Files", str(err))
+            else:
+                self.result.setText(done_text)
+            self.go_remote(self.remote.folder)
+
+        self.runner.run(job, done)
 
     # -- copies -------------------------------------------------------------------------------------
 
@@ -434,6 +663,7 @@ class FilesWindow(QDialog):
             self.stop_btn.setEnabled(False)
 
     def _busy(self, on: bool, text: str = "") -> None:
+        self.busy = on
         for w in (self.send_btn, self.receive_btn, self.remote.up, self.remote.again, self.remote.combo):
             w.setEnabled(not on)
         self.stop_btn.setEnabled(on and self.cancel is not None)

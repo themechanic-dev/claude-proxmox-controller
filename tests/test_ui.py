@@ -109,6 +109,21 @@ class UiCase(unittest.TestCase):
             self.terminals.append(inner), self.titles.append(title))))
         self.patches.append(mock.patch.object(host_shell, "error", error))
         self.patches.append(mock.patch.object(host_shell, "confirm", confirm))
+        # nor moves anything into the desktop's Trash, opens a file in its apps or writes its clipboard
+        self.trashed, self.trash_works, self.opened, self.clipboard = [], True, [], []
+        self.real_to_trash = files_window.to_trash
+
+        def to_trash(path):
+            if not self.trash_works:
+                return False
+            self.trashed.append(path.name)
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+            return True
+        self.patches.append(mock.patch.object(files_window, "to_trash", to_trash))
+        self.patches.append(mock.patch.object(files_window, "QDesktopServices", types.SimpleNamespace(
+            openUrl=lambda url: self.opened.append(url.toLocalFile()) or True)))
+        self.patches.append(mock.patch.object(files_window, "QGuiApplication", types.SimpleNamespace(
+            clipboard=lambda: types.SimpleNamespace(setText=self.clipboard.append))))
         for p in self.patches:
             p.start()
         self.runner = Runner()
@@ -477,6 +492,18 @@ class FakeGuestSide:
         progress(14, total, "proxmox")
         return "proxmox"
 
+    def rename(self, folder, old, new):
+        self.calls.append(("rename", folder, old, new))
+        self.entries = [self.Entry(new, e.is_dir, e.size, e.mtime) if e.name == old else e for e in self.entries]
+
+    def delete(self, folder, names):
+        self.calls.append(("delete", folder, list(names)))
+        self.entries = [e for e in self.entries if e.name not in names]
+
+    def mkdir(self, folder, name):
+        self.calls.append(("mkdir", folder, name))
+        self.entries.append(self.Entry(name, True, 0, 0))
+
 
 class FilesWindowTest(UiCase):
     def setUp(self):
@@ -495,12 +522,183 @@ class FilesWindowTest(UiCase):
         self.dlg.close()  # (before the patches stop: a copy still going asks first)
         super().tearDown()
 
-    def choose(self, pane, name):
+    def choose(self, pane, *names):
         pane.tree.clearSelection()
         for i in range(pane.tree.topLevelItemCount()):
             item = pane.tree.topLevelItem(i)
-            if item.data(0, Qt.ItemDataRole.UserRole) == name:
+            if item.data(0, Qt.ItemDataRole.UserRole) in names:
                 item.setSelected(True)
+
+    def item(self, pane, name):
+        return next(pane.tree.topLevelItem(i) for i in range(pane.tree.topLevelItemCount())
+                    if pane.tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole) == name)
+
+    def actions(self, pane):
+        return [(a.text(), a.isEnabled()) for a in self.dlg.menu_for(pane).actions() if not a.isSeparator()]
+
+    def settled(self):
+        return wait_until(lambda: not self.dlg.busy and self.dlg.cancel is None)
+
+    def test_right_click_menu(self):
+        dlg = self.dlg
+        dlg.show()
+        dlg.local.tree.clearSelection()  # the empty space: the folder itself
+        self.assertEqual(self.actions(dlg.local), [("New Folder…", True), ("Refresh", True), ("Copy Path", True)])
+        self.choose(dlg.local, "new.txt")
+        self.assertEqual([t for t, _ in self.actions(dlg.local)],
+                         ["Open", "Send  →", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path"])
+        self.choose(dlg.remote, "old.txt")  # the guest's file: no Open (yet)
+        self.assertEqual([t for t, _ in self.actions(dlg.remote)],
+                         ["←  Receive", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path"])
+        self.choose(dlg.remote, "old.txt", "docs")  # two: one name cannot go on both
+        self.assertIn(("Rename…", False), self.actions(dlg.remote))
+        self.choose(dlg.remote, "docs")
+        self.assertEqual(self.actions(dlg.remote)[0], ("Open", True))
+        dlg._busy(True)  # the guest's side being read: nothing changes there meanwhile
+        self.assertEqual([t for t, on in self.actions(dlg.remote) if on], ["Copy Path"])
+        self.assertTrue(all(on for _t, on in self.actions(dlg.local)))
+        dlg._busy(False)
+        shown = []  # the right click itself: the item under the pointer chosen first, the empty space the folder
+        with mock.patch.object(dlg, "menu_for", lambda pane: types.SimpleNamespace(exec=shown.append)):
+            QApplication.processEvents()
+            dlg._menu(dlg.remote, dlg.remote.tree.visualItemRect(self.item(dlg.remote, "old.txt")).center())
+            self.assertEqual([e.name for e in dlg.remote.chosen()], ["old.txt"])
+            dlg._menu(dlg.remote, QPoint(5, dlg.remote.tree.viewport().height() - 5))
+            self.assertEqual(dlg.remote.chosen(), [])
+        self.assertEqual(len(shown), 2)
+        keys = {sc.key().toString(): sc for sc in dlg.remote.tree.findChildren(files_window.QShortcut)}
+        self.assertEqual(set(keys), {"Del", "F2", "F5"})  # FileZilla's keys, on each side's list
+        self.choose(dlg.remote, "old.txt")
+        self.answer = False
+        keys["Del"].activated.emit()
+        self.assertEqual(self.asked[-1], "Delete old.txt for good?")
+        with mock.patch.object(files_window, "ask_name", return_value="") as ask:
+            keys["F2"].activated.emit()
+        self.assertEqual(ask.call_args.args[1:], ("Rename", "A new name for old.txt.", "old.txt", "linux"))
+        self.assertEqual(self.side.calls, [])  # nothing done: asked, and cancelled
+        self.choose(dlg.local, "new.txt")
+        dlg.open_item(dlg.local)  # this computer's file: in its own app
+        self.assertEqual(self.opened, [str(self.local / "new.txt")])
+        self.choose(dlg.remote, "old.txt", "docs")
+        dlg.copy_path(dlg.remote)
+        self.assertEqual(self.clipboard, ["/home/user/old.txt\n/home/user/docs"])
+        self.assertEqual(dlg.result.text(), "Copied: /home/user/old.txt and 1 more")
+
+    def test_rename_delete_and_new_folder_in_the_guest(self):
+        dlg = self.dlg
+        with mock.patch.object(files_window, "ask_name", side_effect=["notes.txt", "docs", "Νέος φάκελος"]):
+            self.choose(dlg.remote, "old.txt")
+            dlg.rename_item(dlg.remote)
+            self.assertTrue(wait_until(lambda: "notes.txt" in [e.name for e in dlg.remote.entries]))
+            self.assertEqual(self.side.calls[-1], ("rename", "/home/user", "old.txt", "notes.txt"))
+            self.assertTrue(self.settled())
+            self.assertEqual(dlg.result.text(), "Renamed old.txt to notes.txt.")
+            self.choose(dlg.remote, "notes.txt")
+            dlg.rename_item(dlg.remote)  # a name already there: said, not sent
+            self.assertEqual(self.errors[-1], ("Rename", "docs is already in this folder."))
+            self.assertEqual(len(self.side.calls), 1)
+            dlg.new_folder(dlg.remote)
+            self.assertTrue(wait_until(lambda: "Νέος φάκελος" in [e.name for e in dlg.remote.entries]))
+            self.assertEqual(self.side.calls[-1], ("mkdir", "/home/user", "Νέος φάκελος"))
+        self.assertTrue(self.settled())
+        self.answer = False
+        self.choose(dlg.remote, "notes.txt", "docs")
+        dlg.delete_items(dlg.remote)
+        self.assertEqual(self.asked[-1], "Delete 2 items for good?")
+        self.assertEqual(self.side.calls[-1][0], "mkdir")  # not deleted
+        self.answer = True
+        dlg.delete_items(dlg.remote)
+        self.assertTrue(wait_until(lambda: [e.name for e in dlg.remote.entries] == ["Νέος φάκελος"]))
+        self.assertEqual(self.side.calls[-1], ("delete", "/home/user", ["notes.txt", "docs"]))
+        self.assertTrue(self.settled())
+        self.assertEqual(dlg.result.text(), "Deleted notes.txt, docs.")
+        with mock.patch.object(self.side, "mkdir", side_effect=files_window.GuestError("Making the folder failed: "
+                                                                                       "Permission denied")), \
+                mock.patch.object(files_window, "ask_name", return_value="x"):
+            dlg.new_folder(dlg.remote)
+            self.assertTrue(wait_until(lambda: self.errors))
+        self.assertEqual(self.errors[-1], ("Files", "Making the folder failed: Permission denied"))
+        self.assertTrue(self.settled())
+
+    def test_rename_delete_and_new_folder_on_this_computer(self):
+        dlg = self.dlg
+        with mock.patch.object(files_window, "ask_name", side_effect=["σημείωση.txt", "Φάκελος", "old.txt"]):
+            self.choose(dlg.local, "new.txt")
+            dlg.rename_item(dlg.local)
+            dlg.new_folder(dlg.local)
+            self.choose(dlg.local, "σημείωση.txt")
+            dlg.rename_item(dlg.local)
+        self.assertEqual(self.errors, [("Rename", "old.txt is already in this folder.")])
+        self.assertEqual([e.name for e in dlg.local.entries], ["Φάκελος", "old.txt", "σημείωση.txt"])
+        self.assertTrue((self.local / "Φάκελος").is_dir())
+        self.answer = False
+        self.choose(dlg.local, "old.txt")
+        dlg.delete_items(dlg.local)
+        self.assertEqual(self.asked[-1], "Move old.txt to the Trash?")
+        self.assertTrue((self.local / "old.txt").exists())
+        self.answer = True
+        dlg.delete_items(dlg.local)
+        self.assertEqual(self.trashed, ["old.txt"])
+        self.assertFalse((self.local / "old.txt").exists())
+        self.assertEqual([e.name for e in dlg.local.entries], ["Φάκελος", "σημείωση.txt"])
+        self.trash_works = False  # a place with no Trash: asked again, then deleted for good
+        self.choose(dlg.local, "Φάκελος", "σημείωση.txt")
+        (self.local / "Φάκελος" / "μέσα.txt").write_text("x")
+        dlg.delete_items(dlg.local)
+        self.assertEqual(self.asked[-2:], ["Move 2 items to the Trash?", "Delete for good?"])
+        self.assertEqual(os.listdir(self.local), [])
+        self.assertEqual(dlg.local.entries, [])
+
+    def test_an_older_listing_never_comes_over_a_newer(self):
+        """A folder opened while the last one is still read: the older answer, coming after, is not shown."""
+        dlg, held, came, real = self.dlg, threading.Event(), threading.Event(), self.side.list
+
+        def listing(folder):
+            if folder != "/home/user":
+                return real(folder)
+            held.wait(5)
+            try:
+                return real(folder)
+            finally:
+                came.set()
+        self.side.list = listing
+        dlg.go_remote("/home/user")
+        dlg.go_remote("/home/user/docs")
+        self.assertTrue(wait_until(lambda: dlg.remote.folder == "/home/user/docs"))
+        self.assertFalse(dlg.busy)  # (what was asked for last has come)
+        held.set()  # the older answer comes now
+        self.assertTrue(wait_until(came.is_set))
+        wait_until(lambda: False, 0.3)  # (and is delivered — wait_until lets the worker run, unlike QTest.qWait)
+        self.assertEqual(dlg.remote.folder, "/home/user/docs")
+        self.assertFalse(dlg.busy)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "elsewhere it would be the real Trash")
+    def test_this_computers_trash(self):
+        home = Path(self.private) / "home"  # (a Trash of the test's own: never the user's)
+        data = home / ".local" / "share"
+        data.mkdir(parents=True)
+        f = home / "Σημείωση.txt"
+        f.write_text("x")
+        with mock.patch.dict(os.environ, {"HOME": str(home), "XDG_DATA_HOME": str(data)}):
+            self.assertTrue(self.real_to_trash(f))
+        self.assertFalse(f.exists())
+        self.assertEqual((data / "Trash" / "files" / "Σημείωση.txt").read_text(), "x")
+
+    def test_name_dialog(self):
+        dlg = files_window.NameDialog(None, "Rename", "A new name for report.txt.", "report.txt", "windows")
+        self.addCleanup(dlg.close)
+        self.assertEqual(dlg.name.selectedText(), "report")  # without its extension, as file managers do
+        self.assertTrue(dlg.ok.isEnabled())
+        dlg.name.setText("a:b?")
+        self.assertFalse(dlg.ok.isEnabled())
+        self.assertEqual(dlg.problem.text(), "A name cannot hold ':' '?'.")
+        dlg.name.setText("name. ")
+        self.assertFalse(dlg.ok.isEnabled())
+        dlg = files_window.NameDialog(None, "New Folder", "A folder in /home/user.", "New folder", "linux")
+        self.addCleanup(dlg.close)
+        self.assertEqual(dlg.name.selectedText(), "New folder")
+        dlg.name.setText("a:b?")
+        self.assertTrue(dlg.ok.isEnabled())  # Linux takes it
 
     def test_send_and_receive(self):
         dlg = self.dlg

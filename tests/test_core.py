@@ -2693,6 +2693,32 @@ class GuestFilesLinuxTest(unittest.TestCase):
         self.assertEqual(argv[-1], "pct exec 105 -- 'sh' '-c' 'it'\\''s'")  # one line for the host's shell
         self.assertIn("BatchMode=yes", argv)
 
+    def test_rename_delete_and_new_folder(self):
+        """The right-click menu's changes, the guest's script run for real: in a VM through the agent, in a
+        container through pct exec — Greek names, a name already taken, a folder that is not there."""
+        ct = guestfiles.ContainerFiles("pve", 22, "root", 105)
+        ct._argv = lambda inner: inner  # (what `pct exec` would run inside, run here)
+        for side in (self.files(), ct):
+            vm = str(self.vm)
+            side.mkdir(vm, "νέος φάκελος")
+            self.assertTrue((self.vm / "νέος φάκελος").is_dir())
+            with self.assertRaisesRegex(guestfiles.GuestError, "That name is taken"):
+                side.mkdir(vm, "νέος φάκελος")
+            side.rename(vm, "υπάρχον.md", "μετονομασία.md")
+            self.assertEqual((self.vm / "μετονομασία.md").read_text(encoding="utf-8"), "ήδη εδώ")
+            with self.assertRaisesRegex(guestfiles.GuestError, "That name is taken"):
+                side.rename(vm, "μετονομασία.md", "νέος φάκελος")
+            with self.assertRaisesRegex(guestfiles.GuestError, "^Renaming failed: mv: .*λείπει"):
+                side.rename(vm, "λείπει", "κάτι")  # what mv said, Greek name and all
+            (self.vm / "νέος φάκελος" / "μέσα.txt").write_text("x")
+            side.delete(vm, ["νέος φάκελος", "μετονομασία.md"])  # a folder goes whole
+            self.assertEqual(os.listdir(self.vm), [])
+            with self.assertRaisesRegex(guestfiles.GuestError, "No such folder"):
+                side.mkdir(str(self.root / "nope"), "x")
+            (self.vm / "υπάρχον.md").write_text("ήδη εδώ", encoding="utf-8")
+        for argv in self.agent.started:  # (the agent is given ASCII only)
+            self.assertTrue(all(ord(c) < 128 for a in argv for c in a), argv)
+
 
 class GuestFilesTest(unittest.TestCase):
     def test_paths_and_listing(self):
@@ -2715,9 +2741,33 @@ class GuestFilesTest(unittest.TestCase):
         with self.assertRaises(guestfiles.GuestError):
             guestfiles.parse_listing("ERR No such folder\n", "linux")
 
+    def test_names_and_changes(self):
+        check = guestfiles.check_name
+        self.assertEqual(check("linux", "Σημειώσεις: 2026?.txt"), "")  # Linux takes all but /
+        self.assertEqual(check("linux", "a/b"), "A name cannot hold '/'.")
+        self.assertEqual(check("windows", "a:b?"), "A name cannot hold ':' '?'.")
+        self.assertIn("ending in a space or a dot", check("windows", "name."))
+        self.assertEqual(check("linux", " "), "Give it a name.")
+        self.assertEqual(check("linux", ".."), "Give it a name.")
+        argv = guestfiles.ops_argv("windows", "rename", "C:\\Χρήστης", "ένα.txt", "δύο.txt")
+        script = argv[-1]
+        self.assertEqual(argv[:2], ["powershell", "-NoProfile"])
+        for part in ("C:\\Χρήστης", "ένα.txt", "δύο.txt"):
+            self.assertIn(guestfiles.b64(part), script)  # names only as base64
+        self.assertFalse(any(m in script for m in ("{folder}", "{op}", "{a}", "{b}")))
+        self.assertTrue(all(ord(c) < 128 for c in script))
+        with self.assertRaisesRegex(guestfiles.GuestError, "^Deleting failed: Δεν επιτρέπεται$"):
+            guestfiles.ops_result(5, "ERRB " + guestfiles.b64("Δεν επιτρέπεται") + "\r\n", "", "Deleting failed")
+        with self.assertRaisesRegex(guestfiles.GuestError, "^Deleting failed: No such folder$"):
+            guestfiles.ops_result(4, "ERR No such folder\n", "", "Deleting failed")
+        with self.assertRaisesRegex(guestfiles.GuestError, "exit code 9"):
+            guestfiles.ops_result(9, "", "", "Deleting failed")
+        guestfiles.ops_result(0, "", "", "Deleting failed")
+
     def test_scripts_stay_ascii_and_are_filled(self):
         for name in ("LINUX_LIST", "LINUX_SEND_NET", "LINUX_RECV_NET", "LINUX_JOIN", "LINUX_PACK", "WINDOWS_LIST",
-                     "WINDOWS_SEND_NET", "WINDOWS_RECV_NET", "WINDOWS_JOIN", "WINDOWS_PACK"):
+                     "WINDOWS_SEND_NET", "WINDOWS_RECV_NET", "WINDOWS_JOIN", "WINDOWS_PACK", "LINUX_OPS",
+                     "WINDOWS_OPS"):
             self.assertTrue(all(ord(c) < 128 for c in getattr(guestfiles, name)), name)
         sent = []
         agent = mock.Mock()
