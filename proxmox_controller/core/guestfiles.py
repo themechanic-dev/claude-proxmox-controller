@@ -533,8 +533,9 @@ class VmFiles:
                 argv = ["sh", "-c", LINUX_SEND_NET, "sh", b64(dest), _names_b64(p.name for p in paths),
                         channel.url("get")]
             pid = self.start(argv)
-            if self._reached(pid, channel, cancel, CONNECT_WAIT_S):
-                st = self.wait(pid, cancel)
+            reached, st = self._reached(pid, channel, cancel, CONNECT_WAIT_S)
+            if reached:
+                st = st or self.wait(pid, cancel)
                 if channel.error is not None:
                     raise GuestError(f"Sending failed: {channel.error}")
                 _check(st, "Copying into the VM failed")
@@ -544,20 +545,25 @@ class VmFiles:
             channel.close()
         return self._send_through_proxmox(paths, dest, writer, progress, cancel)
 
-    def _reached(self, pid: int, channel: Channel, cancel: threading.Event, wait_s: float | None) -> bool:
+    def _reached(self, pid: int, channel: Channel, cancel: threading.Event,
+                 wait_s: float | None) -> tuple[bool, dict | None]:
         """Whether the guest's curl came to the channel — False as soon as it gave up (it cannot reach this
-        computer), or after `wait_s` (None: as long as the guest's command runs — Windows zips before it connects)."""
+        computer), or after `wait_s` (None: as long as the guest's command runs — Windows zips before it connects).
+        With it, the command's end as already told, if it came while looking: the guest agent tells an ended process
+        once and then forgets it — asked again, "PID … does not exist" (a small file, 26/10: copied whole while the
+        app was still looking, then that error though all had gone well)."""
         deadline = None if wait_s is None else time.monotonic() + wait_s
         while not channel.reached.is_set():
             if cancel.is_set():
                 self.kill(pid)
                 raise Cancelled()
-            if self.pve.agent_exec_status(self.node, self.vmid, pid).get("exited"):
-                return channel.reached.is_set()
+            st = self.pve.agent_exec_status(self.node, self.vmid, pid)
+            if st.get("exited"):
+                return channel.reached.is_set(), st
             if deadline is not None and time.monotonic() > deadline:
-                return False
+                return False, None
             time.sleep(0.2)
-        return True
+        return True, None
 
     def receive(self, folder: str, names: list[str], dest: Path, progress: Progress, cancel: threading.Event,
                 total: int | None = None) -> str:
@@ -589,8 +595,9 @@ class VmFiles:
             else:
                 argv = ["sh", "-c", LINUX_RECV_NET, "sh", b64(folder), _names_b64(names), channel.url("put")]
             pid = self.start(argv)
-            if self._reached(pid, channel, cancel, None if self.os_name == "windows" else CONNECT_WAIT_S):
-                st = self.wait(pid, cancel)
+            reached, st = self._reached(pid, channel, cancel, None if self.os_name == "windows" else CONNECT_WAIT_S)
+            if reached:
+                st = st or self.wait(pid, cancel)
                 channel.done.wait(30)
                 if channel.error is not None:
                     raise GuestError(f"Receiving failed: {channel.error}")

@@ -2553,11 +2553,13 @@ class SoundsTest(unittest.TestCase):
 class LocalAgent:
     """Stands in for Proxmox's guest-agent calls: the guest's commands run on this computer (for the Linux side —
     sh, tar, curl, base64 — on temporary folders), its file calls on the local disk. `unreachable`: the guest cannot
-    reach this computer (its curl goes to a closed port)."""
+    reach this computer (its curl goes to a closed port). As QEMU's agent, an ended process is told once and then
+    forgotten. `slow`: its status is told only once the process has ended (a small file copied whole meanwhile)."""
 
-    def __init__(self, unreachable=False):
+    def __init__(self, unreachable=False, slow=False):
         import itertools
         self.procs, self.ids, self.unreachable, self.started = {}, itertools.count(100), unreachable, []
+        self.slow = slow
 
     def agent_exec(self, node, vmid, argv, input_data=""):
         if self.unreachable:
@@ -2568,10 +2570,15 @@ class LocalAgent:
         return pid
 
     def agent_exec_status(self, node, vmid, pid):
-        p = self.procs[pid]
+        p = self.procs.get(pid)
+        if p is None:
+            raise PveError("Agent error: PID ld does not exist")
+        if self.slow:
+            p.wait()
         if p.poll() is None:
             return {"exited": 0}
         out, err = p.communicate()
+        del self.procs[pid]
         return {"exited": 1, "exitcode": p.returncode, "out-data": out, "err-data": err}
 
     def agent_file_write(self, node, vmid, path, content_b64):
@@ -2636,6 +2643,20 @@ class GuestFilesLinuxTest(unittest.TestCase):
         self.assertEqual([p for p in os.listdir("/tmp") if p.startswith("pcx-")], [])  # Proxmox's way cleans up
         for argv in self.agent.started:  # the agent is never given anything but ASCII (it stalls on other text)
             self.assertTrue(all(ord(c) < 128 for a in argv for c in a), argv)
+
+    def test_a_small_file_ends_while_the_app_looks(self):
+        """26/10: a small PDF went over whole while the app was still waiting for the guest's curl to come; the agent
+        told the end then, and forgot it — asked again: "PID ld does not exist", though all had gone well."""
+        small = self.pc / "Καταγραφή Βάρδιας.pdf"
+        small.write_bytes(os.urandom(230 * 1024))
+        self.agent = LocalAgent(slow=True)
+        files = guestfiles.VmFiles(self.agent, "pve", 112, "linux", "127.0.0.1")
+        self.assertEqual(files.send([small], str(self.vm), self.note, threading.Event()), "network")
+        self.assertEqual((self.vm / small.name).read_bytes(), small.read_bytes())
+        back = self.root / "back"
+        back.mkdir()
+        self.assertEqual(files.receive(str(self.vm), [small.name], back, self.note, threading.Event()), "network")
+        self.assertEqual((back / small.name).read_bytes(), small.read_bytes())
 
     def test_falls_back_at_once_when_the_guest_cannot_reach_this_computer(self):
         t0 = time.monotonic()

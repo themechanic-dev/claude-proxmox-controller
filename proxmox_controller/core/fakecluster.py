@@ -502,8 +502,10 @@ class FakeCluster:
 
     def agent_exec_status(self, p, node, vmid):
         run = self.exec_runs.get(int(p.get("pid", 0)))
-        if run is None:
-            raise ValueError("pid: no such process")
+        if run is None:  # (QEMU's guest agent writes it so: its format has lost the '%')
+            raise ValueError("Agent error: PID ld does not exist")
+        if run.get("exited"):  # as the guest agent: an ended process is told once, then forgotten
+            del self.exec_runs[int(p["pid"])]
         return run
 
     def rrd(self, p, node, kind, vmid):
