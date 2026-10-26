@@ -1323,8 +1323,12 @@ class VmDialogTest(UiCase):
             dlg.create()
             self.assertIn(words, self.errors[-1][1])
         dlg.static_ip.setText("192.168.1.62")
+        steps = []
+        dlg.steps.said.connect(steps.append)
         dlg.create()
         self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
+        # what it was doing, on the status line, step by step (26/10: the window sat ~15 s without a word)
+        self.assertEqual(steps, ["Writing the setup disc…", "Creating the VM…", "Starting it…"])
         cfg = self.cluster().guests[103]["cfg"]
         disc = cfg["ide3"].split(",")[0]
         self.assertEqual((kept[0]["volid"], kept[0]["drive"], kept[0]["agent"], str(cfg["agent"])),
@@ -1436,8 +1440,12 @@ class VmDialogTest(UiCase):
         dlg.password2.setText("srv-pw")
         dlg.static.setChecked(True)  # a fixed address, the rest from the host's network
         dlg.static_ip.setText("192.168.1.63")
+        steps = []
+        dlg.steps.said.connect(steps.append)
         dlg.create()
         self.assertTrue(wait_until(lambda: dlg.result() == dlg.DialogCode.Accepted))
+        self.assertIn("Copying Ubuntu's image into its disk — the longest part, about half a minute…", steps)
+        self.assertEqual(steps[-2:], ["Growing its disk to 20 GB…", "Starting it…"])
         cfg, g = self.cluster().guests[103]["cfg"], self.cluster().guests[103]
         self.assertEqual((g["disk_gb"], g["status"]), (20, "running"))
         self.assertNotIn("ciuser", cfg)  # a server too sets itself up from the app's disc (25/10)

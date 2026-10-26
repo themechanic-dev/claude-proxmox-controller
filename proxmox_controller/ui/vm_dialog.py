@@ -33,6 +33,15 @@ class _Relay(QObject):
     progressed = Signal(object, object)
 
 
+class _Steps(QObject):
+    """What a creating job is doing, said from its thread and shown on the window's status line (the user, 26/10:
+    the window sat ~15 s after Create without a word — mostly the host copying Ubuntu's image)."""
+    said = Signal(str)
+
+
+POLL_S = 0.5  # how often a creating job asks whether its Proxmox task is done (a second at most was lost each time)
+
+
 class _Busy:
     def busy(self, text: str) -> None:
         self.status.setText(text)
@@ -355,6 +364,8 @@ class CreateVmDialog(_Busy, QDialog):
         lay.addWidget(self.hint)
         self.status = label("", "dim", wrap=True)
         lay.addWidget(self.status)
+        self.steps = _Steps()
+        self.steps.said.connect(self.status.setText)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         self.create_btn = buttons.addButton("Create", QDialogButtonBox.ButtonRole.AcceptRole)
         self.create_btn.setProperty("kind", "suggested")
@@ -838,6 +849,7 @@ class CreateVmDialog(_Busy, QDialog):
             return
         pve, node = self.client(), self.current_node()
         vmid, name = self.vmid.value(), self.name.text().strip()
+        say = self.steps.said.emit  # (from the job's thread: shown on the status line)
         self.done_text = f"Created VM {vmid} ({name}) — open its Console to install the operating system"
         if self.windows_setup():
             job = self._windows_job(pve, node, vmid, name)
@@ -849,7 +861,8 @@ class CreateVmDialog(_Busy, QDialog):
             params = {**self.params(), **self.hw.params(), **self.startup.params()}
 
             def job():
-                pve.wait_task(node, pve.create_vm(node, params), timeout=900)
+                say("Creating the VM…")
+                pve.wait_task(node, pve.create_vm(node, params), timeout=900, poll=POLL_S)
         else:
             source, full, storage = self.template.currentData(), self.full.isChecked(), self.storage.currentData()
             changes = {k: w.value() for k, w in (("cores", self.cores), ("memory", self.memory))
@@ -860,11 +873,15 @@ class CreateVmDialog(_Busy, QDialog):
             start = self.start.isChecked()
 
             def job():
-                pve.wait_task(node, pve.clone_vm(node, source, vmid, name, full=full, storage=storage), timeout=3600)
+                say("Copying the template…")
+                pve.wait_task(node, pve.clone_vm(node, source, vmid, name, full=full, storage=storage), timeout=3600,
+                              poll=POLL_S)
                 if changes:
+                    say("Setting its CPU and memory…")
                     pve.update_config(node, "qemu", vmid, changes)
                 if start:
-                    pve.wait_task(node, pve.guest_action(node, "qemu", vmid, "start"), timeout=300)
+                    say("Starting it…")
+                    pve.wait_task(node, pve.guest_action(node, "qemu", vmid, "start"), timeout=300, poll=POLL_S)
 
         def finished(result, err):
             if err is not None:
@@ -898,20 +915,25 @@ class CreateVmDialog(_Busy, QDialog):
                           (": watch it in its Console" if start else ": start it, and press a key in its Console "
                            "at “Press any key to boot from CD”"))
 
+        say = self.steps.said.emit
+
         def job():
+            say("Writing the answer disc…")
             place = timezones.region(timezones.host_zone(pve, node))
             xml = winsetup.answer_file(**settings, time_zone=place["windows"], region=place["locale"])
             drive = setupdisc.free_slot(params)
             volid = setupdisc.upload(pve, node, storage, vmid, {winsetup.ANSWER_NAME: xml.encode()}, "autounattend")
             params[drive] = f"{volid},media=cdrom"
+            say("Creating the VM…")
             try:
-                pve.wait_task(node, pve.create_vm(node, params), timeout=900)
+                pve.wait_task(node, pve.create_vm(node, params), timeout=900, poll=POLL_S)
             except Exception:
                 setupdisc.delete(pve, node, volid)
                 raise
             disc = setupdisc.entry("", node, vmid, volid, drive, virtio and agent)
             if start:
-                pve.wait_task(node, pve.guest_action(node, "qemu", vmid, "start"), timeout=300)
+                say("Starting it…")
+                pve.wait_task(node, pve.guest_action(node, "qemu", vmid, "start"), timeout=300, poll=POLL_S)
             return disc, start
 
         return job
@@ -928,21 +950,26 @@ class CreateVmDialog(_Busy, QDialog):
                           (": watch it in its Console" if start else ": start it, and type yes at “Continue with "
                            "autoinstall?” in its Console"))
 
+        say = self.steps.said.emit
+
         def job():
+            say("Writing the setup disc…")
             place = timezones.region(timezones.host_zone(pve, node))
             files = autoinstall.seed_files(vm_name=name, vmid=vmid, time_zone=place["iana"],
                                            keyboard=place["keyboard"], **settings)
             drive = setupdisc.free_slot(params)
             volid = setupdisc.upload(pve, node, storage, vmid, files, cloudseed.SEED_LABEL)
             params[drive] = f"{volid},media=cdrom"
+            say("Creating the VM…")
             try:
-                pve.wait_task(node, pve.create_vm(node, params), timeout=900)
+                pve.wait_task(node, pve.create_vm(node, params), timeout=900, poll=POLL_S)
             except Exception:
                 setupdisc.delete(pve, node, volid)
                 raise
             disc = setupdisc.entry("", node, vmid, volid, drive, True)
             if start:
-                pve.wait_task(node, pve.guest_action(node, "qemu", vmid, "start"), timeout=300)
+                say("Starting it…")
+                pve.wait_task(node, pve.guest_action(node, "qemu", vmid, "start"), timeout=300, poll=POLL_S)
             return disc, start
 
         return job
@@ -967,7 +994,10 @@ class CreateVmDialog(_Busy, QDialog):
                           ("Ubuntu Desktop installs itself on the first start (10–20 minutes)" if desktop else
                            "Ubuntu Server sets itself up on the first start (2–5 minutes)"))
 
+        say = self.steps.said.emit
+
         def job():
+            say("Writing the setup disc…")
             place = timezones.region(timezones.host_zone(pve, node))
             files = cloudseed.seed_files(vm_name=name, vmid=vmid, user=user, password=password, ssh_keys=[key],
                                          desktop=desktop, remote_desktop=rdp, dark=dark, time_zone=place["iana"],
@@ -975,15 +1005,18 @@ class CreateVmDialog(_Busy, QDialog):
             volid = setupdisc.upload(pve, node, seed_storage, vmid, files, cloudseed.SEED_LABEL)
             params["ide2"] = f"{volid},media=cdrom"
             disc = setupdisc.entry("", node, vmid, volid, "ide2", True)
+            say("Copying Ubuntu's image into its disk — the longest part, about half a minute…")
             try:
-                pve.wait_task(node, pve.create_vm(node, params), timeout=1800)  # (the image is copied first)
+                pve.wait_task(node, pve.create_vm(node, params), timeout=1800, poll=POLL_S)  # (the image first)
             except Exception:
                 setupdisc.delete(pve, node, volid)
                 raise
             if disk > 3:  # the image's own disk is ~3.5 GB
+                say(f"Growing its disk to {disk} GB…")
                 pve.put(f"/nodes/{q(node)}/qemu/{int(vmid)}/resize", disk="scsi0", size=f"{disk}G")
             if start:
-                pve.wait_task(node, pve.guest_action(node, "qemu", vmid, "start"), timeout=300)
+                say("Starting it…")
+                pve.wait_task(node, pve.guest_action(node, "qemu", vmid, "start"), timeout=300, poll=POLL_S)
             return disc, start
 
         return job

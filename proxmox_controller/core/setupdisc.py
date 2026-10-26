@@ -46,7 +46,7 @@ def upload(pve: Pve, node: str, storage: str, vmid: int, files: dict[str, bytes]
     name = disc_name(vmid)
     upid = pve.upload_data(node, storage, name, make_iso(files, label))
     if isinstance(upid, str) and upid.startswith("UPID:"):
-        pve.wait_task(node, upid, timeout=300)
+        pve.wait_task(node, upid, timeout=300, poll=0.5)  # (a small file: done at once)
     return f"{storage}:iso/{name}"
 
 
