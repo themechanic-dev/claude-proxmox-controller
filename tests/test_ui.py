@@ -670,6 +670,26 @@ class AgentSetupTest(UiCase):
             view.open_files(self.guest(201))
         self.assertEqual((self.asked[-1], opened), ("Install the guest agent?", [201]))
 
+    def test_files_opens_its_window(self):
+        """The Files button opens the window — for a VM, and for a container over the host's SSH (26/10: it opened
+        nothing after the new head went in, an error before the window was made)."""
+        view = self.loaded_view()
+        self.addCleanup(view.close)
+        self.assertTrue(wait_until(lambda: 201 in view.details))
+        made = []
+
+        def window(*a, **kw):
+            made.append((a[1], kw.get("guest", {}).get("vmid")))
+            return mock.Mock()
+        with mock.patch.object(files_window, "FilesWindow", window):
+            self.select(view, 201)
+            view.act["files"].click()
+            self.assertEqual(made, [("VM 201 (ubuntu-desktop)", 201)])  # with its card
+            with mock.patch.object(view, "_with_ssh", lambda then: then()), \
+                    mock.patch.object(host_shell, "settings_of", lambda host: {"key": True}):
+                view.open_files(self.guest(100))
+            self.assertEqual(made[-1][1], 100)
+
     def test_install_guest_agent_in_the_row(self):
         """The user's choice, 24/10: in the row of buttons — which takes a second row where the window is too narrow."""
         self.cluster().guests[201]["agent_down"] = True

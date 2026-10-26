@@ -1307,7 +1307,7 @@ class HostView(QWidget):
                                          "'Use a key' in SSH Settings (the arrow beside Console, at the top).")
                     return
                 port, user = int(s.get("port", 22)), str(s.get("user") or "root")
-                self._show_files(title, "Container · over the host's SSH",
+                self._show_files(g, title, "Container · over the host's SSH",
                                  lambda: guestfiles.ContainerFiles(host.hostname, port, user, g["vmid"]))
             self._with_ssh(go)
             return
@@ -1317,9 +1317,9 @@ class HostView(QWidget):
             os_name = guestfiles.os_of(client.guest_config(g["node"], "qemu", g["vmid"]))
             return guestfiles.VmFiles(client, g["node"], g["vmid"], os_name,
                                       guestfiles.address_towards(host.hostname, host.port))
-        self._show_files(title, "", make)
+        self._show_files(g, title, "", make)
 
-    def _show_files(self, title: str, subtitle: str, make) -> None:
+    def _show_files(self, g: dict, title: str, subtitle: str, make) -> None:
         from . import files_window
         dlg = files_window.FilesWindow(self, title, subtitle, make, self.runner, guest=self.card_of(g))
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
