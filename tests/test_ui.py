@@ -2115,6 +2115,18 @@ class ConsoleTest(UiCase):
         QTest.keyClick(win.view, Qt.Key.Key_V, ctrl_shift)
         self.assertEqual(win.status.text(), "Nothing copied to paste.")
 
+    def test_a_console_thread_ends_quietly_when_the_app_closes(self):
+        """26/10: at every exit a console's thread printed "RuntimeError: Signal source has been deleted" — the app
+        had gone, and with it the relay the thread reports to."""
+        import shiboken6
+
+        def refused():
+            raise OSError("closed")
+        session = console._Session(refused)
+        shiboken6.delete(session.relay)  # (as the app's end leaves it)
+        session.run()  # no exception: nothing left to tell
+        self.assertTrue(session.stopping)
+
     def test_screen_is_opaque_when_scaled_down(self):
         """The white console: QEMU's pixels carry 0 in their fourth byte, Qt took it for alpha, and the window became
         see-through once the screen was drawn smaller than the guest's resolution."""
@@ -3781,7 +3793,7 @@ class ClaudeConnectTest(unittest.TestCase):
                 self.assertEqual(fh.read().splitlines(), ["mcp", "add", "--scope", "user", "proxmox-controller",
                                                           "--", *claude_connect.bridge_command(), "--mcp"])
             claude_connect.connect_desktop()
-            data = json.load(open(claude_connect.desktop_config()))
+            data = json.loads(claude_connect.desktop_config().read_text())
             command = claude_connect.bridge_command()
             self.assertEqual(data["mcpServers"]["proxmox-controller"],
                              {"command": command[0], "args": [*command[1:], "--mcp"]})
@@ -3789,7 +3801,7 @@ class ClaudeConnectTest(unittest.TestCase):
             self.assertTrue(claude_connect.desktop_connected())
             claude_connect.disconnect_desktop()
             self.assertFalse(claude_connect.desktop_connected())
-            self.assertEqual(json.load(open(claude_connect.desktop_config()))["preferences"], {"keep": True})
+            self.assertEqual(json.loads(claude_connect.desktop_config().read_text())["preferences"], {"keep": True})
             desktop = claude_connect.desktop_config()
             # with a BOM, as Windows' Notepad and PowerShell 5 save it: read, and kept as it was beside our entry
             desktop.write_bytes(b"\xef\xbb\xbf" + json.dumps({"preferences": {"keep": True}}).encode())

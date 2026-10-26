@@ -254,16 +254,24 @@ class _Session:
             client = RfbClient(ws, password)
             size = client.handshake()
             self.client = client
-            relay.connected.emit(size)
+            self._emit(relay.connected, size)
             while not self.stopping:
-                relay.updated.emit(client.next_update())
+                self._emit(relay.updated, client.next_update())
         except Exception as e:  # shown in the window, which offers Reconnect
             if not self.stopping:
-                relay.ended.emit(str(e) or "The console was closed.")
+                self._emit(relay.ended, str(e) or "The console was closed.")
         finally:
             if ws is not None:  # this connection is over either way (Reconnect opens a new one)
                 ws.close()
-            relay.finished.emit(self)
+            self._emit(relay.finished, self)
+
+    def _emit(self, signal, *args) -> None:
+        """A message to the window — unless the app is closing and its relay is gone already: then no one is left to
+        tell, and the thread ends quietly (it printed "Signal source has been deleted" at every exit)."""
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            self.stopping = True
 
     def stop(self) -> None:
         self.stopping = True

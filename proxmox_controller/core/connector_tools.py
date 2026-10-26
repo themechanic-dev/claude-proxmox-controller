@@ -408,6 +408,11 @@ EDITABLE = {
     "tablet": {"type": "boolean", "description": "VMs: the USB tablet, an absolute pointer — console_click needs it "
                "(Windows has no other). The SPICE display leaves it out unless it is set. Plugged in at once where "
                "USB hotplug is on, otherwise at the next start."},
+    "cpu_type": {"type": "string", "description": "VMs: the CPU type Proxmox gives the guest, as Proxmox names it — "
+                 "'host' (every feature of the host's CPU, the fastest; the VM then moves only between alike hosts), "
+                 "'x86-64-v2-AES' (Proxmox's default for new VMs), 'x86-64-v3', or another model it lists. A VM with "
+                 "no type set gets 'kvm64', which lacks features modern systems use (Windows 11 runs at full CPU). "
+                 "Its other CPU options are kept. Takes effect at the VM's next start."},
 }
 
 
@@ -443,6 +448,14 @@ def _edit_changes(g: dict, cfg: dict, ch: dict) -> dict:
         out["tags"] = ";".join(ch["tags"])
     if "notes" in ch:
         out["description"] = ch["notes"]
+    if "cpu_type" in ch:
+        if g["type"] != "qemu":
+            raise ToolError("cpu_type is for VMs.")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", ch["cpu_type"]):
+            raise ToolError("cpu_type: a CPU model as Proxmox names it, such as host or x86-64-v2-AES.")
+        rest = [part for i, part in enumerate(str(cfg.get("cpu", "")).split(","))
+                if part and not part.startswith("cputype=") and (i or "=" in part)]  # (flags, hidden… stay)
+        out["cpu"] = ",".join([ch["cpu_type"], *rest])
     if "tablet" in ch:
         if g["type"] != "qemu":
             raise ToolError("tablet is for VMs.")
@@ -453,7 +466,7 @@ def _edit_changes(g: dict, cfg: dict, ch: dict) -> dict:
 
 LABELS = {"cores": "CPU cores", "memory": "Memory (MiB)", "swap": "Swap (MiB)", "name": "Name", "hostname": "Hostname",
           "onboot": "Start at boot", "startup": "Boot order", "tags": "Tags", "description": "Notes",
-          "tablet": "USB tablet"}
+          "tablet": "USB tablet", "cpu": "CPU type"}
 
 
 def _edit_words(ctx: Context, a: dict):
@@ -468,10 +481,14 @@ def _edit_words(ctx: Context, a: dict):
             lines.append(f"Notes: {len(str(cfg.get(k, '')))} → {len(str(v))} characters")
         elif k == "tablet":
             lines.append(f"USB tablet: {'on' if vmhw.tablet_of(cfg) else 'off'} → {'on' if v else 'off'}")
+        elif k == "cpu":
+            lines.append(f"CPU type: {cfg.get('cpu') or 'kvm64 (none set: Proxmox' + chr(39) + 's default)'} → {v}")
         else:
             lines.append(f"{LABELS.get(k, k)}: {cfg.get(k, '—')} → {v}")
     if g.get("status") == "running" and any(k in changes for k in ("cores", "memory")) and g["type"] == "qemu":
         lines.append("Running VM: CPU and memory changes may wait for its next start.")
+    if g.get("status") == "running" and "cpu" in changes:
+        lines.append("Running VM: the CPU type takes effect at its next start (a reboot from Proxmox).")
     if g.get("status") == "running" and "tablet" in changes:
         lines.append("Running VM: the tablet is plugged in at once where USB hotplug is on, otherwise at its next "
                      "start.")
@@ -486,6 +503,9 @@ def _edit(ctx: Context, a: dict):
         return {"guest": what(g), "changed": [], "note": "Nothing differed from the current settings."}
     ctx.pve.update_config(g["node"], g["type"], g["vmid"], changes)
     out = {"guest": what(g), "changed": sorted(changes)}
+    if "cpu" in changes and g.get("status") == "running":
+        out["cpu_type"] = ("takes effect at the VM's next start: reboot it from Proxmox — a restart inside the guest "
+                           "is not enough")
     if "tablet" in changes and g.get("status") == "running":
         try:
             later = "tablet" in (ctx.admin or ctx.pve).pending(g["node"], g["vmid"])

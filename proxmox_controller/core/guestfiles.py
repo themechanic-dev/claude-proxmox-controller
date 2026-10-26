@@ -1238,13 +1238,14 @@ class ContainerFiles:
                     done[0] += n
                     progress(done[0], total, "ssh")
                 return n
-        try:
-            extract_tar(io.BufferedReader(Reader(), 1 << 20), dest)
-        except Cancelled:
-            proc.kill()
-            raise
-        err = proc.stderr.read()
-        proc.wait(timeout=60)
+        with proc:  # (its pipes closed whatever happens)
+            try:
+                extract_tar(io.BufferedReader(Reader(), 1 << 20), dest)
+            except Cancelled:
+                proc.kill()
+                raise
+            err = proc.stderr.read()
+            proc.wait(timeout=60)
         if proc.returncode:
             raise GuestError(err.decode("utf-8", "replace").strip()[:300] or
                              f"Copying from the container failed ({proc.returncode}).")

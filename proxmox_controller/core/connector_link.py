@@ -147,10 +147,9 @@ class LinkServer:
             return self._start_pipe()
         if self.path.exists():
             try:
-                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                probe.settimeout(1)
-                probe.connect(str(self.path))
-                probe.close()
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:  # (closed either way)
+                    probe.settimeout(1)
+                    probe.connect(str(self.path))
                 return False
             except OSError:
                 self.path.unlink(missing_ok=True)  # left by an app that ended without tidying (a power cut)

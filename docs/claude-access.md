@@ -44,7 +44,7 @@ Edit, notes, snapshots, Back Up Now, new VMs and containers, copies, ISOs.
 
 | Tool | What it does |
 |---|---|
-| `edit_guest` | Change a guest's settings: cores, memory_mib, swap_mib, name, start_at_boot, boot_order, boot_delay_s, shutdown_timeout_s, tags, notes, tablet. |
+| `edit_guest` | Change a guest's settings: cores, memory_mib, swap_mib, name, start_at_boot, boot_order, boot_delay_s, shutdown_timeout_s, tags, notes, tablet, cpu_type. |
 | `grow_disk` | Make a guest's disk bigger (never smaller). |
 | `take_snapshot` | Take a snapshot of a guest. |
 | `backup_now` | Back a guest up now (it keeps running in snapshot mode). |

@@ -985,6 +985,21 @@ class ConnectorToolsTest(unittest.TestCase):
         with self.assertRaises(connector_tools.ToolError):
             connector_tools.TOOLS["wake_host"].run(self.ctx(no_mac), {"host": "demo-pve", "reason": "r"})
 
+    def test_cpu_type(self):
+        """26/10: the CPU type, which edit_guest could not change (it took a host_command with qm set)."""
+        self.cluster.guests[201]["status"] = "running"
+        what, lines = self.words("edit_guest", host="demo-pve", vmid=201, reason="r", changes={"cpu_type": "host"})
+        self.assertIn("CPU type: kvm64 (none set: Proxmox's default) → host", lines)
+        self.assertIn("Running VM: the CPU type takes effect at its next start (a reboot from Proxmox).", lines)
+        out = self.run_tool("edit_guest", host="demo-pve", vmid=201, reason="r", changes={"cpu_type": "host"})
+        self.assertEqual((out["changed"], self.pve.guest_config("pve", "qemu", 201)["cpu"]), (["cpu"], "host"))
+        self.assertIn("next start", out["cpu_type"])
+        self.pve.update_config("pve", "qemu", 201, {"cpu": "cputype=kvm64,flags=+aes;+pcid,hidden=1"})
+        self.run_tool("edit_guest", host="demo-pve", vmid=201, reason="r", changes={"cpu_type": "x86-64-v2-AES"})
+        self.assertEqual(self.pve.guest_config("pve", "qemu", 201)["cpu"], "x86-64-v2-AES,flags=+aes;+pcid,hidden=1")
+        same = self.run_tool("edit_guest", host="demo-pve", vmid=201, reason="r", changes={"cpu_type": "x86-64-v2-AES"})
+        self.assertEqual(same["changed"], [])  # (already so: other options and all)
+
     def test_changes(self):
         what, lines = self.words("edit_guest", host="demo-pve", vmid=100, reason="r",
                                  changes={"memory_mib": 1024, "boot_order": 2, "tags": ["dns"]})
@@ -997,9 +1012,11 @@ class ConnectorToolsTest(unittest.TestCase):
                          (1024, "order=2", "dns", "DNS"))
         same = self.run_tool("edit_guest", host="demo-pve", vmid=100, reason="r", changes={"memory_mib": 1024})
         self.assertEqual(same["changed"], [])
-        for changes in ({"swap_mib": 512}, {"colour": "red"}, {"tags": ["no spaces"]}, {}):
+        for changes in ({"swap_mib": 512}, {"colour": "red"}, {"tags": ["no spaces"]}, {}, {"cpu_type": "host; reboot"}):
             with self.assertRaises(connector_tools.ToolError):
                 self.run_tool("edit_guest", host="demo-pve", vmid=201, reason="r", changes=changes)
+        with self.assertRaisesRegex(connector_tools.ToolError, "cpu_type is for VMs"):
+            self.run_tool("edit_guest", host="demo-pve", vmid=100, reason="r", changes={"cpu_type": "host"})
         self.run_tool("grow_disk", host="demo-pve", vmid=100, disk="rootfs", add_gb=2, reason="r")
         self.assertEqual(self.cluster.guests[100]["disk_gb"], 6)
         with self.assertRaises(connector_tools.ToolError):
@@ -2560,6 +2577,16 @@ class LocalAgent:
         import itertools
         self.procs, self.ids, self.unreachable, self.started = {}, itertools.count(100), unreachable, []
         self.slow = slow
+        self.all: list[subprocess.Popen] = []
+
+    def close(self):
+        """What the app left running (a guest's curl it gave up on, as the real agent would let it run) ended, and
+        every pipe closed: no ResourceWarning."""
+        for p in self.all:
+            if p.poll() is None:
+                p.kill()
+            if not (p.stdout is None or p.stdout.closed):  # (one the app was told the end of: closed already)
+                p.communicate()
 
     def agent_exec(self, node, vmid, argv, input_data=""):
         if self.unreachable:
@@ -2567,6 +2594,7 @@ class LocalAgent:
         self.started.append(argv)
         pid = next(self.ids)
         self.procs[pid] = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.all.append(self.procs[pid])
         return pid
 
     def agent_exec_status(self, node, vmid, pid):
@@ -2609,6 +2637,7 @@ class GuestFilesLinuxTest(unittest.TestCase):
 
     def files(self, unreachable=False):
         self.agent = LocalAgent(unreachable)
+        self.addCleanup(self.agent.close)
         return guestfiles.VmFiles(self.agent, "pve", 112, "linux", "127.0.0.1")
 
     def note(self, done, total, how):
@@ -2650,6 +2679,7 @@ class GuestFilesLinuxTest(unittest.TestCase):
         small = self.pc / "Καταγραφή Βάρδιας.pdf"
         small.write_bytes(os.urandom(230 * 1024))
         self.agent = LocalAgent(slow=True)
+        self.addCleanup(self.agent.close)
         files = guestfiles.VmFiles(self.agent, "pve", 112, "linux", "127.0.0.1")
         self.assertEqual(files.send([small], str(self.vm), self.note, threading.Event()), "network")
         self.assertEqual((self.vm / small.name).read_bytes(), small.read_bytes())
