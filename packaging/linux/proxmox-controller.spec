@@ -12,6 +12,14 @@ a = Analysis(
     hiddenimports=["multiprocessing.connection"],
     excludes=["tkinter"],
 )
+# Qt's GTK 3 theme plugin would bring the build machine's whole GTK stack along (it did, once virt-viewer was on the
+# build VM: 26/10) — old libraries that would meet a newer system's GTK modules at run time. The app draws with its own
+# style and colours (Fusion), so the plugin and its stack stay out; the rest is what PyInstaller always takes.
+DROP = ("libqgtk3.so", "libgtk-3.", "libgdk-3.", "libgdk_pixbuf", "libatk-", "libatspi.", "libcairo", "libpango",
+        "libharfbuzz.", "libepoxy.", "libfribidi.", "libdatrie.", "libthai.", "libgraphite2.", "libpixman-", "libjpeg.",
+        "libXcomposite.", "libXdamage.", "libXi.", "libXinerama.", "libXrandr.", "libXcursor.", "libXfixes.",
+        "libXext.", "libXrender.")
+a.binaries = [b for b in a.binaries if not os.path.basename(b[0]).startswith(DROP)]
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], name="proxmox-controller", exclude_binaries=True, console=True, upx=False, strip=False)
 COLLECT(exe, a.binaries, a.datas, name="proxmox-controller", upx=False)
