@@ -1,5 +1,12 @@
 """Opening a VM's SPICE console in remote-viewer (virt-viewer), the viewer Proxmox itself hands out .vv files for.
-SPICE brings sound, a shared clipboard, USB devices from this computer and a screen that follows the window."""
+SPICE brings sound, a shared clipboard, USB devices from this computer and a screen that follows the window.
+
+Until the VM's system starts its USB tablet, SPICE has only the relative PS/2 mouse, and remote-viewer captures the
+pointer — on GNOME Wayland it did not give it back with Ctrl+Alt+R (the user, 24/10: freed only through the power
+button's dialog). Measured 26/10 on a Windows 11 VM's restart, QEMU's 'info mice' each second: the PS/2 mouse from
+QEMU's start for 24 s, then the tablet; at a first boot from an ISO, minutes (the firmware, "Press any key", the
+installer loading). would_capture() tells it before the window opens. (QEMU's 'info spice' is no help: its
+mouse-mode reads "server" until a viewer connects and asks for "client" — read 26/10, tablet on.)"""
 
 from __future__ import annotations
 
@@ -32,6 +39,19 @@ def viewer() -> str | None:
 
 def install_hint() -> str:
     return INSTALL_HINT.get("win32" if sys.platform.startswith("win") else "linux")
+
+
+def would_capture(pve, node: str, vmid: int) -> bool:
+    """Whether remote-viewer would capture the pointer now: the VM has a USB tablet that its system has not started
+    yet (firmware, a boot from an ISO, an installation). A VM without a tablet (Proxmox leaves it out with SPICE)
+    goes as before: it is used with SPICE's agent. Not readable: False (SPICE as before)."""
+    from . import vmhw
+    try:
+        if not vmhw.tablet_of(pve.guest_config(node, "qemu", vmid)):
+            return False
+        return vmhw.pointer_state(pve.monitor(node, vmid, "info mice"))[0] == "relative"
+    except Exception:  # noqa: BLE001 — an older Proxmox, a token without Sys.Audit: SPICE as it always opened
+        return False
 
 
 def vv_text(cfg: dict) -> str:

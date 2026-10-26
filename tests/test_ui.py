@@ -2212,6 +2212,60 @@ class ConsoleChoiceTest(UiCase):
         self.assertEqual(launch.call_args[0][0]["type"], "spice")
         self.assertEqual(console.OPEN, {})
 
+    def starting(self, vmid):
+        """As VM 103 at its first boot (26/10): its USB tablet set, but its system has not started it yet — only
+        QEMU's relative PS/2 mouse, so remote-viewer would capture the pointer."""
+        cluster = DemoPve._clusters["demo-pve"]
+        cluster.guests[vmid].setdefault("extra", {}).update(tablet="1", ostype="win11")
+        cluster.pending_keys[vmid] = {"tablet"}
+
+    def spice_ready(self):
+        """remote-viewer here, the VM offering SPICE: what would open it is caught, nothing opens on the desktop."""
+        patches = (mock.patch.object(DemoPve, "has_spice", return_value=True),
+                   mock.patch.object(DemoPve, "spice_config", return_value={"type": "spice", "password": "x"}),
+                   mock.patch.object(host_view.spice, "viewer", return_value="/usr/bin/remote-viewer"),
+                   mock.patch.object(host_view.spice, "launch"))
+        started = [p.start() for p in patches]
+        for p in patches:
+            self.addCleanup(p.stop)
+        self.addCleanup(console.close_all)
+        return started[-1]
+
+    def test_no_spice_before_the_tablet(self):
+        view = self.view_with("auto")
+        self.starting(201)
+        launch = self.spice_ready()
+        self.select(view, 201)
+        view.guest_action("console")  # automatic: the built-in console, and why
+        self.assertTrue(wait_until(lambda: f"{DEMO_HOSTS[0].id}/201" in console.OPEN))
+        self.assertFalse(launch.called)
+        self.assertTrue(any("has not started its USB tablet yet" in n for n in self.notes))
+        console.close_all()
+        self.answer = False  # SPICE chosen outright: asked first — cancelled, nothing opens
+        view.open_selected_console("spice")
+        self.assertTrue(wait_until(lambda: "Open the built-in console instead?" in self.asked))
+        self.assertEqual((console.OPEN, launch.called), ({}, False))
+        self.answer = "instead"  # "SPICE Anyway"
+        view.open_selected_console("spice")
+        self.assertTrue(wait_until(lambda: launch.called))
+        self.answer = True  # "Built-in Console"
+        view.open_selected_console("spice")
+        self.assertTrue(wait_until(lambda: f"{DEMO_HOSTS[0].id}/201" in console.OPEN))
+        self.assertEqual(launch.call_count, 1)
+
+    def test_spice_once_the_tablet_is_up_or_without_one(self):
+        view = self.view_with("auto")
+        self.starting(201)
+        DemoPve._clusters["demo-pve"].pending_keys.pop(201)  # the system started it: SPICE as always
+        launch = self.spice_ready()
+        self.select(view, 201)
+        view.guest_action("console")
+        self.assertTrue(wait_until(lambda: launch.called))
+        DemoPve._clusters["demo-pve"].guests[201]["extra"]["tablet"] = "0"  # no tablet (Proxmox's SPICE): as before
+        view.guest_action("console")
+        self.assertTrue(wait_until(lambda: launch.call_count == 2))
+        self.assertEqual(console.OPEN, {})
+
     def test_automatic_falls_back_to_the_builtin_console(self):
         view = self.view_with("auto")
         self.select(view, 201)

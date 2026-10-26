@@ -1246,12 +1246,7 @@ def _host_power(ctx: Context, a: dict):
 
 # -- Console ---------------------------------------------------------------------------------------
 
-def pointer_state(text: str) -> tuple[str, str]:
-    """From QEMU's 'info mice': ('absolute' | 'relative' | 'unknown', the mouse in use — the line marked '*')."""
-    for line in (text or "").splitlines():
-        if line.lstrip().startswith("*"):
-            return ("absolute" if "(absolute)" in line else "relative"), line.split(":", 1)[-1].strip()
-    return "unknown", ""
+pointer_state = vmhw.pointer_state  # (from QEMU's 'info mice')
 
 
 def _pointer(ctx: Context, g: dict) -> tuple[str, str]:

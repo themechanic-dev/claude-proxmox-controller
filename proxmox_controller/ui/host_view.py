@@ -1047,11 +1047,13 @@ class HostView(QWidget):
             return
         pve, node, vmid = self.client(), g["node"], g["vmid"]
 
-        def job():
+        def job(checked: bool = False):
             if how == "auto" and not (spice.viewer() and pve.has_spice(node, vmid)):
                 return None
             if not spice.viewer():
                 raise FileNotFoundError(f"remote-viewer was not found. {spice.install_hint()}")
+            if not checked and spice.would_capture(pve, node, vmid):
+                return "capture"  # (the ticket is asked for only once SPICE is sure to open: it lasts seconds)
             return pve.spice_config(node, vmid)
 
         def done(cfg, err):
@@ -1060,6 +1062,23 @@ class HostView(QWidget):
                 return
             if cfg is None:
                 self.open_builtin_console(g)
+                return
+            if cfg == "capture":
+                if how == "auto":
+                    self.open_builtin_console(g)
+                    self.notify(f"{what} has not started its USB tablet yet (starting, or installing): opened the "
+                                "built-in console — SPICE would capture the pointer. Console opens SPICE once the "
+                                "system is up.")
+                    return
+                choice = confirm(self, "Open the built-in console instead?", f"{what} has not started its USB tablet "
+                                 "yet — it is still starting, or installing. Until it does, SPICE's window captures the "
+                                 "pointer, and on some desktops does not give it back. The built-in console works "
+                                 "now; SPICE works as usual once the system is up.", "Built-in Console",
+                                 icon="warning", instead="SPICE Anyway")
+                if choice is True:
+                    self.open_builtin_console(g)
+                elif choice == "instead":
+                    self.runner.run(lambda: job(True), done)
                 return
             try:
                 spice.launch(cfg)

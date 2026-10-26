@@ -49,6 +49,14 @@ def tablet_of(cfg: dict, display: str | None = None) -> bool:
     return not TABLET_OFF_WITH.fullmatch(display if display is not None else display_of(cfg))
 
 
+def pointer_state(text: str) -> tuple[str, str]:
+    """From QEMU's 'info mice': ('absolute' | 'relative' | 'unknown', the mouse in use — the line marked '*')."""
+    for line in (text or "").splitlines():
+        if line.lstrip().startswith("*"):
+            return ("absolute" if "(absolute)" in line else "relative"), line.split(":", 1)[-1].strip()
+    return "unknown", ""
+
+
 def sound_of(cfg: dict) -> tuple[str, str] | None:
     """(card, output) or None."""
     a = options(str(cfg.get("audio0", "")))
