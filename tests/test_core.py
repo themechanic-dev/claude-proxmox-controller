@@ -2947,6 +2947,9 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("Package: proxmox-controller\nVersion: 1.0.0\n", control)
         self.assertIn("Installed-Size: 123456", control)
         self.assertIn("Depends: virt-viewer, ", control)  # (the SPICE console comes with the app)
+        depends = control.split("Depends: ")[1].split("\n")[0].split(", ")
+        for lib in ("libxcb-icccm4", "libxcb-keysyms1", "libxcb-shape0", "libxcb-xkb1", "libxkbcommon-x11-0"):
+            self.assertIn(lib, depends)  # Qt's X11 side: not in the package, not on Ubuntu Desktop 26.04 (26/10)
         self.assertTrue(control.endswith("\n") and all(line.startswith(" ") for line in
                                                          control.split("Description:")[1].splitlines()[1:]))
         self.assertEqual(build_deb.PACKAGE, updates.PACKAGE)  # (what the app's updates look for in dpkg)

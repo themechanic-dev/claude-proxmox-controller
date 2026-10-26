@@ -30,8 +30,13 @@ ICON_SIZES = (48, 64, 128, 256)
 sys.path.insert(0, str(ROOT))
 from proxmox_controller import APP_ID, APP_NAME, VERSION  # noqa: E402
 
-DEPENDS = ["virt-viewer", "libegl1", "libgl1", "libxkbcommon0", "libfontconfig1", "libdbus-1-3"]
-RECOMMENDS = ["libxcb-cursor0", "openssh-client"]  # (X11 sessions; the host's Console and Upgrade)
+DEPENDS = ["virt-viewer", "libegl1", "libgl1", "libxkbcommon0", "libfontconfig1", "libdbus-1-3",
+           # Qt's X11 side, which the app uses on GNOME's Wayland too (through XWayland: windows reopen where they
+           # were). PyInstaller carries some xcb libraries but not these, and Ubuntu Desktop 26.04 has none of them:
+           # the app did not start from its menu there (26/10, VM 109). Listed with ldd over the whole package.
+           "libxcb1", "libxcb-icccm4", "libxcb-keysyms1", "libxcb-shape0", "libxcb-xkb1", "libxkbcommon-x11-0",
+           "libwayland-client0", "libwayland-cursor0", "libwayland-egl1"]
+RECOMMENDS = ["openssh-client"]  # (the host's Console and Upgrade)
 
 
 def control_text(installed_kb: int, version: str = VERSION) -> str:

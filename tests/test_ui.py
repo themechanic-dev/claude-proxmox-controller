@@ -2572,7 +2572,7 @@ class WindowPlaceTest(UiCase):
     def test_xwayland_only_where_it_helps(self):
         on = {"remember_place": True}
         wayland = {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"}
-        self.assertEqual(app_module.choose_platform(on, wayland, "linux"), "xcb")
+        self.assertEqual(app_module.choose_platform(on, wayland, "linux"), "xcb;wayland")  # Wayland if X11 cannot load
         self.assertIsNone(app_module.choose_platform({"remember_place": False}, wayland, "linux"))  # turned off
         self.assertIsNone(app_module.choose_platform(on, {**wayland, "QT_QPA_PLATFORM": "wayland"}, "linux"))
         self.assertIsNone(app_module.choose_platform(on, {"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}, "linux"))

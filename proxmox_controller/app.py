@@ -27,10 +27,11 @@ ICON = ROOT / "data" / "icons" / f"{APP_ID}.svg"
 def choose_platform(settings: dict, env=os.environ, platform: str = sys.platform) -> str | None:
     """On GNOME's Wayland an app is not allowed to place its own windows, so "reopen where it was" needs XWayland
     (measured on GNOME 50: same dark theme, same four screens). Nothing is changed when the user set QT_QPA_PLATFORM
-    or turned the option off."""
+    or turned the option off. Wayland stays the fallback: where Qt's X11 side cannot load (a library missing — Ubuntu
+    Desktop 26.04 has few of them, 26/10) the app opens on Wayland instead of not at all."""
     if (platform.startswith("linux") and settings.get("remember_place", True)
             and env.get("XDG_SESSION_TYPE") == "wayland" and env.get("DISPLAY") and "QT_QPA_PLATFORM" not in env):
-        return "xcb"
+        return "xcb;wayland"
     return None
 
 
