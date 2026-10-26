@@ -44,8 +44,10 @@ def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], ti
         raise ValueError("An Ubuntu that installs itself needs the user's password (sudo asks for it).")
     keys = [k.strip() for k in ssh_keys if k.strip()]
     cfg: dict = {"version": 1, "locale": "en_US.UTF-8",
-                 "keyboard": ({"layout": f"us,{keyboard}", "toggle": "alt_shift_toggle"}
-                              if keyboard and keyboard != "us" else {"layout": "us"}),
+                 # (one variant per layout, even empty: "us,gr" with no variants stopped the installer — "inconsistent
+                 # multi-layout", the live test of 26/10)
+                 "keyboard": ({"layout": f"us,{keyboard}", "variant": ",", "toggle": "alt_shift_toggle"}
+                              if keyboard and keyboard != "us" else {"layout": "us", "variant": ""}),
                  "identity": {"hostname": cloudseed.hostname_of(vm_name), "realname": user, "username": user,
                               "password": cloudseed.sha512_crypt(password)},
                  "ssh": {"install-server": True, "authorized-keys": keys, "allow-pw": not keys},

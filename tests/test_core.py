@@ -3176,7 +3176,8 @@ class AutoinstallTest(unittest.TestCase):
 
     def test_the_question_is_recognised(self):
         """Only the installer's "Continue with autoinstall? (yes|no)" — among every real screen the tests keep: GRUB,
-        the installer starting, its log scrolling, the installed system's login, and Windows' screens."""
+        the installer starting, its log scrolling, its error ("An error occurred. Press enter to start a shell": no
+        key there), the installed system's login, and Windows' screens."""
         for name in sorted(p.name for p in DATA.glob("*.png")):
             self.assertEqual(autoinstall.question_on(*screen_of(name)), name == "ubuntu-autoinstall-question.png",
                              name)
@@ -3233,7 +3234,9 @@ class AutoinstallTest(unittest.TestCase):
     def test_answers(self):
         ai = self.config(time_zone="Europe/Athens", keyboard="gr")
         self.assertEqual((ai["version"], ai["locale"], ai["timezone"]), (1, "en_US.UTF-8", "Europe/Athens"))
-        self.assertEqual(ai["keyboard"], {"layout": "us,gr", "toggle": "alt_shift_toggle"})
+        self.assertEqual(ai["keyboard"], {"layout": "us,gr", "variant": ",", "toggle": "alt_shift_toggle"})
+        kb = ai["keyboard"]  # one variant per layout: else "inconsistent multi-layout" stops the installer (26/10)
+        self.assertEqual(len(kb["layout"].split(",")), len(kb["variant"].split(",")))
         idn = ai["identity"]
         self.assertEqual((idn["hostname"], idn["username"], idn["realname"]), ("srv", "nikos", "nikos"))
         self.assertEqual(idn["password"], cloudseed.sha512_crypt("Pw-1234", idn["password"].split("$")[2]))
@@ -3244,7 +3247,7 @@ class AutoinstallTest(unittest.TestCase):
         keyed = self.config(ssh_keys=["ssh-ed25519 AAAA me@pc", " "], keyboard="us")
         self.assertEqual(keyed["ssh"]["authorized-keys"], ["ssh-ed25519 AAAA me@pc"])
         self.assertFalse(keyed["ssh"]["allow-pw"])  # a key: no password over SSH, as the installer does
-        self.assertEqual(keyed["keyboard"], {"layout": "us"})
+        self.assertEqual(keyed["keyboard"], {"layout": "us", "variant": ""})
         self.assertNotIn("timezone", keyed)
         static = self.config(static={"address": "192.168.1.50/24", "gateway": "192.168.1.1", "dns": ["1.1.1.1"],
                                      "search": []})
