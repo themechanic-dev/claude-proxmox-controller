@@ -95,31 +95,32 @@ def _extent(w: int, bgra: bytes, top: int, bottom: int) -> tuple[int, int]:
 
 
 def question_on(w: int, h: int, bgra: bytes) -> bool:
-    """Whether the console shows the installer's "Continue with autoinstall? (yes|no)" — known by its shape on the
-    text console (measured 25/10 on 1024×768): the last line of text, a short one from the left edge (a quarter of
-    the width), with an empty gap of about three lines above it, under the installer's log; only the cursor may come
-    after. Not the shape of GRUB's menu (720×400 text mode, long lines in from the edge), the log as it scrolls (no
-    gap), the installer starting (nothing above), nor the installed system's login (a single empty line above)."""
+    """Whether the console shows the installer's question — known by the shape of its three lines on the text console
+    (measured 25/10, 1024×768, an 8-point font): "Confirmation is required to continue." and "Add 'autoinstall' to
+    your kernel command line to avoid this" one under the other, an empty gap of about three lines, then "Continue
+    with autoinstall? (yes|no)" from the left edge — anywhere on the screen: the installer's network log may go on
+    under it and push it up while it waits (the live test of 26/10: the last line for three seconds only, then
+    missed). Not the shape of GRUB's menu (720×400 text mode, long lines in from the edge), the log as it scrolls (no
+    gap), the installer starting (nothing above), its error (no gap), nor the installed system's login."""
     if w < 640 or h < 480 or len(bgra) < w * h * 4:
         return False
-    runs = _blocks(w, h, bgra)
-    if runs:
-        top, bottom = runs[0]
+    rows = list(reversed(_blocks(w, h, bgra, wanted=h)))  # every line of text, top down
+    for i in range(2, len(rows)):
+        (top, bottom), (above_top, above), (first_top, first) = rows[i], rows[i - 1], rows[i - 2]
+        if top - above - 1 < 28 or not 8 <= bottom - top + 1 <= 20 or above_top - first - 1 > 8:
+            continue  # (cheap first: the gap, the line's height, the two lines above one under the other)
         left, right = _extent(w, bgra, top, bottom)
-        if bottom - top <= 3 and right <= 16:  # the cursor
-            runs = runs[1:]
-    if len(runs) < 2:
-        return False
-    (top, bottom), (_, above) = runs[0], runs[1]
-    left, right = _extent(w, bgra, top, bottom)
-    return (8 <= bottom - top + 1 <= 20 and left <= 16 and 0.15 * w <= right <= 0.45 * w
-            and top - above - 1 >= 28)
+        if left > 16 or not 210 <= right <= 350:  # "Continue with autoinstall? (yes|no)": 35 characters
+            continue
+        if 350 <= _extent(w, bgra, above_top, above)[1] <= 590 and 220 <= _extent(w, bgra, first_top, first)[1] <= 370:
+            return True  # (59 and 37 characters)
+    return False
 
 
 def answer_question(pve: Pve, node: str, vmid: int, timeout: float | None = None) -> bool:
     """Types yes at the installer's question of a VM just started from an Ubuntu Server ISO with its autoinstall disc
-    (screen.answer_prompt). The whole screen is asked for every 2 s — the question waits, so there is no hurry, and
-    where it shows depends on how much log came before. True when it was answered; what was seen goes to
+    (screen.answer_prompt). The whole screen is asked for every second: where the question shows depends on how much
+    log came before, and more may come after it. True when it was answered; what was seen goes to
     boot-prompt.log in the app's data folder (the last watch only)."""
     path = store.data_dir() / "boot-prompt.log"
     try:
@@ -134,9 +135,11 @@ def answer_question(pve: Pve, node: str, vmid: int, timeout: float | None = None
             out.flush()
 
     try:
+        # yes half a second after the question shows (its input() reads the keyboard from the moment it is
+        # printed), again only if it still stands two minutes on; the screen asked for every second
         return screen.answer_prompt(lambda: pve.open_vnc(node, "qemu", vmid), question_on, ANSWER,
-                                    QUESTION_WAIT_S if timeout is None else timeout, quiet=20.0, refresh=2.0,
-                                    first_after=2.0, again_after=30.0, settle=10.0, log=log)
+                                    QUESTION_WAIT_S if timeout is None else timeout, quiet=20.0, refresh=1.0,
+                                    first_after=0.5, again_after=120.0, settle=10.0, log=log)
     finally:
         if out is not None:
             out.close()

@@ -3185,6 +3185,13 @@ class AutoinstallTest(unittest.TestCase):
             self.assertEqual(autoinstall.question_on(*screen_of(name)), name == "ubuntu-autoinstall-question.png",
                              name)
         self.assertFalse(autoinstall.question_on(1024, 768, bytes(1024 * 768 * 4)))  # black
+        # the network log goes on under it while it waits, and pushes it up (the live test of 26/10: missed, as only
+        # the last line was looked at); "…-scrolled.png" is that screen once it has left the top: not seen
+        w, h, question = screen_of("ubuntu-autoinstall-question.png")
+        log_lines = screen_of("ubuntu-installer-disk.png")[2]
+        for lines in (1, 10, 30):
+            cut = lines * 16 * w * 4
+            self.assertTrue(autoinstall.question_on(w, h, question[cut:] + log_lines[-cut:]), lines)
 
     def test_yes_typed_when_the_question_shows(self):
         """The log first, then the question: y, e, s and Enter — with their scan codes — once it shows, then done."""
@@ -3226,6 +3233,8 @@ class AutoinstallTest(unittest.TestCase):
             self.assertIn("VM 150: question SEEN", (Path(tmp) / "boot-prompt.log").read_text())
         self.assertIs(seen["is_prompt"], autoinstall.question_on)
         self.assertEqual((seen["keys"], seen["timeout"], seen.get("top")), (("y", "e", "s", "enter"), 900, None))
+        # yes half a second after it shows, the whole screen every second, again only after two minutes
+        self.assertEqual((seen["first_after"], seen["refresh"], seen["again_after"]), (0.5, 1.0, 120.0))
 
     def config(self, **kw):
         text = autoinstall.user_data(**{"vm_name": "srv.lan", "user": "nikos", "password": "Pw-1234",
