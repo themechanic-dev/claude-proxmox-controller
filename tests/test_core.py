@@ -1913,6 +1913,13 @@ class WindowsPackagingTest(unittest.TestCase):
         self.assertIn('AppUserModelID: "{#AppIdName}"', self.iss)
         self.assertIn("AppId={{CD154B40-5EEA-477B-B826-A0F95650C4E8}", self.iss)  # never changes: upgrades replace
 
+    def test_viewer_not_approved_is_said(self):
+        # the administrator's approval declined, or its window closed by itself while nobody was there (26/10):
+        # the setup says so and asks again on Retry, instead of finishing as if virt-viewer were installed
+        self.assertIn("ShellExec('runas', 'msiexec.exe'", self.iss)
+        self.assertIn("Code = 1223", self.iss)
+        self.assertIn("MB_RETRYCANCEL, IDCANCEL) = IDRETRY", self.iss)
+
     def test_signature_in_the_wizard(self):
         self.assertIn("BeveledLabel=HOME LAB · by the mechanic", self.iss)  # the user's signature, on every page
         self.assertTrue(self.iss_bytes.startswith(b"\xef\xbb\xbf"))  # UTF-8 with a BOM, or Inno reads the · wrong

@@ -138,7 +138,13 @@ class MainWindow(QMainWindow):
         add.clicked.connect(lambda: self.add_host())
         box.layout().addWidget(add, 0, Qt.AlignmentFlag.AlignLeft)
         box.setMaximumWidth(560)
-        lay.addWidget(box, 0, Qt.AlignmentFlag.AlignHCenter)
+        # centred by a row, not by AlignHCenter: aligned, its height was reckoned for the page's width and the card
+        # then made narrower, cutting its words off (Windows 11 and Ubuntu, 26/10); a row reckons it at its width
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(box, 100)
+        row.addStretch(1)
+        lay.addLayout(row)
         lay.addStretch(2)
         return w
 

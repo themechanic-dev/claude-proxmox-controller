@@ -4108,6 +4108,16 @@ class MainWindowTest(UiCase):
             try:
                 self.assertIs(win.pages.currentWidget(), win.empty)
                 self.assertEqual(self.menu_texts(win), ["Hosts and Settings…", "Claude Access…", "Help", "Quit"])
+                # the card's words whole at any width (Windows 11, 1024 px: its height was reckoned for the page's
+                # width, the centred card then narrower — the second line cut off, the third gone)
+                words = [w for w in win.empty.findChildren(QLabel) if w.wordWrap()]
+                self.assertEqual(len(words), 1)
+                win.show()
+                for width in (1024, 1600, 760):
+                    win.resize(width, 700)
+                    QApplication.processEvents()
+                    w = words[0]
+                    self.assertGreaterEqual(w.height(), w.heightForWidth(w.width()), width)
             finally:
                 win.close()
 

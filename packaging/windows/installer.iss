@@ -110,15 +110,47 @@ begin
   end;
 end;
 
-procedure CurStepChanged(CurStep: TSetupStep);
+function InstallViewer(const Msi: String): String;
 var
   Code: Integer;
-  Msi: String;
+begin
+  { its own installer, for all users: Windows asks for an administrator. '' when it is installed, else why not }
+  Result := '';
+  if not ShellExec('runas', 'msiexec.exe', '/i "' + Msi + '" /passive /norestart', '', SW_SHOW,
+                   ewWaitUntilTerminated, Code) then
+  begin
+    if Code = 1223 then  { ERROR_CANCELLED }
+      Result := 'Windows did not get an administrator''s approval (it was declined, or its window closed by ' +
+                'itself after a while).'
+    else
+      Result := 'Windows could not start its installer: ' + SysErrorMessage(Code)
+  end
+  else if Code = 1602 then
+    Result := 'Its installer was cancelled.'
+  else if Code = 1618 then
+    Result := 'Another installation is running: wait until it ends.'
+  else if (Code <> 0) and (Code <> 3010) then  { 3010: installed, Windows wants a restart some time }
+    Result := 'Its installer stopped (code ' + IntToStr(Code) + ').';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Msi, Why: String;
+  Again: Boolean;
 begin
   Msi := ExpandConstant('{tmp}\virt-viewer.msi');
   if (CurStep = ssPostInstall) and FileExists(Msi) then
-    { its own installer, for all users: Windows asks for an administrator }
-    ShellExec('runas', 'msiexec.exe', '/i "' + Msi + '" /passive /norestart', '', SW_SHOW, ewWaitUntilTerminated, Code);
+    { not approved (the approval window closes by itself when nobody answers it: 26/10, while away) or failed:
+      said, and asked again on Retry — it went on silently before }
+    repeat
+      Why := InstallViewer(Msi);
+      Again := False;
+      if Why <> '' then
+        Again := SuppressibleMsgBox('virt-viewer was not installed. ' + Why + #13#10#13#10 +
+                   'Retry asks again. Cancel finishes without it: Proxmox Controller''s built-in console works ' +
+                   'without virt-viewer, and this setup offers it again the next time it runs.',
+                   mbError, MB_RETRYCANCEL, IDCANCEL) = IDRETRY;
+    until not Again;
 end;
 
 procedure StopRunning();
