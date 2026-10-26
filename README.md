@@ -64,6 +64,16 @@ Everything works without Claude too:
   sudo apt install ./proxmox-controller_1.0.0_amd64.deb
   ```
 
+- **Ubuntu / Debian, from its apt repository** — it then updates with the rest of the system:
+
+  ```bash
+  wget -qO- https://themechanic.store/apt-controller/proxmox-controller.gpg | sudo tee /usr/share/keyrings/proxmox-controller.gpg >/dev/null
+  echo "deb [signed-by=/usr/share/keyrings/proxmox-controller.gpg] https://themechanic.store/apt-controller ./" | sudo tee /etc/apt/sources.list.d/proxmox-controller.list
+  sudo apt update && sudo apt install proxmox-controller
+  ```
+
+  The package is built on Ubuntu 24.04 and runs there and on newer releases (tested on Ubuntu Desktop 26.04).
+
 Each host needs a Proxmox API token (Help in the app shows how to make one).
 
 ## From the source
