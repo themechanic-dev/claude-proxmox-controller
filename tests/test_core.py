@@ -3215,11 +3215,13 @@ class AutoinstallTest(unittest.TestCase):
             kw["log"]("question SEEN")
             return True
 
-        with mock.patch.object(screen, "answer_prompt", fake):
-            self.assertTrue(autoinstall.answer_question(DemoPve(DEMO_HOSTS[0]), "pve", 150))
+        with tempfile.TemporaryDirectory() as tmp:  # (not the app's own data folder: its log is the user's)
+            with mock.patch.object(screen, "answer_prompt", fake), \
+                    mock.patch.object(store, "data_dir", lambda: Path(tmp)):
+                self.assertTrue(autoinstall.answer_question(DemoPve(DEMO_HOSTS[0]), "pve", 150))
+            self.assertIn("VM 150: question SEEN", (Path(tmp) / "boot-prompt.log").read_text())
         self.assertIs(seen["is_prompt"], autoinstall.question_on)
         self.assertEqual((seen["keys"], seen["timeout"], seen.get("top")), (("y", "e", "s", "enter"), 900, None))
-        self.assertIn("VM 150: question SEEN", (store.data_dir() / "boot-prompt.log").read_text())
 
     def config(self, **kw):
         text = autoinstall.user_data(**{"vm_name": "srv.lan", "user": "nikos", "password": "Pw-1234",
