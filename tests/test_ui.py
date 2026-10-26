@@ -507,6 +507,11 @@ class FakeGuestSide:
     def accounts(self):
         return [("root", 0), ("user", 1000)], [("root", 0), ("user", 1000), ("www-data", 33)]
 
+    def put_back(self, path, folder, progress, cancel):
+        self.calls.append(("put_back", path.name, folder, path.read_text()))
+        progress(path.stat().st_size, path.stat().st_size, "network")
+        return "network"
+
     def set_permissions(self, folder, names, mode, owner, scope="self"):
         self.calls.append(("permissions", folder, list(names), mode, owner, scope))
 
@@ -564,9 +569,9 @@ class FilesWindowTest(UiCase):
         self.choose(dlg.local, "new.txt")
         self.assertEqual([t for t, _ in self.actions(dlg.local)],
                          ["Open", "Send  →", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path", "Properties…"])
-        self.choose(dlg.remote, "old.txt")  # the guest's file: no Open (yet); a Linux guest: Permissions…
+        self.choose(dlg.remote, "old.txt")  # the guest's file: Edit; a Linux guest: Permissions…
         self.assertEqual([t for t, _ in self.actions(dlg.remote)],
-                         ["←  Receive", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path", "Properties…",
+                         ["Edit", "←  Receive", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path", "Properties…",
                           "Permissions…"])
         self.choose(dlg.remote, "old.txt", "docs")  # two: one name cannot go on both
         self.assertIn(("Rename…", False), self.actions(dlg.remote))
@@ -762,6 +767,74 @@ class FilesWindowTest(UiCase):
         self.assertEqual(self.side.calls[-1][0], "properties")
         self.side.os_name = "windows"  # a Windows guest: not offered
         self.assertNotIn("Permissions…", [t for t, _ in self.actions(dlg.remote)])
+
+    def saved(self, path, text):
+        """As an editor saves: new contents, a new time."""
+        path.write_text(text)
+        t = time.time_ns() + 2_000_000_000 * (1 + len(self.asked))
+        os.utime(path, ns=(t, t))
+
+    def test_edit_as_filezilla(self):
+        dlg = self.dlg
+        self.choose(dlg.remote, "docs")
+        self.assertEqual(self.actions(dlg.remote)[0], ("Open", True))  # a folder: opened, not edited
+        self.choose(dlg.remote, "old.txt")
+        self.assertEqual(self.actions(dlg.remote)[0], ("Edit", True))
+        dlg.edit_item(dlg.remote)
+        self.assertTrue(wait_until(lambda: dlg.edits and self.opened))
+        ed = dlg.edits[0]
+        self.assertEqual(self.opened, [str(ed.path)])  # in this computer's own app
+        self.assertEqual((ed.path.name, ed.path.read_text()), ("old.txt", "from the guest"))
+        self.assertTrue(ed.path.parent.name.startswith("pvc-edit-"))
+        self.assertTrue(dlg.edit_timer.isActive())
+        self.assertTrue(self.settled())
+        dlg.check_edits()  # not saved yet: nothing asked
+        self.assertEqual(self.asked, [])
+        self.answer = False
+        self.saved(ed.path, "edited")
+        dlg.check_edits()
+        self.assertEqual(self.asked, ["Send old.txt back?"])
+        dlg.check_edits()  # "not now": asked again only when saved again
+        self.assertEqual(self.asked, ["Send old.txt back?"])
+        self.answer = True
+        self.saved(ed.path, "edited again")
+        dlg.check_edits()
+        self.assertTrue(wait_until(lambda: self.side.calls[-1][0] == "put_back"))
+        self.assertEqual(self.side.calls[-1], ("put_back", "old.txt", "/home/user", "edited again"))
+        self.assertTrue(self.settled())
+        self.assertFalse(ed.changed())
+        asked = len(self.asked)
+        t = time.time_ns() + 60_000_000_000
+        os.utime(ed.path, ns=(t, t))  # saved without a change: nothing asked
+        dlg.check_edits()
+        self.assertEqual(len(self.asked), asked)
+        calls = len(self.side.calls)
+        dlg.edit_item(dlg.remote)  # the same file again: its copy opened again, not received again
+        self.assertEqual((self.opened[-1], len(self.opened), len(self.side.calls)), (str(ed.path), 2, calls))
+        self.saved(ed.path, "not sent")
+        self.answer = False
+        dlg.close()  # a change not sent back: asked, and kept open
+        self.assertEqual(self.asked[-1], "Close without sending back?")
+        self.assertTrue(ed.path.exists())
+        self.answer = True
+        dlg.close()
+        self.assertFalse(ed.path.parent.exists())  # the copies go with the window
+        self.assertEqual(dlg.edits, [])
+
+    def test_edit_that_cannot_be_received(self):
+        dlg, made, real = self.dlg, [], tempfile.mkdtemp
+
+        def mkdtemp(**kw):
+            made.append(Path(real(**kw)))
+            return str(made[-1])
+        self.choose(dlg.remote, "old.txt")
+        with mock.patch.object(files_window.tempfile, "mkdtemp", mkdtemp), \
+                mock.patch.object(self.side, "receive", side_effect=files_window.GuestError("No such file")):
+            dlg.edit_item(dlg.remote)
+            self.assertTrue(wait_until(lambda: self.errors))
+        self.assertEqual(self.errors[-1], ("Files", "No such file"))
+        self.assertEqual((dlg.edits, self.opened), ([], []))
+        self.assertFalse(made[0].exists())  # nothing left on this computer
 
     def test_permissions_window(self):
         Props = files_window.Props

@@ -5,20 +5,25 @@ shows how far, how fast and which way it goes. The copies themselves are core/gu
 A right click on either side opens what FileZilla's does (the user's wish, 26/10): Open, Send / Receive, Rename…
 (F2), Delete… (Del — on this computer into the Trash, in the guest for good), New Folder…, Refresh (F5), Copy Path
 and Properties… (Alt+Enter: a folder's whole size, what it holds, times, owner, rights); in a Linux guest also
-Permissions… (chmod and chown, on what is chosen or with what is inside)."""
+Permissions… (chmod and chown, on what is chosen or with what is inside). Edit, on a guest's file, works as
+FileZilla's: a copy opens in this computer's own app, and each time it is saved there the window asks whether to send
+it back (its contents only: the guest's file keeps its owner and rights)."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import stat
+import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QFile, QMimeData, QObject, Qt, QUrl, Signal
+from PySide6.QtCore import QFile, QMimeData, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
                                QGridLayout, QHBoxLayout, QHeaderView, QLineEdit, QMenu, QProgressBar, QTreeWidget,
@@ -359,6 +364,35 @@ def ask_permissions(parent: QWidget, title: str, where: str, props: list[Props],
     return (mode, owner, scope) if mode or owner else None
 
 
+@dataclass
+class Edit:
+    """A guest's file being edited on this computer (Edit): where it came from, the copy, how the copy was when last
+    looked at, and its contents' digest as last received or sent back."""
+    folder: str
+    name: str
+    path: Path
+    seen: tuple
+    sent: str
+
+    def look(self) -> tuple:
+        st = self.path.stat()
+        return st.st_mtime_ns, st.st_size
+
+    def digest(self) -> str:
+        h = hashlib.sha256()
+        with open(self.path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        return h.hexdigest()
+
+    def changed(self) -> bool:
+        """Changed here since received or last sent back."""
+        try:
+            return self.digest() != self.sent
+        except OSError:
+            return False
+
+
 def local_listing(folder: Path) -> list[Entry]:
     out = []
     with os.scandir(folder) as it:
@@ -502,6 +536,8 @@ class _Relay(QObject):
 class FilesWindow(QDialog):
     """`make_backend` gives the guest's side (guestfiles.VmFiles or ContainerFiles) — called on a worker thread."""
 
+    EDIT_LOOK_MS = 1000  # how often the edited copies are looked at
+
     def __init__(self, parent, title: str, subtitle: str, make_backend: Callable[[], object], runner,
                  local_start: Path | None = None, guest: dict | None = None):
         super().__init__(parent)
@@ -517,6 +553,13 @@ class FilesWindow(QDialog):
         self.busy = False  # (the guest's side reading or changing)
         self.reads = 0  # the guest's folder asked for last: an older answer coming after it is not shown
         self.props_windows: list[PropertiesDialog] = []
+        self.edits: list[Edit] = []
+        self.asking = False  # (a question about an edited file is up)
+        self.after_copy: Callable[[], None] | None = None
+        self.copy_failed: Callable[[], None] | None = None
+        self.edit_timer = QTimer(self)
+        self.edit_timer.setInterval(self.EDIT_LOOK_MS)
+        self.edit_timer.timeout.connect(self.check_edits)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)  # as every window of a guest (widgets.DialogHead)
         lay.setSpacing(12)
@@ -694,6 +737,8 @@ class FilesWindow(QDialog):
 
         if one is not None and (one.is_dir or local):
             add("Open", lambda: self.open_item(pane), ready)
+        elif one is not None:  # a guest's file: edited here, offered back when saved
+            add("Edit", lambda: self.edit_item(pane), ready)
         if chosen:
             if local:
                 add("Send  →", lambda: self.send(), ready and self.backend is not None)
@@ -875,6 +920,77 @@ class FilesWindow(QDialog):
 
         self.runner.run(lambda: (backend.properties(folder, names), backend.accounts()), got)
 
+    # -- Edit, as FileZilla's -------------------------------------------------------------------------
+
+    def edit_item(self, pane: Pane) -> None:
+        """The guest's file chosen: a copy in a folder of its own in this computer's temporary folder, opened in the
+        app this computer opens it with; then watched (check_edits). The same file again: its copy opened again."""
+        chosen = pane.chosen()
+        if pane is self.local or len(chosen) != 1 or chosen[0].is_dir or not self._ready(pane):
+            return
+        entry, folder, backend = chosen[0], pane.folder, self.backend
+        known = next((e for e in self.edits if e.folder == folder and e.name == entry.name), None)
+        if known is not None and known.path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(known.path)))
+            return
+        where = Path(tempfile.mkdtemp(prefix="pvc-edit-"))
+
+        def opened():
+            path = where / entry.name
+            ed = Edit(folder, entry.name, path, (), "")
+            ed.seen, ed.sent = ed.look(), ed.digest()
+            self.edits = [e for e in self.edits if e is not known] + [ed]
+            self.edit_timer.start()
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            self.result.setText(f"Editing {entry.name} in this computer's app: each time it is saved there, this "
+                                "window asks whether to send it back.")
+
+        self._copy(f"{_short(entry.name)}  →  this computer, to edit",
+                   lambda progress, cancel: backend.receive(folder, [entry.name], where, progress, cancel, entry.size),
+                   None, opened, lambda: shutil.rmtree(where, True))
+
+    def check_edits(self) -> None:
+        """Each edited copy saved since last looked at, its contents changed: asked whether to send it back — one
+        question at a time, none while a copy goes on (asked at the next look)."""
+        if self.asking or self.cancel is not None or self.backend is None:
+            return
+        for ed in list(self.edits):
+            try:
+                seen = ed.look()
+                if seen == ed.seen:
+                    continue
+                digest = ed.digest()
+            except OSError:
+                continue  # (an editor saving: away for a moment)
+            ed.seen = seen
+            if digest == ed.sent:
+                continue
+            self.asking = True
+            try:
+                yes = confirm(self, f"Send {ed.name} back?", f"It was changed on this computer. Send it back to "
+                              f"{ed.folder} in {self.guest_name}, over the one there? (Its contents only: the file "
+                              "keeps its owner and rights there.)", "Send Back", icon="edit")
+            finally:
+                self.asking = False
+            if yes:
+                self._send_back(ed, digest)
+            return
+
+    def _send_back(self, ed: Edit, digest: str) -> None:
+        backend = self.backend
+
+        def sent():
+            ed.sent = digest
+
+        self._copy(f"{_short(ed.name)}  →  {ed.folder}",
+                   lambda progress, cancel: backend.put_back(ed.path, ed.folder, progress, cancel), self.remote, sent)
+
+    def _forget_edits(self) -> None:
+        self.edit_timer.stop()
+        for ed in self.edits:
+            shutil.rmtree(ed.path.parent, True)
+        self.edits = []
+
     def _guest_op(self, job, done_text: str) -> None:
         """A change in the guest, off the window's thread; then its folder read again."""
         self._busy(True, "Working…")
@@ -930,7 +1046,10 @@ class FilesWindow(QDialog):
         self._copy(f"{_short(', '.join(names))}  →  {dest}",
                    lambda progress, cancel: backend.receive(folder, names, dest, progress, cancel, total), self.local)
 
-    def _copy(self, what: str, job, refresh: Pane) -> None:
+    def _copy(self, what: str, job, refresh: Pane | None, after: Callable[[], None] | None = None,
+              failed: Callable[[], None] | None = None) -> None:
+        """A copy with its bar and Cancel; then `refresh` read again, and `after` (or `failed`, when it did not go)."""
+        self.after_copy, self.copy_failed = after, failed
         self.cancel = threading.Event()
         cancel = self.cancel
         self.refresh_after = refresh
@@ -982,9 +1101,14 @@ class FilesWindow(QDialog):
         else:
             moved = file_size(getattr(self, "done_bytes", 0))
             self.result.setText(f"Done: {self.what.text()} — {moved} in {secs:.1f} s, {WAYS.get(way, way)}.")
+        after, failed, self.after_copy, self.copy_failed = self.after_copy, self.copy_failed, None, None
+        if err is None and after is not None:
+            after()
+        elif err is not None and failed is not None:
+            failed()
         if self.refresh_after is self.remote:
             self.go_remote(self.remote.folder)
-        else:
+        elif self.refresh_after is self.local:
             self.go_local(self.local.folder)
 
     def _stop(self) -> None:
@@ -1001,11 +1125,17 @@ class FilesWindow(QDialog):
             self.remote.state.setText(text)
 
     def closeEvent(self, ev) -> None:
+        unsent = [e.name for e in self.edits if e.changed()]  # (asked first: a stopped copy cannot be taken back)
+        if unsent and not confirm(self, "Close without sending back?", f"{', '.join(unsent)}: changed on this "
+                                  "computer and not sent back. Closing forgets the changes.", "Close Anyway", True):
+            ev.ignore()
+            return
         if self.cancel is not None:
             if not confirm(self, "Stop the copy?", "A copy is still going on.", "Stop It", True):
                 ev.ignore()
                 return
             self.cancel.set()
+        self._forget_edits()
         super().closeEvent(ev)
 
 

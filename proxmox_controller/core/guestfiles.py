@@ -547,6 +547,71 @@ def mode_spec(bits: dict[str, bool | None]) -> str:
     return ",".join(out)
 
 
+# -- an edited file back where it came from (Edit…) ---------------------------------------------------------------
+# Its contents only, written into the file that is there: the file keeps its owner, its rights, its links (a fresh
+# copy would take the folder owner's and this computer's). The copy goes first into a folder of its own in the
+# guest's temporary folder (the usual way: network, Proxmox or SSH), then this writes it over and takes that away.
+
+LINUX_PUTBACK = r"""
+t=$(printf %s "$1" | base64 -d); n=$(printf %s "$3" | base64 -d)
+fail() { rm -rf -- "$t"; printf 'ERRB %s\n' "$(printf %s "$1" | base64 | tr -d '\n')"; exit 5; }
+[ -f "$t/$n" ] || fail "The copy did not arrive."
+cd -- "$(printf %s "$2" | base64 -d)" 2>/dev/null || fail "No such folder"
+new=; [ -e "$n" ] || new=1
+e=$( { cat -- "$t/$n" > "$n"; } 2>&1 ) || fail "$e"
+rm -rf -- "$t"
+[ -z "$new" ] || chown "$(stat -c %u:%g .)" -- "$n" 2>/dev/null
+exit 0
+"""
+
+WINDOWS_PUTBACK = r"""
+$ErrorActionPreference = 'Stop'
+function D([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
+function E([string]$s) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s)) }
+$t = D '{tmp}'; $d = D '{folder}'; $n = D '{name}'; $code = 0
+try {
+  $src = Join-Path $t $n
+  if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { 'ERR The copy did not arrive.'; $code = 6 }
+  elseif (-not (Test-Path -LiteralPath $d -PathType Container)) { 'ERR No such folder'; $code = 4 }
+  else {
+    $in = [IO.File]::OpenRead($src)
+    try {
+      $out = [IO.File]::Open((Join-Path $d $n), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write)
+      try { $out.SetLength(0); $in.CopyTo($out) } finally { $out.Close() }
+    } finally { $in.Close() }
+  }
+} catch { 'ERRB ' + (E $_.Exception.Message); $code = 5 }
+Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue
+exit $code
+"""
+
+
+def putback_argv(os_name: str, tmp: str, folder: str, name: str) -> list[str]:
+    if os_name == "windows":
+        return _ps(WINDOWS_PUTBACK.replace("{tmp}", b64(tmp)).replace("{folder}", b64(folder))
+                   .replace("{name}", b64(name)))
+    return ["sh", "-c", LINUX_PUTBACK, "sh", b64(tmp), b64(folder), b64(name)]
+
+
+def put_back(side, os_name: str, path: Path, folder: str, progress: Progress, cancel: threading.Event,
+             finish: Callable[[list[str]], None]) -> str:
+    """`path` of this computer over the file of the same name in the guest's `folder` (see LINUX_PUTBACK), through
+    `side` (VmFiles or ContainerFiles); `finish` runs the guest's last command. Returns the way it went."""
+    tmp_name = f"pcx-edit-{secrets.token_hex(6)}"
+    side.mkdir(TEMP[os_name], tmp_name)
+    tmp = join(os_name, TEMP[os_name], tmp_name)
+    try:
+        way = side.send([path], tmp, progress, cancel)
+    except BaseException:
+        try:
+            side.delete(TEMP[os_name], [tmp_name])
+        except Exception:  # noqa: BLE001 — what failed first is what the user is told
+            pass
+        raise
+    finish(putback_argv(os_name, tmp, folder, path.name))
+    return way
+
+
 WIN_ATTRIBUTES = (("ReadOnly", 0x1), ("Hidden", 0x2), ("System", 0x4), ("Archive", 0x20), ("Compressed", 0x800),
                   ("Encrypted", 0x4000))
 
@@ -858,6 +923,11 @@ class VmFiles:
         code, out, err = self.run(["sh", "-c", LINUX_ACCOUNTS])
         return parse_accounts(out)
 
+    def put_back(self, path: Path, folder: str, progress: Progress, cancel: threading.Event) -> str:
+        """An edited file back over the one it came from: its contents only (see LINUX_PUTBACK)."""
+        return put_back(self, self.os_name, path, folder, progress, cancel, lambda argv: ops_result(
+            *self.run(argv, timeout=600), "Sending it back failed"))
+
     def set_permissions(self, folder: str, names: list[str], mode: str, owner: str, scope: str = "self") -> None:
         if self.os_name == "windows":
             raise GuestError("Permissions… is for Linux guests.")
@@ -1081,11 +1151,19 @@ class ContainerFiles:
         return parse_listing(done.stdout, "linux")
 
     def _op(self, op: str, folder: str, names: tuple, what: str, timeout: float = 60) -> None:
-        done = subprocess.run(self._argv(ops_argv("linux", op, folder, *names)), capture_output=True, text=True,
-                              errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, **procs.hidden())
+        self._exec(ops_argv("linux", op, folder, *names), what, timeout)
+
+    def _exec(self, argv: list[str], what: str, timeout: float = 60) -> None:
+        done = subprocess.run(self._argv(argv), capture_output=True, text=True, errors="replace", timeout=timeout,
+                              stdin=subprocess.DEVNULL, **procs.hidden())
         if done.returncode == 255:
             raise GuestError(done.stderr.strip()[:300] or "SSH to the host failed.")
         ops_result(done.returncode, done.stdout, done.stderr, what)
+
+    def put_back(self, path: Path, folder: str, progress: Progress, cancel: threading.Event) -> str:
+        """An edited file back over the one it came from: its contents only (see LINUX_PUTBACK)."""
+        return put_back(self, "linux", path, folder, progress, cancel,
+                        lambda argv: self._exec(argv, "Sending it back failed", 600))
 
     def rename(self, folder: str, old: str, new: str) -> None:
         self._op("rename", folder, (old, new), "Renaming failed")
@@ -1111,11 +1189,7 @@ class ContainerFiles:
         return parse_accounts(done.stdout)
 
     def set_permissions(self, folder: str, names: list[str], mode: str, owner: str, scope: str = "self") -> None:
-        done = subprocess.run(self._argv(perms_argv(folder, names, mode, owner, scope)), capture_output=True,
-                              text=True, errors="replace", timeout=600, stdin=subprocess.DEVNULL, **procs.hidden())
-        if done.returncode == 255:
-            raise GuestError(done.stderr.strip()[:300] or "SSH to the host failed.")
-        ops_result(done.returncode, done.stdout, done.stderr, "Setting the permissions failed")
+        self._exec(perms_argv(folder, names, mode, owner, scope), "Setting the permissions failed", 600)
 
     def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event) -> str:
         total = total_size(paths)

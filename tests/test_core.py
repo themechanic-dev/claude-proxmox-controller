@@ -2748,6 +2748,28 @@ class GuestFilesLinuxTest(unittest.TestCase):
         with self.assertRaisesRegex(guestfiles.GuestError, "^λείπει: not there"):
             self.files().properties(str(self.vm), ["λείπει"])
 
+    def test_put_back(self):
+        """Edit's way back, run for real: the edited contents over the guest's file — the same file still (its
+        rights, its links), over the network, through Proxmox and in a container; nothing left behind."""
+        target = self.vm / "ρυθμίσεις.sh"
+        target.write_text("old\n")
+        os.chmod(target, 0o750)
+        (self.vm / "δεσμός.sh").symlink_to("ρυθμίσεις.sh")
+        inode = target.stat().st_ino
+        edited = self.pc / "ρυθμίσεις.sh"
+        ct = guestfiles.ContainerFiles("pve", 22, "root", 105)
+        ct._argv = lambda inner: inner  # (what `pct exec` would run inside, run here)
+        for side, way in ((self.files(), "network"), (self.files(True), "proxmox"), (ct, "ssh")):
+            edited.write_text(f"νέο, {way}\n", encoding="utf-8")
+            os.chmod(edited, 0o644)
+            self.assertEqual(side.put_back(edited, str(self.vm), self.note, threading.Event()), way)
+            self.assertEqual((self.vm / "δεσμός.sh").read_text(encoding="utf-8"), f"νέο, {way}\n")
+            self.assertEqual((stat.S_IMODE(target.stat().st_mode), target.stat().st_ino), (0o750, inode))
+        self.assertEqual(sorted(os.listdir(self.vm)), ["δεσμός.sh", "ρυθμίσεις.sh", "υπάρχον.md"])
+        with self.assertRaisesRegex(guestfiles.GuestError, "^Sending it back failed: No such folder"):
+            ct.put_back(edited, str(self.root / "nope"), self.note, threading.Event())
+        self.assertEqual([p for p in os.listdir("/tmp") if p.startswith("pcx-edit-")], [])
+
     def test_permissions(self):
         """Permissions…, the guest's script run for real: only the bits asked for change, as far as asked; links
         are neither followed nor changed; chown's own words come back."""
@@ -2872,11 +2894,17 @@ class GuestFilesTest(unittest.TestCase):
         self.assertTrue(all(ord(c) < 128 for c in argv[-1]))
         with self.assertRaisesRegex(guestfiles.GuestError, "^Reading the properties failed: No such folder$"):
             guestfiles.parse_props(4, "ERR No such folder\r\n", "")
+        script = guestfiles.putback_argv("windows", "C:\\Windows\\Temp\\pcx-edit-1", "C:\\Χρήστης", "σημείωση.txt")[-1]
+        for part in ("C:\\Windows\\Temp\\pcx-edit-1", "C:\\Χρήστης", "σημείωση.txt"):
+            self.assertIn(guestfiles.b64(part), script)
+        self.assertFalse(any(m in script for m in ("{tmp}", "{folder}", "{name}")))
+        self.assertTrue(all(ord(c) < 128 for c in script))
 
     def test_scripts_stay_ascii_and_are_filled(self):
         for name in ("LINUX_LIST", "LINUX_SEND_NET", "LINUX_RECV_NET", "LINUX_JOIN", "LINUX_PACK", "WINDOWS_LIST",
                      "WINDOWS_SEND_NET", "WINDOWS_RECV_NET", "WINDOWS_JOIN", "WINDOWS_PACK", "LINUX_OPS",
-                     "WINDOWS_OPS", "LINUX_PROPS", "WINDOWS_PROPS", "LINUX_PERMS", "LINUX_ACCOUNTS"):
+                     "WINDOWS_OPS", "LINUX_PROPS", "WINDOWS_PROPS", "LINUX_PERMS", "LINUX_ACCOUNTS",
+                     "LINUX_PUTBACK", "WINDOWS_PUTBACK"):
             self.assertTrue(all(ord(c) < 128 for c in getattr(guestfiles, name)), name)
         sent = []
         agent = mock.Mock()
