@@ -504,6 +504,12 @@ class FakeGuestSide:
         self.calls.append(("mkdir", folder, name))
         self.entries.append(self.Entry(name, True, 0, 0))
 
+    def accounts(self):
+        return [("root", 0), ("user", 1000)], [("root", 0), ("user", 1000), ("www-data", 33)]
+
+    def set_permissions(self, folder, names, mode, owner, scope="self"):
+        self.calls.append(("permissions", folder, list(names), mode, owner, scope))
+
     def properties(self, folder, names):
         from proxmox_controller.core.guestfiles import Props
         self.calls.append(("properties", folder, list(names)))
@@ -558,15 +564,16 @@ class FilesWindowTest(UiCase):
         self.choose(dlg.local, "new.txt")
         self.assertEqual([t for t, _ in self.actions(dlg.local)],
                          ["Open", "Send  →", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path", "Properties…"])
-        self.choose(dlg.remote, "old.txt")  # the guest's file: no Open (yet)
+        self.choose(dlg.remote, "old.txt")  # the guest's file: no Open (yet); a Linux guest: Permissions…
         self.assertEqual([t for t, _ in self.actions(dlg.remote)],
-                         ["←  Receive", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path", "Properties…"])
+                         ["←  Receive", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path", "Properties…",
+                          "Permissions…"])
         self.choose(dlg.remote, "old.txt", "docs")  # two: one name cannot go on both
         self.assertIn(("Rename…", False), self.actions(dlg.remote))
         self.choose(dlg.remote, "docs")
         self.assertEqual(self.actions(dlg.remote)[0], ("Open", True))
         dlg._busy(True)  # the guest's side being read: nothing changes there meanwhile (what reads only, still)
-        self.assertEqual([t for t, on in self.actions(dlg.remote) if on], ["Copy Path", "Properties…"])
+        self.assertEqual([t for t, on in self.actions(dlg.remote) if on], ["Copy Path", "Properties…"])  # (not Permissions…)
         self.assertTrue(all(on for _t, on in self.actions(dlg.local)))
         dlg._busy(False)
         shown = []  # the right click itself: the item under the pointer chosen first, the empty space the folder
@@ -685,7 +692,7 @@ class FilesWindowTest(UiCase):
 
     def test_properties(self):
         dlg = self.dlg
-        self.assertEqual(self.actions(dlg.remote)[-1], ("Properties…", True))
+        self.assertIn(("Properties…", True), self.actions(dlg.remote))
         self.choose(dlg.remote, "old.txt")
         dlg.properties(dlg.remote)
         win = dlg.props_windows[-1]
@@ -727,6 +734,74 @@ class FilesWindowTest(UiCase):
         self.assertEqual((win.values["Size"], win.head.text.text()), ("3 B", f"In {self.local} · this computer"))
         if os.name == "posix":
             self.assertEqual(win.values["Permissions"], "rw------- (600)")
+
+    def test_permissions(self):
+        dlg = self.dlg
+        self.assertEqual(self.actions(dlg.remote)[-1], ("Permissions…", False))  # (nothing chosen)
+        self.assertNotIn("Permissions…", [t for t, _ in self.actions(dlg.local)])  # the guest's side only
+        self.choose(dlg.remote, "old.txt", "docs")
+        self.assertEqual(self.actions(dlg.remote)[-1], ("Permissions…", True))
+        asked = []
+
+        def ask(_parent, title, where, props, users, groups):
+            asked.append((title, where, [(p.name, p.mode) for p in props], users[1], groups[2]))
+            return ("u+rw,g-w", "", "all")
+        with mock.patch.object(files_window, "ask_permissions", ask):
+            dlg.permissions(dlg.remote)
+            self.assertTrue(wait_until(lambda: self.side.calls and self.side.calls[-1][0] == "permissions"))
+        self.assertEqual(asked, [("2 items", "In /home/user · VM 201", [("old.txt", 0o644), ("docs", 0o755)],
+                                  ("user", 1000), ("www-data", 33))])
+        self.assertEqual(self.side.calls[-1], ("permissions", "/home/user", ["old.txt", "docs"], "u+rw,g-w", "", "all"))
+        self.assertTrue(self.settled())
+        self.assertEqual(dlg.result.text(), "Permissions set: old.txt, docs.")
+        self.assertEqual(dlg.remote.state.text(), "2 items")
+        self.assertEqual([e.name for e in dlg.remote.chosen()], ["old.txt", "docs"])  # still chosen, read again
+        with mock.patch.object(files_window, "ask_permissions", return_value=None):  # cancelled: nothing set
+            dlg.permissions(dlg.remote)
+            self.assertTrue(self.settled())
+        self.assertEqual(self.side.calls[-1][0], "properties")
+        self.side.os_name = "windows"  # a Windows guest: not offered
+        self.assertNotIn("Permissions…", [t for t, _ in self.actions(dlg.remote)])
+
+    def test_permissions_window(self):
+        Props = files_window.Props
+        users, groups = [("root", 0), ("user", 1000)], [("root", 0), ("user", 1000)]
+        one = files_window.PermissionsDialog(None, "old.txt", "In /home/user · VM 201",
+                                             [Props("old.txt", "file", mode=0o644, owner="user", group="user")],
+                                             users, groups)
+        self.addCleanup(one.close)
+        self.assertEqual(one.number.text(), "644")
+        self.assertFalse(one.has_scope)  # a file: nothing inside
+        self.assertEqual(one.changes(), ("", "", "self"))  # nothing touched, nothing changes
+        one.boxes["ux"].click()
+        self.assertEqual(one.number.text(), "744")
+        self.assertEqual(one.changes(), ("u+rwx,g+r,g-wx,o+r,o-wx", "", "self"))  # the rights as a whole
+        one.number.setText("60")
+        one.number.textEdited.emit("60")
+        self.assertFalse(one.apply.isEnabled())
+        one.number.setText("600")
+        one.number.textEdited.emit("600")
+        self.assertTrue(one.apply.isEnabled())
+        self.assertEqual([k for k, b in one.boxes.items() if b.isChecked()], ["ur", "uw"])
+        one.group.setCurrentText("www data")
+        self.assertFalse(one.apply.isEnabled())
+        one.group.setCurrentText("root")
+        one.group.lineEdit().textEdited.emit("root")
+        self.assertEqual(one.changes()[1], "user:root")
+        many = files_window.PermissionsDialog(None, "2 items", "In /home/user · VM 201",
+                                              [Props("a", "folder", mode=0o755, owner="user", group="user"),
+                                               Props("b", "file", mode=0o4640, owner="root", group="user")],
+                                              users, groups)
+        self.addCleanup(many.close)
+        self.assertEqual(many.number.text(), "")  # mixed
+        self.assertEqual(many.boxes["gx"].checkState(), Qt.CheckState.PartiallyChecked)
+        self.assertEqual((many.user.currentText(), many.group.currentText()), ("", "user"))  # owners differ
+        self.assertTrue(many.has_scope)
+        many.scope.setCurrentIndex(2)
+        many.boxes["ow"].click()
+        self.assertEqual(many.changes(), ("u+rw,g+r,g-w,o+w", "", "files"))  # the mixed bits left as each is
+        texts = [lbl.text() for lbl in many.findChildren(QLabel)]
+        self.assertIn("Setuid, setgid and the sticky bit stay as they are.", texts)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "elsewhere it would be the real Trash")
     def test_this_computers_trash(self):

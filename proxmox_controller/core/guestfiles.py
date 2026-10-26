@@ -21,6 +21,7 @@ import base64
 import io
 import os
 import posixpath
+import re
 import secrets
 import shutil
 import socket
@@ -468,6 +469,84 @@ def parse_props(code: int, out: str, err: str) -> list[Props]:
     return got
 
 
+# -- who may do what (Permissions…, Linux guests): chmod and chown, on what is chosen or with what is inside ---------
+# The rights go as chmod's +/- clauses ("u+rw,u-x,…"): only the bits asked for change — never setuid, setgid or the
+# sticky bit. `scope`: "self" — what is chosen; "all" — and everything inside; "files" / "folders" — only the files /
+# only the folders, what is chosen among them too. Links are never followed (find does not; chown -h changes the
+# link itself; chmod would change what it points to, so links are left out).
+
+LINUX_PERMS = r"""
+cd -- "$(printf %s "$1" | base64 -d)" 2>/dev/null || { echo "ERR No such folder"; exit 4; }
+m=$2; o=$(printf %s "$3" | base64 -d); r=$4; shift 4
+fail() { printf 'ERRB %s\n' "$(printf %s "$1" | base64 | tr -d '\n')"; exit 5; }
+for a in "$@"; do
+  n=$(printf %s "$a" | base64 -d)
+  { [ -e "$n" ] || [ -L "$n" ]; } || fail "$n: not there (any more)"
+  case "$r" in
+    all) t='!'; y=l;; files) t=; y=f;; folders) t=; y=d;; *) t=self;;
+  esac
+  if [ -n "$m" ]; then
+    if [ "$t" = self ]; then [ -L "$n" ] || { e=$(chmod "$m" -- "$n" 2>&1) || fail "$e"; }
+    else e=$(find "./$n" $t -type $y -exec chmod "$m" -- {} + 2>&1) || fail "$e"; fi
+  fi
+  if [ -n "$o" ]; then
+    if [ "$t" = self ]; then e=$(chown -h -- "$o" "$n" 2>&1) || fail "$e"
+    elif [ "$r" = all ]; then e=$(find "./$n" -exec chown -h -- "$o" {} + 2>&1) || fail "$e"
+    else e=$(find "./$n" -type $y -exec chown -h -- "$o" {} + 2>&1) || fail "$e"; fi
+  fi
+done
+exit 0
+"""
+
+# the guest's accounts, for the owner's and group's lists
+LINUX_ACCOUNTS = r"""
+printf 'PASSWD %s\n' "$(base64 < /etc/passwd | tr -d '\n')"
+printf 'GROUP %s\n' "$(base64 < /etc/group | tr -d '\n')"
+"""
+
+SCOPES = ("self", "all", "files", "folders")
+MODE_SPEC = re.compile(r"^([ugo][+-][rwx]{1,3})(,[ugo][+-][rwx]{1,3})*$")
+
+
+def perms_argv(folder: str, names: Iterable[str], mode: str, owner: str, scope: str) -> list[str]:
+    """The Linux guest's command for Permissions…: `mode` as chmod's +/- clauses (or ""), `owner` as "user:group",
+    "user" or ":group" (or "")."""
+    if mode and not MODE_SPEC.match(mode):
+        raise ValueError(f"Not a mode for this: {mode!r}")
+    if scope not in SCOPES:
+        raise ValueError(f"No such scope: {scope!r}")
+    return ["sh", "-c", LINUX_PERMS, "sh", b64(folder), mode, b64(owner) if owner else "", scope,
+            *[b64(n) for n in names]]
+
+
+def parse_accounts(out: str) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """(users, groups) as (name, number): root first, then people (1000 and up), then the system's own."""
+    found: dict[str, list[tuple[str, int]]] = {"PASSWD": [], "GROUP": []}
+    for line in out.splitlines():
+        kind, _, data = line.strip().partition(" ")
+        if kind in found and data:
+            for row in unb64(data).splitlines():
+                f = row.split(":")
+                if len(f) > 2 and f[0] and f[2].isdigit():
+                    found[kind].append((f[0], int(f[2])))
+
+    def order(item: tuple[str, int]) -> tuple:
+        n = item[1]
+        return (0 if n == 0 else 1 if 1000 <= n < 65534 else 2, n, item[0])
+    return sorted(found["PASSWD"], key=order), sorted(found["GROUP"], key=order)
+
+
+def mode_spec(bits: dict[str, bool | None]) -> str:
+    """chmod's +/- clauses from {"ur": True, "uw": False, "gx": None, …}: True adds, False takes away, None (mixed
+    among what is chosen) leaves as it is."""
+    out = []
+    for who in "ugo":
+        on = "".join(b for b in "rwx" if bits.get(who + b) is True)
+        off = "".join(b for b in "rwx" if bits.get(who + b) is False)
+        out += [f"{who}+{on}"] * bool(on) + [f"{who}-{off}"] * bool(off)
+    return ",".join(out)
+
+
 WIN_ATTRIBUTES = (("ReadOnly", 0x1), ("Hidden", 0x2), ("System", 0x4), ("Archive", 0x20), ("Compressed", 0x800),
                   ("Encrypted", 0x4000))
 
@@ -775,6 +854,15 @@ class VmFiles:
     def properties(self, folder: str, names: list[str]) -> list[Props]:
         return parse_props(*self.run(props_argv(self.os_name, folder, names), timeout=600))  # (a folder: counted)
 
+    def accounts(self) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+        code, out, err = self.run(["sh", "-c", LINUX_ACCOUNTS])
+        return parse_accounts(out)
+
+    def set_permissions(self, folder: str, names: list[str], mode: str, owner: str, scope: str = "self") -> None:
+        if self.os_name == "windows":
+            raise GuestError("Permissions… is for Linux guests.")
+        ops_result(*self.run(perms_argv(folder, names, mode, owner, scope), timeout=600), "Setting the permissions failed")
+
     # -- copies
     def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event) -> str:
         """The chosen files and folders of this computer into the VM's folder `dest`. Returns the way it went."""
@@ -1014,6 +1102,20 @@ class ContainerFiles:
         if done.returncode == 255:
             raise GuestError(done.stderr.strip()[:300] or "SSH to the host failed.")
         return parse_props(done.returncode, done.stdout, done.stderr)
+
+    def accounts(self) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+        done = subprocess.run(self._argv(["sh", "-c", LINUX_ACCOUNTS]), capture_output=True, text=True,
+                              errors="replace", timeout=60, stdin=subprocess.DEVNULL, **procs.hidden())
+        if done.returncode == 255:
+            raise GuestError(done.stderr.strip()[:300] or "SSH to the host failed.")
+        return parse_accounts(done.stdout)
+
+    def set_permissions(self, folder: str, names: list[str], mode: str, owner: str, scope: str = "self") -> None:
+        done = subprocess.run(self._argv(perms_argv(folder, names, mode, owner, scope)), capture_output=True,
+                              text=True, errors="replace", timeout=600, stdin=subprocess.DEVNULL, **procs.hidden())
+        if done.returncode == 255:
+            raise GuestError(done.stderr.strip()[:300] or "SSH to the host failed.")
+        ops_result(done.returncode, done.stdout, done.stderr, "Setting the permissions failed")
 
     def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event) -> str:
         total = total_size(paths)

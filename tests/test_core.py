@@ -2747,6 +2747,48 @@ class GuestFilesLinuxTest(unittest.TestCase):
                 self.assertEqual(a, b)
         with self.assertRaisesRegex(guestfiles.GuestError, "^λείπει: not there"):
             self.files().properties(str(self.vm), ["λείπει"])
+
+    def test_permissions(self):
+        """Permissions…, the guest's script run for real: only the bits asked for change, as far as asked; links
+        are neither followed nor changed; chown's own words come back."""
+        (self.vm / "φάκελος" / "μέσα").mkdir(parents=True)
+        (self.vm / "φάκελος" / "ένα.txt").write_text("1")
+        (self.vm / "φάκελος" / "μέσα" / "δύο.sh").write_text("2")
+        outside = self.root / "outside.txt"
+        outside.write_text("x")
+        os.chmod(outside, 0o600)
+        (self.vm / "φάκελος" / "δεσμός").symlink_to(outside)
+        for p in ("φάκελος", "φάκελος/μέσα"):
+            os.chmod(self.vm / p, 0o755)
+        for p in ("φάκελος/ένα.txt", "φάκελος/μέσα/δύο.sh"):
+            os.chmod(self.vm / p, 0o4644)  # (setuid: never touched)
+
+        def modes():
+            return [stat.S_IMODE(os.lstat(self.vm / p).st_mode) for p in
+                    ("φάκελος", "φάκελος/μέσα", "φάκελος/ένα.txt", "φάκελος/μέσα/δύο.sh")]
+        ct = guestfiles.ContainerFiles("pve", 22, "root", 105)
+        ct._argv = lambda inner: inner  # (what `pct exec` would run inside, run here)
+        vm, files = str(self.vm), self.files()
+        files.set_permissions(vm, ["φάκελος"], "g+w", "")
+        self.assertEqual(modes(), [0o775, 0o755, 0o4644, 0o4644])  # only what is chosen
+        ct.set_permissions(vm, ["φάκελος"], "o-r", "", "files")
+        self.assertEqual(modes(), [0o775, 0o755, 0o4640, 0o4640])  # only the files inside
+        files.set_permissions(vm, ["φάκελος"], "o-x", "", "folders")
+        self.assertEqual(modes(), [0o774, 0o754, 0o4640, 0o4640])  # only the folders, it among them
+        ct.set_permissions(vm, ["φάκελος"], "u+x,o+x", "", "all")
+        self.assertEqual(modes(), [0o775, 0o755, 0o4741, 0o4741])
+        self.assertEqual(stat.S_IMODE(os.stat(outside).st_mode), 0o600)  # what a link points to: untouched
+        files.set_permissions(vm, ["φάκελος"], "", f"{os.getuid()}:{os.getgid()}", "all")  # (to whom it is already)
+        with self.assertRaisesRegex(guestfiles.GuestError, "^Setting the permissions failed: chown: .*nosuchuser"):
+            files.set_permissions(vm, ["φάκελος"], "", "nosuchuser")
+        with self.assertRaisesRegex(guestfiles.GuestError, "^Setting the permissions failed: λείπει: not there"):
+            ct.set_permissions(vm, ["λείπει"], "u+r", "")
+        users, groups = files.accounts()
+        self.assertEqual(users[0], ("root", 0))
+        self.assertEqual(groups[0], ("root", 0))
+        self.assertEqual(ct.accounts(), (users, groups))
+        for argv in self.agent.started:  # (the agent is given ASCII only)
+            self.assertTrue(all(ord(c) < 128 for a in argv for c in a), argv)
         with self.assertRaisesRegex(guestfiles.GuestError, "No such folder"):
             ct.properties(str(self.root / "nope"), ["x"])
 
@@ -2795,6 +2837,27 @@ class GuestFilesTest(unittest.TestCase):
             guestfiles.ops_result(9, "", "", "Deleting failed")
         guestfiles.ops_result(0, "", "", "Deleting failed")
 
+    def test_permission_words(self):
+        spec = guestfiles.mode_spec
+        self.assertEqual(spec({"ur": True, "uw": True, "ux": False, "gr": True, "gw": False, "gx": None,
+                               "or": None, "ow": False, "ox": False}), "u+rw,u-x,g+r,g-w,o-wx")
+        self.assertEqual(spec({}), "")
+        argv = guestfiles.perms_argv("/home/user", ["Έγγραφα"], "u+rwx", "user:www-data", "all")
+        self.assertEqual(argv[4:8], [guestfiles.b64("/home/user"), "u+rwx", guestfiles.b64("user:www-data"), "all"])
+        self.assertEqual(argv[8:], [guestfiles.b64("Έγγραφα")])
+        for bad in ({"mode": "777; reboot"}, {"mode": "a=rwx"}, {"scope": "everything"}):
+            with self.assertRaises(ValueError):
+                guestfiles.perms_argv("/", ["x"], bad.get("mode", ""), "", bad.get("scope", "self"))
+        b = guestfiles.b64
+        users, groups = guestfiles.parse_accounts(
+            f"PASSWD {b('daemon:x:1:1::/:/bin/sh' + chr(10) + 'user:x:1000:1000::/home/user:/bin/bash' + chr(10) + 'root:x:0:0::/root:/bin/bash' + chr(10) + 'nobody:x:65534:65534::/:/bin/false')}\n"
+            f"GROUP {b('adm:x:4:' + chr(10) + 'root:x:0:')}\n")
+        self.assertEqual(users, [("root", 0), ("user", 1000), ("daemon", 1), ("nobody", 65534)])  # root, people, the rest
+        self.assertEqual(groups, [("root", 0), ("adm", 4)])
+        win = guestfiles.VmFiles(mock.Mock(), "pve", 103, "windows", "192.0.2.5")
+        with self.assertRaisesRegex(guestfiles.GuestError, "for Linux guests"):
+            win.set_permissions("C:\\", ["x"], "u+r", "")
+
     def test_properties_from_windows(self):
         b = guestfiles.b64
         out = (f"P {b('Έγγραφα')} folder 12345 10 2 1700000000 1700000100 1600000000 - - - {b('PC' + chr(92) + 'Χρήστης')}"
@@ -2813,7 +2876,7 @@ class GuestFilesTest(unittest.TestCase):
     def test_scripts_stay_ascii_and_are_filled(self):
         for name in ("LINUX_LIST", "LINUX_SEND_NET", "LINUX_RECV_NET", "LINUX_JOIN", "LINUX_PACK", "WINDOWS_LIST",
                      "WINDOWS_SEND_NET", "WINDOWS_RECV_NET", "WINDOWS_JOIN", "WINDOWS_PACK", "LINUX_OPS",
-                     "WINDOWS_OPS", "LINUX_PROPS", "WINDOWS_PROPS"):
+                     "WINDOWS_OPS", "LINUX_PROPS", "WINDOWS_PROPS", "LINUX_PERMS", "LINUX_ACCOUNTS"):
             self.assertTrue(all(ord(c) < 128 for c in getattr(guestfiles, name)), name)
         sent = []
         agent = mock.Mock()

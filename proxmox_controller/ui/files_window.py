@@ -4,7 +4,8 @@ shows how far, how fast and which way it goes. The copies themselves are core/gu
 
 A right click on either side opens what FileZilla's does (the user's wish, 26/10): Open, Send / Receive, Rename…
 (F2), Delete… (Del — on this computer into the Trash, in the guest for good), New Folder…, Refresh (F5), Copy Path
-and Properties… (Alt+Enter: a folder's whole size, what it holds, times, owner, rights)."""
+and Properties… (Alt+Enter: a folder's whole size, what it holds, times, owner, rights); in a Linux guest also
+Permissions… (chmod and chown, on what is chosen or with what is inside)."""
 
 from __future__ import annotations
 
@@ -19,9 +20,9 @@ from typing import Callable
 
 from PySide6.QtCore import QFile, QMimeData, QObject, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout,
-                               QHBoxLayout, QHeaderView, QLineEdit, QMenu, QProgressBar, QTreeWidget, QTreeWidgetItem,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+                               QGridLayout, QHBoxLayout, QHeaderView, QLineEdit, QMenu, QProgressBar, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from ..core import guestfiles
 from ..core.guestfiles import Cancelled, Entry, GuestError, Props
@@ -196,6 +197,168 @@ class PropertiesDialog(QDialog):
         fit_to_width(self, 480)
 
 
+class PermissionsDialog(QDialog):
+    """Permissions… (Linux guests): Read / Write / Execute for the owner, the group and others, ticked as they are now
+    — half-ticked where what is chosen differs, and left so — the same as a number (755), the owner and the group,
+    and with a folder chosen how far it goes. What is touched is what changes: the rights as a whole once any box or
+    the number was touched (as FileZilla sends them), the owner and group once either was picked or typed."""
+
+    WHO = (("u", "Owner"), ("g", "Group"), ("o", "Others"))
+    WHAT = (("r", "Read"), ("w", "Write"), ("x", "Execute"))
+    BIT = {w + b: v << shift for w, shift in (("u", 6), ("g", 3), ("o", 0)) for b, v in (("r", 4), ("w", 2), ("x", 1))}
+    SCOPES = (("self", "Only what is chosen"), ("all", "What is chosen and everything inside"),
+              ("files", "Only the files — inside the folders too"), ("folders", "Only the folders — and those inside"))
+
+    def __init__(self, parent: QWidget | None, title: str, where: str, props: list[Props],
+                 users: list[tuple[str, int]], groups: list[tuple[str, int]]):
+        super().__init__(parent)
+        self.setWindowTitle(f"Permissions — {title}")
+        self.setModal(True)
+        self.touched = self.owner_touched = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 16)
+        lay.setSpacing(12)
+        lay.addWidget(DialogHead("lock", title, where))
+        modes = [p.mode for p in props if p.kind != "link" and p.mode is not None]
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(8)
+        for col, (_b, text) in enumerate(self.WHAT, 1):
+            grid.addWidget(label(text, "dim"), 0, col)
+        self.boxes: dict[str, QCheckBox] = {}
+        for row, (who, text) in enumerate(self.WHO, 1):
+            grid.addWidget(label(text), row, 0)
+            for col, (what, _t) in enumerate(self.WHAT, 1):
+                bit = self.BIT[who + what]
+                box = QCheckBox()
+                have = {bool(m & bit) for m in modes}
+                if len(have) > 1:
+                    box.setTristate(True)
+                    box.setCheckState(Qt.CheckState.PartiallyChecked)
+                else:
+                    box.setChecked(have == {True})
+                box.clicked.connect(self._box_clicked)
+                self.boxes[who + what] = box
+                grid.addWidget(box, row, col)
+        grid.setColumnStretch(4, 1)
+        number_row = QHBoxLayout()
+        self.number = QLineEdit()
+        self.number.setMaxLength(3)
+        self.number.setFixedWidth(64)
+        self.number.setPlaceholderText("mixed")
+        self.number.textEdited.connect(self._number_edited)
+        number_row.addWidget(label("As a number"))
+        number_row.addWidget(self.number)
+        number_row.addStretch(1)
+        rights = QVBoxLayout()
+        rights.setSpacing(12)
+        rights.addLayout(grid)
+        rights.addLayout(number_row)
+        if any(m & 0o7000 for m in modes):
+            rights.addWidget(label("Setuid, setgid and the sticky bit stay as they are.", "caption", wrap=True))
+        lay.addWidget(boxed(rights))
+        self._show_number()
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(16)
+        self.user, self.group = QComboBox(), QComboBox()
+        for combo, names, now in ((self.user, users, {p.owner or str(p.uid) for p in props}),
+                                  (self.group, groups, {p.group or str(p.gid) for p in props})):
+            combo.setEditable(True)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            combo.addItems([n for n, _num in names])
+            for i, (_n, num) in enumerate(names):
+                combo.setItemData(i, f"{num}", Qt.ItemDataRole.ToolTipRole)
+            combo.setCurrentText(now.pop() if len(now) == 1 else "")
+            combo.lineEdit().setPlaceholderText("as each is")
+            combo.activated.connect(self._owner_touched)
+            combo.lineEdit().textEdited.connect(self._owner_touched)
+        self.first = (self.user.currentText(), self.group.currentText())
+        form.addRow(label("Owner", "dim"), self.user)
+        form.addRow(label("Group", "dim"), self.group)
+        lay.addWidget(boxed(form))
+
+        self.scope = QComboBox()
+        for key, text in self.SCOPES:
+            self.scope.addItem(text, key)
+        self.has_scope = any(p.kind == "folder" for p in props)  # (with a folder chosen: how far it goes)
+        if self.has_scope:
+            scope_row = QFormLayout()
+            scope_row.addRow(label("Apply to", "dim"), self.scope)
+            lay.addWidget(boxed(scope_row))
+        self.problem = label("", "dim", wrap=True)
+        lay.addWidget(self.problem)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.apply = buttons.addButton("Apply", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.apply.setProperty("kind", "suggested")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        for combo in (self.user, self.group):
+            combo.currentTextChanged.connect(self._check)
+        self._check()
+        fit_to_width(self, 460)
+
+    def bits(self) -> dict[str, bool | None]:
+        states = {Qt.CheckState.Checked: True, Qt.CheckState.Unchecked: False}
+        return {k: states.get(b.checkState()) for k, b in self.boxes.items()}
+
+    def _box_clicked(self) -> None:
+        self.touched = True
+        self._show_number()
+
+    def _show_number(self) -> None:
+        bits = self.bits()
+        if None in bits.values():
+            self.number.setText("")
+            return
+        self.number.setText("".join(str(sum(v for b, v in (("r", 4), ("w", 2), ("x", 1)) if bits[who + b]))
+                                    for who in "ugo"))
+
+    def _number_edited(self, text: str) -> None:
+        if len(text) == 3 and all(c in "01234567" for c in text):
+            self.touched = True
+            for who, digit in zip("ugo", text):
+                for b, v in (("r", 4), ("w", 2), ("x", 1)):
+                    box = self.boxes[who + b]
+                    box.setTristate(False)
+                    box.setChecked(bool(int(digit) & v))
+        self._check()
+
+    def _owner_touched(self, *_a) -> None:
+        self.owner_touched = True
+
+    def _check(self) -> None:
+        problem = ""
+        for what, combo in (("owner", self.user), ("group", self.group)):
+            text = combo.currentText().strip()
+            if any(c in text for c in ": \t"):
+                problem = f"The {what}: a name or a number, without spaces or ':'."
+        text = self.number.text()
+        if text and not (len(text) == 3 and all(c in "01234567" for c in text)):
+            problem = problem or "As a number: three digits from 0 to 7, as 755."
+        self.problem.setText(problem)
+        self.apply.setEnabled(not problem)
+
+    def changes(self) -> tuple[str, str, str]:
+        """(chmod's clauses, chown's "user:group", the scope) — "" for what is left as it is."""
+        mode = guestfiles.mode_spec(self.bits()) if self.touched else ""
+        owner = ""
+        if self.owner_touched:
+            user, group = self.user.currentText().strip(), self.group.currentText().strip()
+            owner = user + (f":{group}" if group else "")
+        return mode, owner, self.scope.currentData() if self.has_scope else "self"
+
+
+def ask_permissions(parent: QWidget, title: str, where: str, props: list[Props], users, groups):
+    """(mode, owner, scope) to set, or None: cancelled, or nothing touched."""
+    dlg = PermissionsDialog(parent, title, where, props, users, groups)
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return None
+    mode, owner, scope = dlg.changes()
+    return (mode, owner, scope) if mode or owner else None
+
+
 def local_listing(folder: Path) -> list[Entry]:
     out = []
     with os.scandir(folder) as it:
@@ -306,6 +469,8 @@ class Pane(QWidget):
         lay.addWidget(self.state)
 
     def show_entries(self, folder: str, entries: list[Entry]) -> None:
+        """The folder's list; the same folder read again keeps what was chosen in it (after a change)."""
+        keep = {e.name for e in self.chosen()} if folder == self.folder else set()
         self.folder, self.entries = folder, entries
         if self.combo.findText(folder) < 0:
             self.combo.insertItem(0, folder)
@@ -317,8 +482,12 @@ class Pane(QWidget):
             item.setData(NAME, Qt.ItemDataRole.UserRole, e.name)
             item.setTextAlignment(SIZE, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.tree.addTopLevelItem(item)
-        n = len(entries)
-        self.state.setText(f"{n} item{'s' if n != 1 else ''}" if folder or n else "")
+            item.setSelected(e.name in keep)
+        self.say_count()
+
+    def say_count(self) -> None:
+        n = len(self.entries)
+        self.state.setText(f"{n} item{'s' if n != 1 else ''}" if self.folder or n else "")
 
     def chosen(self) -> list[Entry]:
         names = {i.data(NAME, Qt.ItemDataRole.UserRole) for i in self.tree.selectedItems()}
@@ -539,6 +708,8 @@ class FilesWindow(QDialog):
         add("Copy Path", lambda: self.copy_path(pane), bool(pane.folder))
         menu.addSeparator()
         add("Properties…", lambda: self.properties(pane), self._readable(pane), "Alt+Return")
+        if not local and self._os() == "linux":
+            add("Permissions…", lambda: self.permissions(pane), ready and bool(chosen))
         return menu
 
     def _ready(self, pane: Pane) -> bool:
@@ -679,6 +850,30 @@ class FilesWindow(QDialog):
                 pass
 
         self.runner.run(job, done)
+
+    def permissions(self, pane: Pane) -> None:
+        """Linux guests: what is chosen read first (its rights, owner, group) with the guest's accounts, then asked,
+        then set."""
+        chosen = pane.chosen()
+        if pane is self.local or self._os() != "linux" or not chosen or not self._ready(pane):
+            return
+        backend, folder, names = self.backend, pane.folder, [e.name for e in chosen]
+        listed = ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+        self._busy(True, "Reading…")
+
+        def got(result, err):
+            self._busy(False)
+            self.remote.say_count()
+            if err is not None:
+                error(self, "Permissions", str(err))
+                return
+            props, (users, groups) = result
+            change = ask_permissions(self, names[0] if len(names) == 1 else f"{len(names)} items",
+                                     f"In {folder} · {self.guest_name}", props, users, groups)
+            if change:
+                self._guest_op(lambda: backend.set_permissions(folder, names, *change), f"Permissions set: {listed}.")
+
+        self.runner.run(lambda: (backend.properties(folder, names), backend.accounts()), got)
 
     def _guest_op(self, job, done_text: str) -> None:
         """A change in the guest, off the window's thread; then its folder read again."""

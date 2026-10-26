@@ -131,6 +131,8 @@ def stylesheet(c: Colors) -> str:
     QCheckBox::indicator:hover, QListView::indicator:hover, QTableView::indicator:hover {{ border-color: {c.accent}; }}
     QCheckBox::indicator:checked, QListView::indicator:checked, QTableView::indicator:checked {{
         background: {c.accent}; border-color: {c.accent}; image: url("{(ICONS / 'check.svg').as_posix()}"); }}
+    QCheckBox::indicator:indeterminate {{ background: {c.accent}; border-color: {c.accent};
+        image: url("{(ICONS / 'dash.svg').as_posix()}"); }}
     QRadioButton::indicator {{ width: 14px; height: 14px; border: 1px solid {c.dim}; border-radius: 8px;
                               background: {c.view}; }}
     QRadioButton::indicator:hover {{ border-color: {c.accent}; }}
