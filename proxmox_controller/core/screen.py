@@ -122,6 +122,36 @@ def keysym_of(ch: str) -> int:
     return code if 0x20 <= code <= 0xFF else 0x01000000 + code  # beyond Latin-1: the Unicode key symbols
 
 
+def typable(text: str) -> tuple[str, list[str]]:
+    """The text as the console types it — each line end one Enter — and the characters it cannot type, sorted: what
+    a US keyboard has not (Greek, accents, emoji…), since the guest maps keys as a US keyboard by default."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text, sorted({c for c in text if c not in "\n\t" and not 0x20 <= ord(c) < 0x7F})
+
+
+def type_keys(key: Callable[[bool, int], None], text: str, stop: threading.Event | None = None,
+              count: Callable[[int], None] | None = None) -> int:
+    """Types `text` with key(down, keysym) — Shift held where a US keyboard needs it — a key every KEY_GAP_S;
+    stops before the next key once `stop` is set; `count(n)` hears how many were typed. Returns that number."""
+    typed = 0
+    for ch in text:
+        if stop is not None and stop.is_set():
+            break
+        sym = keysym_of(ch)
+        shift = ch in SHIFTED
+        if shift:
+            key(True, SHIFT)
+        key(True, sym)
+        key(False, sym)
+        if shift:
+            key(False, SHIFT)
+        typed += 1
+        if count is not None:
+            count(typed)
+        time.sleep(KEY_GAP_S)
+    return typed
+
+
 def parse_combo(combo: str) -> list[int]:
     """'ctrl+alt+delete' → its key symbols, modifiers first. ValueError for a key name not known."""
     syms = []
@@ -143,18 +173,7 @@ def send(open_console: Callable[[], tuple], text: str = "", keys: list[str] | tu
     try:
         ws, client, _, _ = _connect(open_console, timeout)
         client.next_update()  # the first screen: read, so the console is not left waiting to send it
-        pressed = 0
-        for ch in text:
-            sym = keysym_of(ch)
-            shift = ch in SHIFTED
-            if shift:
-                client.key(True, SHIFT)
-            client.key(True, sym)
-            client.key(False, sym)
-            if shift:
-                client.key(False, SHIFT)
-            pressed += 1
-            time.sleep(KEY_GAP_S)
+        pressed = type_keys(client.key, text)
         for syms in combos:
             for sym in syms:
                 client.key(True, sym)

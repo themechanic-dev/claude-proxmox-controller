@@ -2815,6 +2815,20 @@ class GuestFilesLinuxTest(unittest.TestCase):
             ct.properties(str(self.root / "nope"), ["x"])
 
 
+class TypingTest(unittest.TestCase):
+    def test_what_the_console_can_type(self):
+        from proxmox_controller.core import screen
+        self.assertEqual(screen.typable("ls -la\r\necho ok\rcd ~\t"), ("ls -la\necho ok\ncd ~\t", []))
+        self.assertEqual(screen.typable("καλή ώρα é 😀")[1], [" ", "é", "ή", "α", "κ", "λ", "ρ", "ώ", "😀"][1:])
+        keys, stop = [], threading.Event()
+        with mock.patch.object(screen, "KEY_GAP_S", 0.0):
+            self.assertEqual(screen.type_keys(lambda d, s: keys.append((d, s)), "a:\n"), 3)
+            self.assertEqual(keys, [(True, ord("a")), (False, ord("a")), (True, screen.SHIFT), (True, ord(":")),
+                                    (False, ord(":")), (False, screen.SHIFT), (True, 0xFF0D), (False, 0xFF0D)])
+            stop.set()
+            self.assertEqual(screen.type_keys(lambda d, s: None, "abc", stop), 0)  # stopped: nothing more
+
+
 class GuestFilesTest(unittest.TestCase):
     def test_paths_and_listing(self):
         self.assertEqual(guestfiles.os_of({"ostype": "win11"}), "windows")

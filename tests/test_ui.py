@@ -124,6 +124,8 @@ class UiCase(unittest.TestCase):
             openUrl=lambda url: self.opened.append(url.toLocalFile()) or True)))
         self.patches.append(mock.patch.object(files_window, "QGuiApplication", types.SimpleNamespace(
             clipboard=lambda: types.SimpleNamespace(setText=self.clipboard.append))))
+        self.copied = ""  # what "this computer has copied", for the console's Paste… (never the real clipboard)
+        self.patches.append(mock.patch.object(console, "clipboard_text", lambda: self.copied))
         for p in self.patches:
             p.start()
         self.runner = Runner()
@@ -2007,6 +2009,91 @@ class ConsoleTest(UiCase):
         QTest.mouseClick(win.view, Qt.MouseButton.LeftButton, pos=t.center().toPoint())
         self.assertTrue(wait_until(lambda: any(b == 1 for b, _x, _y in srv.pointer)))
         self.assertTrue(wait_until(lambda: any(b == 0 for b, _x, _y in srv.pointer[1:])))  # and released
+
+    def typed(self, srv, since=0):
+        """The text the guest received as typed keys (key downs, Shift, Ctrl and the like aside, Enter as a line
+        end)."""
+        out = []
+        for k in srv.keys[since:]:
+            if k[1] and not 0xFFE1 <= k[2] <= 0xFFEE:
+                out.append("\n" if k[2] == 0xFF0D else "\t" if k[2] == 0xFF09 else chr(k[2]))
+        return "".join(out)
+
+    def test_paste_window(self):
+        import shiboken6
+        win, pve = self.open()
+        srv = pve.cluster.consoles[-1]
+        self.assertEqual([w.text() for w in (win.cad_btn, win.paste_btn, win.full_btn)],
+                         ["Ctrl+Alt+Del", "Paste…", "Full Screen"])
+        self.copied = "echo 'Γεια' > /tmp/A.txt\r\ncat /tmp/A.txt\n"
+        with mock.patch.object(screen_core, "KEY_GAP_S", 0.0):
+            win.paste_btn.click()
+            dlg = win.paste_dialog
+            self.assertEqual(dlg.edit.toPlainText(), "echo 'Γεια' > /tmp/A.txt\ncat /tmp/A.txt\n")
+            self.assertEqual(dlg.info.text(), "2 lines, 35 characters — about 1 s. In a terminal each line runs as its "
+                                              "Enter is typed. Not on a US keyboard, left out (marked): Γ α ε ι")
+            self.assertEqual(len(dlg.edit.extraSelections()), 4)
+            self.assertFalse(dlg.enter.isChecked())  # no Enter at the end unless ticked
+            dlg.type_btn.click()
+            self.assertTrue(wait_until(lambda: not shiboken6.isValid(dlg) or not dlg.isVisible()))
+            self.assertEqual(self.typed(srv), "echo '' > /tmp/A.txt\ncat /tmp/A.txt")
+            self.assertEqual([k[2] for k in srv.keys if k[2] == screen_core.SHIFT][:2], [screen_core.SHIFT] * 2)
+            self.assertTrue(wait_until(lambda: win.status.text() == "Connected"))
+            n = len(srv.keys)
+            self.copied = "ls -la"
+            dlg = win.paste()
+            dlg.enter.setChecked(True)
+            self.assertTrue(dlg.info.text().startswith("1 line, 7 characters"))
+            dlg.type_btn.click()
+            self.assertTrue(wait_until(lambda: self.typed(srv, n) == "ls -la\n"))
+        self.copied = "   "
+        dlg = win.paste()
+        self.assertFalse(dlg.type_btn.isEnabled())
+        self.assertEqual(dlg.info.text(), "Nothing to type.")
+        dlg.close()
+
+    def test_paste_stops_and_holds_the_users_keys(self):
+        win, pve = self.open()
+        srv = pve.cluster.consoles[-1]
+        with mock.patch.object(screen_core, "KEY_GAP_S", 0.002):
+            dlg = win.paste("x" * 5000)
+            dlg.type_btn.click()
+            self.assertTrue(wait_until(lambda: dlg.job is not None and dlg.job.typed > 20))
+            self.assertEqual(dlg.cancel_btn.text(), "Stop")
+            n = len(srv.keys)
+            QTest.keyClick(win.view, Qt.Key.Key_Q)  # the user's own keys wait while it types
+            dlg.cancel_btn.click()
+            self.assertTrue(wait_until(lambda: dlg.info.text().startswith("Stopped after")))
+        typed = self.typed(srv)
+        self.assertTrue(20 < len(typed) < 5000)
+        self.assertNotIn("q", typed)
+        self.assertEqual(dlg.cancel_btn.text(), "Close")
+        self.assertFalse(win.typing())
+        QTest.keyClick(win.view, Qt.Key.Key_Q)  # and go again once it stopped
+        self.assertTrue(wait_until(lambda: "q" in self.typed(srv, n)))
+        dlg.close()
+
+    def test_ctrl_shift_v_types_one_copied_line(self):
+        win, pve = self.open()
+        srv = pve.cluster.consoles[-1]
+        ctrl_shift = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+        self.copied = "uname -a\n"
+        with mock.patch.object(screen_core, "KEY_GAP_S", 0.0):
+            QTest.keyClick(win.view, Qt.Key.Key_V, ctrl_shift)
+            self.assertTrue(wait_until(lambda: self.typed(srv) == "uname -a"))  # no Enter: it does not run
+        self.assertNotIn(ord("V"), [k[2] for k in srv.keys])  # the shortcut is the app's, not the guest's
+        first = next(i for i, k in enumerate(srv.keys) if k[2] == ord("u"))
+        held = [k for k in srv.keys[:first] if 0xFFE1 <= k[2] <= 0xFFEE]
+        self.assertEqual(sum(1 if k[1] else -1 for k in held), 0)  # Ctrl and Shift let go before the typing
+        self.assertIsNone(win.paste_dialog)
+        self.copied = "one\ntwo"  # more than one line: Paste… first
+        QTest.keyClick(win.view, Qt.Key.Key_V, ctrl_shift)
+        self.assertIsNotNone(win.paste_dialog)
+        self.assertEqual(win.paste_dialog.edit.toPlainText(), "one\ntwo")
+        win.paste_dialog.close()
+        self.copied = ""
+        QTest.keyClick(win.view, Qt.Key.Key_V, ctrl_shift)
+        self.assertEqual(win.status.text(), "Nothing copied to paste.")
 
     def test_screen_is_opaque_when_scaled_down(self):
         """The white console: QEMU's pixels carry 0 in their fourth byte, Qt took it for alpha, and the window became

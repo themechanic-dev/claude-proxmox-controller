@@ -1,6 +1,10 @@
 """The built-in console: a VM's or container's screen in a window of the app, through Proxmox's VNC websocket and the
 app's API token — no browser and no web login. Keys go to the guest as physical keys where QEMU allows it, so the
-keyboard layout of this computer does not get in the way."""
+keyboard layout of this computer does not get in the way.
+
+Paste… (the user's idea, 26/10) types text into the guest key by key, as the app types its own commands — where
+nothing else reaches: an installer, a login, a terminal without the guest agent. Ctrl+Shift+V types one copied line
+at once; more than one line opens Paste… first."""
 
 from __future__ import annotations
 
@@ -8,12 +12,15 @@ import sys
 import threading
 from typing import Callable
 
-from PySide6.QtCore import QObject, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QCursor, QGuiApplication, QImage, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtCore import QObject, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (QColor, QCursor, QFontDatabase, QGuiApplication, QImage, QPainter, QPixmap, QTextCharFormat,
+                           QTextCursor)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QPlainTextEdit, QProgressBar, QTextEdit,
+                               QVBoxLayout, QWidget)
 
+from ..core import screen
 from ..core.rfb import RfbClient, qnum_from_evdev, qnum_from_windows
-from .widgets import button, label
+from .widgets import DialogHead, button, label
 
 
 def _v(x) -> int:
@@ -71,12 +78,14 @@ class ConsoleView(QWidget):
 
     key_event = Signal(bool, int, int)       # down, keysym, qnum
     pointer_event = Signal(int, int, int)    # buttons, x, y
+    paste_requested = Signal()               # Ctrl+Shift+V: the app's, not the guest's
 
     def __init__(self):
         super().__init__()
         self.fb = QImage()
         self.buttons = 0
         self.held: dict[int, tuple[int, int]] = {}  # Qt key → (keysym, qnum) of keys now down
+        self.swallowed: set[int] = set()  # keys the app took for itself: their release is not the guest's either
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)  # until the guest sends its own pointer
@@ -152,6 +161,15 @@ class ConsoleView(QWidget):
         return super().event(ev)
 
     def keyPressEvent(self, ev) -> None:
+        mods = ev.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier |
+                                 Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier)
+        if _v(ev.key()) == _v(K.Key_V) and mods == (Qt.KeyboardModifier.ControlModifier |
+                                                    Qt.KeyboardModifier.ShiftModifier):
+            self.swallowed.add(_v(ev.key()))
+            if not ev.isAutoRepeat():
+                self.paste_requested.emit()
+            ev.accept()
+            return
         sym, qnum = keysym_for(ev), qnum_for(ev)
         if sym or qnum:
             self.held[_v(ev.key())] = (sym, qnum)
@@ -160,6 +178,10 @@ class ConsoleView(QWidget):
 
     def keyReleaseEvent(self, ev) -> None:
         if ev.isAutoRepeat():  # the guest repeats a held key by itself
+            ev.accept()
+            return
+        if _v(ev.key()) in self.swallowed:
+            self.swallowed.discard(_v(ev.key()))
             ev.accept()
             return
         sym, qnum = self.held.pop(_v(ev.key()), (keysym_for(ev), qnum_for(ev)))
@@ -249,6 +271,162 @@ class _Session:
             self.ws.close()
 
 
+class _Typing:
+    """Text being typed into the guest by a thread of its own. Plain Python on purpose — the windows look at it with a
+    timer, so the thread touches no Qt object."""
+
+    def __init__(self, total: int):
+        self.total, self.typed, self.error, self.ended = total, 0, "", False
+        self.stop = threading.Event()
+
+    def count(self, n: int) -> None:
+        self.typed = n
+
+
+def clipboard_text() -> str:
+    """What this computer has copied."""
+    return QGuiApplication.clipboard().text()
+
+
+QUICK_MAX = 300  # Ctrl+Shift+V types at once one line up to this long; more opens Paste… (with its Stop)
+
+
+class PasteDialog(QDialog):
+    """Paste…: text typed into the guest key by key, as on a US keyboard. It opens with what this computer has copied,
+    to be read and changed first; what a US keyboard has not (Greek, accents…) is marked and left out; Enter at the
+    end only when ticked (a terminal would run it); a bar while it types, and Stop."""
+
+    LOOK_MS = 50
+
+    def __init__(self, win: "ConsoleWindow", text: str):
+        from .theme import colors
+        super().__init__(win)
+        self.win, self.job = win, None
+        self.setWindowTitle("Paste into the console")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 16)
+        lay.setSpacing(12)
+        lay.addWidget(DialogHead("clipboard", "Paste into the console", "Typed key by key, as on a US keyboard — no "
+                                 "guest agent needed: an installer, a login, a terminal."))
+        self.edit = QPlainTextEdit()
+        self.edit.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.edit.setMinimumHeight(160)
+        self.edit.setPlainText(text)
+        lay.addWidget(self.edit, 1)
+        self.info = label("", "caption", wrap=True)
+        lay.addWidget(self.info)
+        self.enter = QCheckBox("Press Enter at the end")
+        self.enter.toggled.connect(self._look)
+        lay.addWidget(self.enter)
+        self.bar = QProgressBar()
+        self.bar.hide()
+        lay.addWidget(self.bar)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.cancel_btn = button("Cancel")
+        self.cancel_btn.clicked.connect(self._cancel)
+        self.type_btn = button("Type", "suggested")
+        self.type_btn.clicked.connect(self.type_now)
+        row.addWidget(self.cancel_btn)
+        row.addWidget(self.type_btn)
+        lay.addLayout(row)
+        self.bad_format = QTextCharFormat()
+        bad = QColor(colors().danger)
+        bad.setAlphaF(0.35)
+        self.bad_format.setBackground(bad)
+        self.timer = QTimer(self)
+        self.timer.setInterval(self.LOOK_MS)
+        self.timer.timeout.connect(self._progress)
+        self.edit.textChanged.connect(self._look)
+        self._look()
+        self.resize(580, 440)
+
+    def to_type(self) -> tuple[str, list[str]]:
+        """What will be typed (without what cannot be, the line ends at its end, and Enter there only when ticked),
+        and the characters left out."""
+        text, bad = screen.typable(self.edit.toPlainText())
+        text = "".join(c for c in text if c not in bad).rstrip("\n")
+        if not text.strip():
+            return "", bad  # (only spaces: nothing worth typing)
+        return text + ("\n" if self.enter.isChecked() else ""), bad
+
+    def _look(self) -> None:
+        text, bad = self.to_type()
+        lines = text.rstrip("\n").count("\n") + 1 if text else 0
+        words = [f"{lines} line{'s' if lines != 1 else ''}, {len(text):,} characters — about "
+                 f"{max(1, round(len(text) / 70))} s."] if text else ["Nothing to type."]
+        if lines > 1:
+            words.append("In a terminal each line runs as its Enter is typed.")
+        if bad:
+            words.append(f"Not on a US keyboard, left out (marked): {' '.join(bad[:16])}" +
+                         (" …" if len(bad) > 16 else ""))
+        self.info.setText(" ".join(words))
+        marks, at = [], 0  # (Qt counts in UTF-16: an emoji is two)
+        for c in self.edit.toPlainText():
+            width = 2 if ord(c) > 0xFFFF else 1
+            if c in bad and len(marks) < 2000:
+                sel = QTextEdit.ExtraSelection()
+                sel.cursor = QTextCursor(self.edit.document())
+                sel.cursor.setPosition(at)
+                sel.cursor.setPosition(at + width, QTextCursor.MoveMode.KeepAnchor)
+                sel.format = self.bad_format
+                marks.append(sel)
+            at += width
+        self.edit.setExtraSelections(marks)
+        self.type_btn.setEnabled(bool(text) and self.job is None)
+
+    def type_now(self) -> None:
+        text, _bad = self.to_type()
+        if not text or self.job is not None:
+            return
+        job = self.win.start_typing(text)
+        if job is None:
+            self.info.setText("⚠ The console is not connected (or is typing already).")
+            return
+        self.job = job
+        self.edit.setReadOnly(True)
+        self.enter.setEnabled(False)
+        self.type_btn.setEnabled(False)
+        self.cancel_btn.setText("Stop")
+        self.bar.setRange(0, job.total)
+        self.bar.setValue(0)
+        self.bar.show()
+        self.timer.start()
+
+    def _progress(self) -> None:
+        job = self.job
+        if job is None:
+            return
+        self.bar.setValue(job.typed)
+        if not job.ended:
+            return
+        self.timer.stop()
+        if job.error or job.typed < job.total:
+            self.job = None
+            self.edit.setReadOnly(False)
+            self.enter.setEnabled(True)
+            self.cancel_btn.setText("Close")
+            self._look()
+            self.info.setText(f"⚠ {job.error}" if job.error else
+                              f"Stopped after {job.typed:,} of {job.total:,} characters.")
+            return
+        self.accept()  # all typed: back to the console
+        self.win.view.setFocus()
+
+    def _cancel(self) -> None:
+        if self.job is not None and not self.job.ended:
+            self.job.stop.set()
+        else:
+            self.reject()
+
+    def done(self, result: int) -> None:
+        if self.job is not None and not self.job.ended:
+            self.job.stop.set()  # (closed while typing: it stops)
+        self.timer.stop()
+        super().done(result)
+
+
 _RUNNING: set[_Session] = set()  # sessions whose thread may still run; let go of on the GUI thread only
 
 
@@ -278,6 +456,9 @@ class ConsoleWindow(QWidget):
         bl.setSpacing(6)
         self.cad_btn = button("Ctrl+Alt+Del", tooltip="Send Ctrl+Alt+Delete to the guest")
         self.cad_btn.clicked.connect(self.ctrl_alt_del)
+        self.paste_btn = button("Paste…", tooltip="Type text into the guest key by key — Ctrl+Shift+V in the console "
+                                                  "types one copied line")
+        self.paste_btn.clicked.connect(lambda: self.paste())
         self.full_btn = button("Full Screen")
         self.full_btn.setCheckable(True)
         self.full_btn.toggled.connect(self._full_screen)
@@ -285,7 +466,7 @@ class ConsoleWindow(QWidget):
         self.reconnect_btn = button("Reconnect", "suggested")
         self.reconnect_btn.clicked.connect(self.connect_now)
         self.reconnect_btn.hide()
-        for w in (self.cad_btn, self.full_btn):
+        for w in (self.cad_btn, self.paste_btn, self.full_btn):
             bl.addWidget(w)
         bl.addStretch(1)
         bl.addWidget(self.status)
@@ -295,6 +476,12 @@ class ConsoleWindow(QWidget):
         lay.addWidget(self.view, 1)
         self.view.key_event.connect(self._key)
         self.view.pointer_event.connect(self._pointer)
+        self.view.paste_requested.connect(self.quick_paste)
+        self.job: _Typing | None = None  # text being typed into the guest (Paste…)
+        self.paste_dialog: PasteDialog | None = None
+        self.job_timer = QTimer(self)
+        self.job_timer.setInterval(PasteDialog.LOOK_MS)
+        self.job_timer.timeout.connect(self._job_look)
         self.resize(820, 520)
         OPEN[key] = self
         self.connect_now()
@@ -354,6 +541,8 @@ class ConsoleWindow(QWidget):
     # -- input ---------------------------------------------------------------------------------------
 
     def _key(self, down: bool, keysym: int, qnum: int) -> None:
+        if self.typing():
+            return  # (the user's keys would mix into the typed text)
         client = self.client
         if client is not None:
             try:
@@ -378,11 +567,68 @@ class ConsoleWindow(QWidget):
                 pass
         self.view.setFocus()
 
+    # -- Paste… -----------------------------------------------------------------------------------
+
+    def typing(self) -> bool:
+        return self.job is not None and not self.job.ended
+
+    def start_typing(self, text: str) -> _Typing | None:
+        """`text` typed into the guest by a thread (screen.type_keys); None when not connected or already typing."""
+        client = self.client
+        if client is None or self.typing() or not text:
+            return None
+        self.view.release_all()  # (no Ctrl or Shift left down in the guest under the typed keys)
+        job = _Typing(len(text))
+
+        def run():
+            try:
+                screen.type_keys(lambda down, sym: client.key(down, sym), text, job.stop, job.count)
+            except OSError as e:
+                job.error = f"The console's connection dropped ({e})." if str(e) else "The console's connection dropped."
+            finally:
+                job.ended = True
+
+        self.job = job
+        self.status.setText("Typing…")
+        threading.Thread(target=run, daemon=True, name="paste").start()
+        self.job_timer.start()
+        return job
+
+    def _job_look(self) -> None:
+        job = self.job
+        if job is None or not job.ended:
+            return
+        self.job_timer.stop()
+        if self.status.text() == "Typing…":
+            self.status.setText(f"Typing stopped — {job.error}" if job.error else "Connected")
+
+    def paste(self, text: str | None = None) -> PasteDialog:
+        """Paste…, with what this computer has copied (or `text`)."""
+        dlg = PasteDialog(self, clipboard_text() if text is None else text)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
+        self.paste_dialog = dlg
+        return dlg
+
+    def quick_paste(self) -> None:
+        """Ctrl+Shift+V: one copied line typed at once (no Enter); more, or what a US keyboard has not, in Paste…"""
+        copied = clipboard_text()
+        text, bad = screen.typable(copied)
+        line = text.rstrip("\n")
+        if not line.strip():
+            self.status.setText("Nothing copied to paste.")
+        elif "\n" in line or bad or len(line) > QUICK_MAX:
+            self.paste(copied)
+        elif self.start_typing(line) is None:
+            self.status.setText("Not connected — nothing typed.")
+
     def _full_screen(self, on: bool) -> None:
         self.showFullScreen() if on else self.showNormal()
         self.view.setFocus()
 
     def closeEvent(self, ev) -> None:
+        if self.job is not None:
+            self.job.stop.set()
         self.view.release_all()
         if OPEN.get(self.key) is self:
             del OPEN[self.key]

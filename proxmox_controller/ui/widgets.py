@@ -267,7 +267,7 @@ def row(*widgets: QWidget, spacing: int = 8, stretch_after: int | None = None) -
 
 def badge(glyph: str, color: str, size: int = 40) -> QPixmap:
     """A round badge for a window's head: `glyph` drawn in `color` on a pale disc of the same colour — stop, power,
-    reboot, trash, host, warning, question; folder, agent, edit, notes, camera, archive, chart, lock."""
+    reboot, trash, host, warning, question; folder, agent, edit, notes, camera, archive, chart, lock, clipboard."""
     from PySide6.QtCore import QPointF, QRectF
     from PySide6.QtGui import QFont, QPen, QPolygonF
     pm = QPixmap(QSize(size * 2, size * 2))
@@ -340,6 +340,11 @@ def badge(glyph: str, color: str, size: int = 40) -> QPixmap:
     elif glyph == "chart":
         p.drawPolyline(QPolygonF([QPointF(11, 26), QPointF(16, 19.5), QPointF(20.5, 23), QPointF(28.5, 13)]))
         p.drawLine(QPointF(11, 29), QPointF(29, 29))
+    elif glyph == "clipboard":
+        p.drawRoundedRect(QRectF(12.5, 12, 15, 18), 2, 2)
+        p.drawRoundedRect(QRectF(16.5, 9.5, 7, 4.5), 1.5, 1.5)
+        for y in (19, 23):
+            p.drawLine(QPointF(16, y), QPointF(24, y))
     elif glyph == "lock":
         p.drawRoundedRect(QRectF(12.5, 19, 15, 11), 2, 2)
         p.drawArc(QRectF(15, 11, 10, 14), 0, 180 * 16)
