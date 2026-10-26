@@ -19,7 +19,7 @@ from ..core.vmspec import (PROFILES, VIRTIO_AS_SYSTEM, VMNAME, WINDOWS, is_virti
                            iso_name_from_url, looks_like_windows, vm_params)
 from .startup_fields import StartupFields
 from .vm_hardware import HardwareFields
-from .widgets import button, confirm, error, fit_to_width, gib, label
+from .widgets import FlowLayout, button, confirm, error, fit_to_width, gib, label
 from .worker import Runner
 
 ISO_NAME = re.compile(r"^[A-Za-z0-9._-]+\.iso$", re.IGNORECASE)
@@ -268,14 +268,23 @@ class CreateVmDialog(_Busy, QDialog):
                                "gateway and the DNS servers are the Proxmox host's own (those of the bridge).")
         self.static_ip = QLineEdit()
         self.static_ip.setPlaceholderText("192.168.1.50")
-        self.static_ip.setMaximumWidth(150)
+        # room for a whole address, however narrow the window (the user's test, 26/10: it shrank to ".50") — measured
+        # with the theme's font and padding (polished first), the field's own margins taken from its size hint
+        self.static_ip.ensurePolished()
+        fm = self.static_ip.fontMetrics()
+        margins = self.static_ip.sizeHint().width() - 17 * fm.horizontalAdvance("x")
+        self.static_ip.setFixedWidth(fm.horizontalAdvance("255.255.255.255") + margins + 6)
         self.static_note = label("", "dim")
-        static_row = QHBoxLayout()
-        static_row.setSpacing(8)
-        static_row.addWidget(self.static)
-        static_row.addWidget(self.static_ip)
-        static_row.addWidget(self.static_note)
-        static_row.addStretch(1)
+        ticked = QWidget()  # the tick and the address stay together …
+        pair = QHBoxLayout(ticked)
+        pair.setContentsMargins(0, 0, 0, 0)
+        pair.setSpacing(8)
+        pair.addWidget(self.static)
+        pair.addWidget(self.static_ip)
+        static_row = QWidget()  # … and what goes with the address moves under them where the row is too narrow
+        flow = FlowLayout(static_row, spacing=8)
+        flow.addWidget(ticked)
+        flow.addWidget(self.static_note)
         self.template = QComboBox()
         self.full = QCheckBox("Full copy (stands on its own; a linked copy shares the template's disk)")
         self.full.setChecked(True)
@@ -330,6 +339,7 @@ class CreateVmDialog(_Busy, QDialog):
         form.addRow("Disk", disk_row)
         form.addRow("Network bridge", self.bridge)
         form.addRow("", static_row)
+        self.static_flow = flow
         self.hw = HardwareFields(form)
         self.hw.set_defaults()
         form.addRow("", self.agent)
@@ -614,7 +624,7 @@ class CreateVmDialog(_Busy, QDialog):
             item = self.form.itemAt(row, QFormLayout.ItemRole.FieldRole)
             if item is None:
                 continue
-            if item.widget() is field:
+            if item.widget() is field or (item.widget() is not None and item.widget().isAncestorOf(field)):
                 return row
             lay = item.layout()
             if lay is not None and any(lay.itemAt(i).widget() is field for i in range(lay.count())):

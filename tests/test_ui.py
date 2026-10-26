@@ -1244,6 +1244,16 @@ class VmDialogTest(UiCase):
         dlg.static.setChecked(True)
         self.assertTrue(dlg.static_ip.isVisibleTo(dlg))
         self.assertEqual(dlg.static_note.text(), "/24 · gateway 192.168.1.1 · DNS 192.168.1.1 (from the Proxmox host)")
+        # a whole address fits in the field however narrow the window; the note goes under it where the row is short
+        # (the user's test, 26/10: the field shrank to ".50" and the note was cut off)
+        dlg.static_ip.setText("192.168.100.250")
+        self.assertGreater(dlg.static_ip.width(), dlg.static_ip.fontMetrics().horizontalAdvance("255.255.255.255"))
+        dlg.show()
+        for width, rows in ((690, 2), (900, 1)):
+            dlg.resize(width, dlg.height())
+            self.assertTrue(wait_until(lambda: dlg.static_flow.rows() == rows), width)
+            note = dlg.static_note.geometry()
+            self.assertLessEqual(note.right(), dlg.static_note.parentWidget().width(), width)  # not cut off
         dlg.name.setText("srv-ai")
         dlg.password.setText("ai-pw")
         dlg.password2.setText("ai-pw")
