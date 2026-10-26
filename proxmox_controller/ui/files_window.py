@@ -3,13 +3,14 @@
 shows how far, how fast and which way it goes. The copies themselves are core/guestfiles.
 
 A right click on either side opens what FileZilla's does (the user's wish, 26/10): Open, Send / Receive, Rename…
-(F2), Delete… (Del — on this computer into the Trash, in the guest for good), New Folder…, Refresh (F5) and Copy
-Path."""
+(F2), Delete… (Del — on this computer into the Trash, in the guest for good), New Folder…, Refresh (F5), Copy Path
+and Properties… (Alt+Enter: a folder's whole size, what it holds, times, owner, rights)."""
 
 from __future__ import annotations
 
 import os
 import shutil
+import stat
 import threading
 import time
 from datetime import datetime
@@ -18,14 +19,14 @@ from typing import Callable
 
 from PySide6.QtCore import QFile, QMimeData, QObject, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QGridLayout, QHBoxLayout,
-                               QHeaderView, QLineEdit, QMenu, QProgressBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout,
+                               QHBoxLayout, QHeaderView, QLineEdit, QMenu, QProgressBar, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from ..core import guestfiles
-from ..core.guestfiles import Cancelled, Entry, GuestError
+from ..core.guestfiles import Cancelled, Entry, GuestError, Props
 from ..core.pve import PveError
-from .widgets import DialogHead, button, card, confirm, error, fit_to_width, guest_card, label
+from .widgets import DialogHead, boxed, button, card, confirm, error, fit_to_width, guest_card, label
 
 MIME = "application/x-proxmox-controller-files"
 WAYS = {"network": "over the network", "proxmox": "through Proxmox (slow)", "ssh": "over the host's SSH"}
@@ -98,6 +99,101 @@ def ask_name(parent: QWidget, title: str, text: str, name: str, os_name: str, ic
     """The name typed, or "" when cancelled."""
     dlg = NameDialog(parent, title, text, name, os_name, icon)
     return dlg.name.text().strip() if dlg.exec() == QDialog.DialogCode.Accepted else ""
+
+
+def count(n: int, what: str) -> str:
+    return f"{n:,} {what}{'' if n == 1 else 's'}"
+
+
+def full_size(n: int) -> str:
+    return file_size(n) + (f" ({n:,} bytes)" if n >= 1024 else "")
+
+
+def rights_text(mode: int) -> str:
+    """0o755 → "rwxr-xr-x (755)"."""
+    return f"{stat.filemode(stat.S_IFREG | mode)[1:]} ({mode:03o})"
+
+
+def id_text(name: str, number: int | None) -> str:
+    if number is None:
+        return name
+    return f"{name} ({number})" if name and name != str(number) else str(number)
+
+
+class PropertiesDialog(QDialog):
+    """Properties…: what is chosen — or the folder itself — as its own system tells it. It opens at once; a folder's
+    whole size is counted meanwhile (on a big one that takes a while), then `fill` shows it all. `values` holds what
+    is shown, by row."""
+
+    KINDS = {"file": "File", "folder": "Folder", "link": "Link", "other": "Special file"}
+
+    def __init__(self, parent: QWidget, where: str, title: str, folder: bool):
+        super().__init__(parent)
+        self.setWindowTitle(f"Properties — {title}")
+        self.setModal(False)
+        self.values: dict[str, str] = {}
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 16)
+        lay.setSpacing(12)
+        self.head = DialogHead("folder" if folder else "notes", title, where)
+        lay.addWidget(self.head)
+        self.form = QFormLayout()
+        self.form.setHorizontalSpacing(16)
+        self.form.setVerticalSpacing(8)
+        self.state = label("Counting…" if folder else "Reading…", "dim")
+        self.form.addRow(self.state)
+        lay.addWidget(boxed(self.form))
+        row = QHBoxLayout()
+        row.addStretch(1)
+        close = button("Close")
+        close.clicked.connect(self.close)
+        row.addWidget(close)
+        lay.addLayout(row)
+        fit_to_width(self, 480)
+
+    def _row(self, name: str, value: str) -> None:
+        if value:
+            self.values[name] = value
+            key, shown = label(name, "dim"), label(value, "", wrap=True, selectable=True)
+            self.form.addRow(key, shown)
+            key.show()  # (now: a widget added to an open window shows only later, and the size is measured now)
+            shown.show()
+
+    def fill(self, props: list[Props]) -> None:
+        self.form.removeRow(self.state)
+        if len(props) == 1:
+            p = props[0]
+            self._row("Kind", self.KINDS.get(p.kind, p.kind))
+            if p.kind == "link":
+                self._row("Points to", p.link)
+            elif p.kind != "other":
+                self._row("Size", full_size(p.size))
+            if p.kind == "folder":
+                self._row("Holds", f"{count(p.files, 'file')}, {count(p.folders, 'folder')}")
+            for name, ts in (("Modified", p.mtime), ("Accessed", p.atime), ("Created", p.btime)):
+                self._row(name, datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M:%S") if ts else "")
+            self._row("Owner", id_text(p.owner, p.uid))
+            self._row("Group", id_text(p.group, p.gid))
+            self._row("Permissions", rights_text(p.mode) if p.mode is not None else "")
+            self._row("Attributes", p.attributes)
+        else:
+            files = sum(p.kind == "file" for p in props)
+            folders = sum(p.kind == "folder" for p in props)
+            others = len(props) - files - folders
+            self._row("Chosen", ", ".join(t for t in (count(files, "file") if files else "",
+                                                       count(folders, "folder") if folders else "",
+                                                       count(others, "other") if others else "") if t))
+            self._row("Size", full_size(sum(p.size for p in props if p.kind in ("file", "folder"))))
+            if folders:
+                self._row("Holds", f"{count(files + sum(p.files for p in props), 'file')}, "
+                                   f"{count(folders + sum(p.folders for p in props), 'folder')}")
+        fit_to_width(self, 480)  # (taller now: the rows came)
+
+    def failed(self, err) -> None:
+        self.state.setText(f"⚠ {err}")
+        self.state.setWordWrap(True)
+        self.values["Error"] = str(err)
+        fit_to_width(self, 480)
 
 
 def local_listing(folder: Path) -> list[Entry]:
@@ -251,6 +347,7 @@ class FilesWindow(QDialog):
         self.refresh_after: Pane | None = None
         self.busy = False  # (the guest's side reading or changing)
         self.reads = 0  # the guest's folder asked for last: an older answer coming after it is not shown
+        self.props_windows: list[PropertiesDialog] = []
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)  # as every window of a guest (widgets.DialogHead)
         lay.setSpacing(12)
@@ -262,7 +359,8 @@ class FilesWindow(QDialog):
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
         self.local = Pane("local", "This computer")
-        self.remote = Pane("remote", title.split(" (")[0], subtitle)
+        self.guest_name = title.split(" (")[0]
+        self.remote = Pane("remote", self.guest_name, subtitle)
         mid = QVBoxLayout()
         mid.addStretch(1)
         self.send_btn = button("Send  →", "suggested", "Copy what is chosen on the left into the folder shown on the "
@@ -328,8 +426,8 @@ class FilesWindow(QDialog):
         self.local.tree.dropped.connect(lambda *_: self.receive())
         for pane in (self.local, self.remote):  # the right click, and FileZilla's keys
             pane.tree.customContextMenuRequested.connect(lambda pos, pane=pane: self._menu(pane, pos))
-            for key, act in ((QKeySequence.StandardKey.Delete, self.delete_items), ("F2", self.rename_item),
-                             (QKeySequence.StandardKey.Refresh, self.refresh)):
+            for key, act in (("Del", self.delete_items), ("F2", self.rename_item), ("F5", self.refresh),
+                             ("Alt+Return", self.properties)):
                 sc = QShortcut(QKeySequence(key), pane.tree, context=Qt.ShortcutContext.WidgetShortcut)
                 sc.activated.connect(lambda act=act, pane=pane: act(pane))
         self.resize(1060, 640)
@@ -439,6 +537,8 @@ class FilesWindow(QDialog):
         add("New Folder…", lambda: self.new_folder(pane), ready and bool(pane.folder))
         add("Refresh", lambda: self.refresh(pane), ready, "F5")
         add("Copy Path", lambda: self.copy_path(pane), bool(pane.folder))
+        menu.addSeparator()
+        add("Properties…", lambda: self.properties(pane), self._readable(pane), "Alt+Return")
         return menu
 
     def _ready(self, pane: Pane) -> bool:
@@ -446,6 +546,10 @@ class FilesWindow(QDialog):
         if self.cancel is not None:
             return False
         return pane is self.local or (self.backend is not None and not self.busy)
+
+    def _readable(self, pane: Pane) -> bool:
+        """Properties… reads only: also while a copy goes on (not in Windows' list of drives)."""
+        return bool(pane.folder) and (pane is self.local or self.backend is not None)
 
     def _path(self, pane: Pane, name: str = "") -> str:
         if pane is self.local:
@@ -544,6 +648,37 @@ class FilesWindow(QDialog):
             return
         backend, folder = self.backend, pane.folder
         self._guest_op(lambda: backend.mkdir(folder, name), f"Made the folder {name}.")
+
+    def properties(self, pane: Pane) -> None:
+        """What is chosen, or with nothing chosen the folder itself, in a window of its own (one per question)."""
+        if not self._readable(pane):
+            return
+        chosen, folder = pane.chosen(), pane.folder
+        names = [e.name for e in chosen] or ["."]
+        side = "this computer" if pane is self.local else self.guest_name
+        if chosen:
+            title = chosen[0].name if len(chosen) == 1 else f"{len(chosen)} items"
+            where = f"In {folder} · {side}"
+        else:  # the folder itself
+            title = folder.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1] or folder
+            where = f"{folder} · {side}"
+        dlg = PropertiesDialog(self, where, title, not chosen or any(e.is_dir for e in chosen))
+        self.props_windows.append(dlg)
+        dlg.finished.connect(lambda *_: self.props_windows.remove(dlg) if dlg in self.props_windows else None)
+        dlg.show()
+        if pane is self.local:
+            job = lambda: guestfiles.local_props(Path(folder), names)  # noqa: E731
+        else:
+            backend = self.backend
+            job = lambda: backend.properties(folder, names)  # noqa: E731
+
+        def done(props, err):
+            try:
+                dlg.failed(err) if err is not None else dlg.fill(props)
+            except RuntimeError:  # (the window is gone)
+                pass
+
+        self.runner.run(job, done)
 
     def _guest_op(self, job, done_text: str) -> None:
         """A change in the guest, off the window's thread; then its folder read again."""

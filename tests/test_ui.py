@@ -504,6 +504,16 @@ class FakeGuestSide:
         self.calls.append(("mkdir", folder, name))
         self.entries.append(self.Entry(name, True, 0, 0))
 
+    def properties(self, folder, names):
+        from proxmox_controller.core.guestfiles import Props
+        self.calls.append(("properties", folder, list(names)))
+        if self.fail:
+            raise self.fail
+        return [Props(n, "file", 5, mtime=1700000000, uid=1000, gid=1000, mode=0o644, owner="user", group="user")
+                if n.endswith(".txt") else
+                Props(n, "folder", 3_500_000, 12, 3, mtime=1700000000, uid=0, gid=0, mode=0o755, owner="root",
+                      group="root") for n in names]
+
 
 class FilesWindowTest(UiCase):
     def setUp(self):
@@ -543,19 +553,20 @@ class FilesWindowTest(UiCase):
         dlg = self.dlg
         dlg.show()
         dlg.local.tree.clearSelection()  # the empty space: the folder itself
-        self.assertEqual(self.actions(dlg.local), [("New Folder…", True), ("Refresh", True), ("Copy Path", True)])
+        self.assertEqual(self.actions(dlg.local), [("New Folder…", True), ("Refresh", True), ("Copy Path", True),
+                                                   ("Properties…", True)])
         self.choose(dlg.local, "new.txt")
         self.assertEqual([t for t, _ in self.actions(dlg.local)],
-                         ["Open", "Send  →", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path"])
+                         ["Open", "Send  →", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path", "Properties…"])
         self.choose(dlg.remote, "old.txt")  # the guest's file: no Open (yet)
         self.assertEqual([t for t, _ in self.actions(dlg.remote)],
-                         ["←  Receive", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path"])
+                         ["←  Receive", "Rename…", "Delete…", "New Folder…", "Refresh", "Copy Path", "Properties…"])
         self.choose(dlg.remote, "old.txt", "docs")  # two: one name cannot go on both
         self.assertIn(("Rename…", False), self.actions(dlg.remote))
         self.choose(dlg.remote, "docs")
         self.assertEqual(self.actions(dlg.remote)[0], ("Open", True))
-        dlg._busy(True)  # the guest's side being read: nothing changes there meanwhile
-        self.assertEqual([t for t, on in self.actions(dlg.remote) if on], ["Copy Path"])
+        dlg._busy(True)  # the guest's side being read: nothing changes there meanwhile (what reads only, still)
+        self.assertEqual([t for t, on in self.actions(dlg.remote) if on], ["Copy Path", "Properties…"])
         self.assertTrue(all(on for _t, on in self.actions(dlg.local)))
         dlg._busy(False)
         shown = []  # the right click itself: the item under the pointer chosen first, the empty space the folder
@@ -567,7 +578,7 @@ class FilesWindowTest(UiCase):
             self.assertEqual(dlg.remote.chosen(), [])
         self.assertEqual(len(shown), 2)
         keys = {sc.key().toString(): sc for sc in dlg.remote.tree.findChildren(files_window.QShortcut)}
-        self.assertEqual(set(keys), {"Del", "F2", "F5"})  # FileZilla's keys, on each side's list
+        self.assertEqual(set(keys), {"Del", "F2", "F5", "Alt+Return"})  # FileZilla's keys, on each side's list
         self.choose(dlg.remote, "old.txt")
         self.answer = False
         keys["Del"].activated.emit()
@@ -671,6 +682,51 @@ class FilesWindowTest(UiCase):
         wait_until(lambda: False, 0.3)  # (and is delivered — wait_until lets the worker run, unlike QTest.qWait)
         self.assertEqual(dlg.remote.folder, "/home/user/docs")
         self.assertFalse(dlg.busy)
+
+    def test_properties(self):
+        dlg = self.dlg
+        self.assertEqual(self.actions(dlg.remote)[-1], ("Properties…", True))
+        self.choose(dlg.remote, "old.txt")
+        dlg.properties(dlg.remote)
+        win = dlg.props_windows[-1]
+        self.assertTrue(wait_until(lambda: "Kind" in win.values))
+        self.assertEqual(self.side.calls[-1], ("properties", "/home/user", ["old.txt"]))
+        self.assertEqual((win.head.title.text(), win.head.text.text()), ("old.txt", "In /home/user · VM 201"))
+        when = files_window.datetime.fromtimestamp(1700000000).strftime("%d/%m/%Y %H:%M:%S")
+        self.assertEqual(win.values, {"Kind": "File", "Size": "5 B", "Modified": when, "Owner": "user (1000)",
+                                      "Group": "user (1000)", "Permissions": "rw-r--r-- (644)"})
+        win.close()
+        self.assertEqual(dlg.props_windows, [])
+        dlg.remote.tree.clearSelection()  # nothing chosen: the folder itself
+        dlg.properties(dlg.remote)
+        win = dlg.props_windows[-1]
+        self.assertTrue(wait_until(lambda: "Kind" in win.values))
+        self.assertEqual(self.side.calls[-1], ("properties", "/home/user", ["."]))
+        self.assertEqual((win.head.title.text(), win.head.text.text()), ("user", "/home/user · VM 201"))
+        self.assertEqual((win.values["Size"], win.values["Holds"], win.values["Owner"], win.values["Permissions"]),
+                         ("3.3 MiB (3,500,000 bytes)", "12 files, 3 folders", "root (0)", "rwxr-xr-x (755)"))
+        self.choose(dlg.remote, "old.txt", "docs")  # two: what they make together
+        keys = {sc.key().toString(): sc for sc in dlg.remote.tree.findChildren(files_window.QShortcut)}
+        keys["Alt+Return"].activated.emit()
+        win = dlg.props_windows[-1]
+        self.assertTrue(wait_until(lambda: "Chosen" in win.values))
+        self.assertEqual(win.head.title.text(), "2 items")
+        self.assertEqual(win.values, {"Chosen": "1 file, 1 folder", "Size": "3.3 MiB (3,500,005 bytes)",
+                                      "Holds": "13 files, 4 folders"})
+        self.side.fail = files_window.GuestError("Reading the properties failed: No such folder")
+        dlg.properties(dlg.remote)
+        win = dlg.props_windows[-1]
+        self.assertTrue(wait_until(lambda: "Error" in win.values))
+        self.assertEqual(win.state.text(), "⚠ Reading the properties failed: No such folder")
+        self.side.fail = None
+        os.chmod(self.local / "new.txt", 0o600)
+        self.choose(dlg.local, "new.txt")  # this computer's own
+        dlg.properties(dlg.local)
+        win = dlg.props_windows[-1]
+        self.assertTrue(wait_until(lambda: "Kind" in win.values))
+        self.assertEqual((win.values["Size"], win.head.text.text()), ("3 B", f"In {self.local} · this computer"))
+        if os.name == "posix":
+            self.assertEqual(win.values["Permissions"], "rw------- (600)")
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "elsewhere it would be the real Trash")
     def test_this_computers_trash(self):

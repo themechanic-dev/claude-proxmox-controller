@@ -2719,6 +2719,37 @@ class GuestFilesLinuxTest(unittest.TestCase):
         for argv in self.agent.started:  # (the agent is given ASCII only)
             self.assertTrue(all(ord(c) < 128 for a in argv for c in a), argv)
 
+    def test_properties(self):
+        """Properties…, the guest's script run for real (a VM through the agent, a container through pct exec) and
+        this computer's own: the same answers — a folder's whole size and what it holds, a link, the folder itself."""
+        import pwd
+        note = "γεια σου κόσμε\n".encode()
+        (self.vm / "φάκελος" / "μέσα").mkdir(parents=True)
+        (self.vm / "φάκελος" / "μέσα" / "σημειώσεις.txt").write_bytes(note)
+        (self.vm / "φάκελος" / "a.bin").write_bytes(b"x" * 5000)
+        (self.vm / "δεσμός").symlink_to("φάκελος")
+        os.chmod(self.vm / "υπάρχον.md", 0o640)
+        ct = guestfiles.ContainerFiles("pve", 22, "root", 105)
+        ct._argv = lambda inner: inner  # (what `pct exec` would run inside, run here)
+        names = ["φάκελος", "δεσμός", "υπάρχον.md", "."]
+        here = guestfiles.local_props(self.vm, names)
+        for side in (self.files(), ct):
+            got = side.properties(str(self.vm), names)
+            self.assertEqual([(p.name, p.kind) for p in got],
+                             [("φάκελος", "folder"), ("δεσμός", "link"), ("υπάρχον.md", "file"), (".", "folder")])
+            self.assertEqual((got[0].size, got[0].files, got[0].folders), (len(note) + 5000, 2, 1))
+            self.assertEqual(got[1].link, "φάκελος")
+            self.assertEqual((got[2].size, got[2].mode, got[2].uid, got[2].owner),
+                             (len("ήδη εδώ".encode()), 0o640, os.getuid(), pwd.getpwuid(os.getuid()).pw_name))
+            self.assertEqual((got[3].files, got[3].folders), (3, 2))  # (the link neither counted nor followed)
+            for a, b in zip(got, here):  # this computer's side tells the same (bar the times it reads itself)
+                a.atime = b.atime = a.btime = b.btime = 0
+                self.assertEqual(a, b)
+        with self.assertRaisesRegex(guestfiles.GuestError, "^λείπει: not there"):
+            self.files().properties(str(self.vm), ["λείπει"])
+        with self.assertRaisesRegex(guestfiles.GuestError, "No such folder"):
+            ct.properties(str(self.root / "nope"), ["x"])
+
 
 class GuestFilesTest(unittest.TestCase):
     def test_paths_and_listing(self):
@@ -2764,10 +2795,25 @@ class GuestFilesTest(unittest.TestCase):
             guestfiles.ops_result(9, "", "", "Deleting failed")
         guestfiles.ops_result(0, "", "", "Deleting failed")
 
+    def test_properties_from_windows(self):
+        b = guestfiles.b64
+        out = (f"P {b('Έγγραφα')} folder 12345 10 2 1700000000 1700000100 1600000000 - - - {b('PC' + chr(92) + 'Χρήστης')}"
+               f" - - {b('Directory, ReadOnly')}\r\nMISS {b('λείπει')}\r\n")
+        self.assertEqual(guestfiles.parse_props(0, out, ""), [guestfiles.Props(
+            "Έγγραφα", "folder", 12345, 10, 2, 1700000000, 1700000100, 1600000000, None, None, None,
+            "PC\\Χρήστης", "", "", "Directory, ReadOnly")])
+        argv = guestfiles.props_argv("windows", "C:\\Χρήστης", ["ένα", "δύο"])
+        self.assertIn(guestfiles.b64("C:\\Χρήστης"), argv[-1])
+        self.assertIn(guestfiles._names_b64(["ένα", "δύο"]), argv[-1])
+        self.assertNotIn("{names}", argv[-1])
+        self.assertTrue(all(ord(c) < 128 for c in argv[-1]))
+        with self.assertRaisesRegex(guestfiles.GuestError, "^Reading the properties failed: No such folder$"):
+            guestfiles.parse_props(4, "ERR No such folder\r\n", "")
+
     def test_scripts_stay_ascii_and_are_filled(self):
         for name in ("LINUX_LIST", "LINUX_SEND_NET", "LINUX_RECV_NET", "LINUX_JOIN", "LINUX_PACK", "WINDOWS_LIST",
                      "WINDOWS_SEND_NET", "WINDOWS_RECV_NET", "WINDOWS_JOIN", "WINDOWS_PACK", "LINUX_OPS",
-                     "WINDOWS_OPS"):
+                     "WINDOWS_OPS", "LINUX_PROPS", "WINDOWS_PROPS"):
             self.assertTrue(all(ord(c) < 128 for c in getattr(guestfiles, name)), name)
         sent = []
         agent = mock.Mock()

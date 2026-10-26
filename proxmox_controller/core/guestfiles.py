@@ -24,6 +24,7 @@ import posixpath
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -59,6 +60,26 @@ class Entry:
     is_dir: bool
     size: int
     mtime: int
+
+
+@dataclass
+class Props:
+    """What a file or folder is (Properties…). Unknown numbers are None, unknown text "", unknown times 0."""
+    name: str
+    kind: str                  # "file" | "folder" | "link" | "other"
+    size: int = 0              # a folder: all the files it holds, at every depth
+    files: int = 0             # a folder: the files and folders it holds, at every depth
+    folders: int = 0
+    mtime: int = 0
+    atime: int = 0
+    btime: int = 0             # created
+    uid: int | None = None
+    gid: int | None = None
+    mode: int | None = None    # Linux: the permission bits (0o755, 0o4755…)
+    owner: str = ""
+    group: str = ""
+    link: str = ""             # a link: where it points
+    attributes: str = ""       # Windows: ReadOnly, Hidden, System…
 
 
 def b64(text: str) -> str:
@@ -356,6 +377,142 @@ def ops_result(code: int, out: str, err: str, what: str) -> None:
     raise GuestError(f"{what}: {(err or out).strip()[:300] or f'exit code {code}'}")
 
 
+# -- what a file or folder is (Properties…) ------------------------------------------------------------
+# One line for each name: P name kind size files folders mtime atime btime uid gid mode owner group link attributes —
+# the texts base64, "-" where the system does not tell it. A folder's size is that of all its files (BusyBox's find has
+# no -printf: there stat tells them). "MISS name": not there (any more).
+
+LINUX_PROPS = r"""
+cd -- "$(printf %s "$1" | base64 -d)" 2>/dev/null || { echo "ERR No such folder"; exit 4; }
+shift
+e() { if [ -n "$1" ]; then printf %s "$1" | base64 | tr -d '\n'; else printf -; fi; }
+gnu=; find . -maxdepth 0 -printf '' 2>/dev/null && gnu=1
+for a in "$@"; do
+  n=$(printf %s "$a" | base64 -d)
+  if [ -L "$n" ]; then k=link; elif [ -d "$n" ]; then k=folder; elif [ -f "$n" ]; then k=file
+  elif [ -e "$n" ]; then k=other; else echo "MISS $a"; continue; fi
+  st() { v=$(stat -c "$1" -- "$n" 2>/dev/null); case "$v" in ''|*[!0-9]*) echo -;; *) echo "$v";; esac; }
+  z=$(st %s); f=0; c=0; l=
+  if [ "$k" = folder ]; then
+    if [ -n "$gnu" ]; then
+      z=$(find "./$n" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {printf "%.0f", s}')
+    else
+      z=$(find "./$n" -type f -exec stat -c %s -- {} + 2>/dev/null | awk '{s+=$1} END {printf "%.0f", s}')
+    fi
+    f=$(find "./$n" -type f 2>/dev/null | wc -l); c=$(find "./$n" -mindepth 1 -type d 2>/dev/null | wc -l)
+  fi
+  [ "$k" = link ] && l=$(readlink -- "$n")
+  printf 'P %s %s %s %s %s %s %s %s %s %s %s %s %s %s -\n' "$a" "$k" "$z" $f $c "$(st %Y)" "$(st %X)" "$(st %W)" \
+    "$(st %u)" "$(st %g)" "$(st %a)" "$(e "$(stat -c %U -- "$n" 2>/dev/null)")" \
+    "$(e "$(stat -c %G -- "$n" 2>/dev/null)")" "$(e "$l")"
+done
+exit 0
+"""
+
+WINDOWS_PROPS = r"""
+$ErrorActionPreference = 'Stop'
+function D([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
+function E([string]$s) { if ($s) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s)) } else { '-' } }
+$epoch = [datetime]'1970-01-01'
+function T($t) { [int64](($t - $epoch).TotalSeconds) }
+$folder = D '{folder}'
+if (-not (Test-Path -LiteralPath $folder -PathType Container)) { 'ERR No such folder'; exit 4 }
+foreach ($n in ((D '{names}') -split [char]0)) {
+  try { $i = Get-Item -LiteralPath (Join-Path $folder $n) -Force } catch { 'MISS ' + (E $n); continue }
+  [int64]$s = 0; $f = 0; $c = 0; $l = ''
+  if ($i.LinkType) { $k = 'link'; $l = [string]($i.Target | Select-Object -First 1) }
+  elseif ($i.PSIsContainer) {
+    $k = 'folder'
+    Get-ChildItem -LiteralPath $i.FullName -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      if ($_.PSIsContainer) { $c++ } else { $f++; $s += $_.Length }
+    }
+  } else { $k = 'file'; $s = $i.Length }
+  $o = ''; try { $o = (Get-Acl -LiteralPath $i.FullName).Owner } catch {}
+  'P ' + (E $n) + " $k $s $f $c " + (T $i.LastWriteTimeUtc) + ' ' + (T $i.LastAccessTimeUtc) + ' ' +
+    (T $i.CreationTimeUtc) + ' - - - ' + (E $o) + ' - ' + (E $l) + ' ' + (E ([string]$i.Attributes))
+}
+"""
+
+
+def props_argv(os_name: str, folder: str, names: Iterable[str]) -> list[str]:
+    names = list(names)
+    if os_name == "windows":
+        return _ps(WINDOWS_PROPS.replace("{folder}", b64(folder)).replace("{names}", _names_b64(names)))
+    return ["sh", "-c", LINUX_PROPS, "sh", b64(folder), *[b64(n) for n in names]]
+
+
+def parse_props(code: int, out: str, err: str) -> list[Props]:
+    """The guest's answer to *_PROPS; GuestError when it failed, or when none of the names is there."""
+    got, missing = [], []
+
+    def text(v: str) -> str:
+        return "" if v == "-" else unb64(v)
+
+    def num(v: str) -> int | None:
+        return int(v) if v.isdigit() else None
+    for line in out.splitlines():
+        f = line.strip().split(" ")
+        if f[0] in ("ERR", "ERRB"):
+            ops_result(code or 1, line, err, "Reading the properties failed")
+        elif f[0] == "MISS" and len(f) > 1:
+            missing.append(text(f[1]))
+        elif f[0] == "P" and len(f) >= 16:
+            got.append(Props(text(f[1]), f[2], num(f[3]) or 0, num(f[4]) or 0, num(f[5]) or 0, num(f[6]) or 0,
+                             num(f[7]) or 0, num(f[8]) or 0, num(f[9]), num(f[10]),
+                             int(f[11], 8) if f[11].isdigit() else None, text(f[12]), text(f[13]), text(f[14]),
+                             text(f[15])))
+    if not got:
+        if missing:
+            raise GuestError(f"{', '.join(missing)}: not there (any more).")
+        ops_result(code or 1, out, err, "Reading the properties failed")
+    return got
+
+
+WIN_ATTRIBUTES = (("ReadOnly", 0x1), ("Hidden", 0x2), ("System", 0x4), ("Archive", 0x20), ("Compressed", 0x800),
+                  ("Encrypted", 0x4000))
+
+
+def local_props(folder: Path, names: Iterable[str]) -> list[Props]:
+    """The same of this computer's files (Properties… on the left)."""
+    out = []
+    for name in names:
+        p = folder / name
+        st = p.lstat()
+        kind = ("link" if stat.S_ISLNK(st.st_mode) else "folder" if stat.S_ISDIR(st.st_mode) else
+                "file" if stat.S_ISREG(st.st_mode) else "other")
+        props = Props(name, kind, 0 if kind == "folder" else st.st_size, mtime=int(st.st_mtime),
+                      atime=int(st.st_atime), btime=int(getattr(st, "st_birthtime", 0) or 0))
+        if kind == "folder":  # as the guest's find counts: files and folders, links neither (nor followed)
+            for root, dirs, files in os.walk(p):
+                props.folders += sum(not os.path.islink(os.path.join(root, d)) for d in dirs)
+                for f in files:
+                    try:
+                        fst = os.lstat(os.path.join(root, f))
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(fst.st_mode):
+                        props.size += fst.st_size
+                        props.files += 1
+        if kind == "link":
+            props.link = os.readlink(p)
+        if os.name == "posix":
+            import grp
+            import pwd
+            props.uid, props.gid, props.mode = st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)
+            try:
+                props.owner = pwd.getpwuid(st.st_uid).pw_name
+            except KeyError:
+                pass
+            try:
+                props.group = grp.getgrgid(st.st_gid).gr_name
+            except KeyError:
+                pass
+        bits = getattr(st, "st_file_attributes", 0)
+        props.attributes = ", ".join(n for n, b in WIN_ATTRIBUTES if bits & b)
+        out.append(props)
+    return out
+
+
 # -- the archive on this computer -----------------------------------------------------------------------
 
 def total_size(paths: Iterable[Path]) -> int:
@@ -615,6 +772,9 @@ class VmFiles:
     def mkdir(self, folder: str, name: str) -> None:
         ops_result(*self.run(ops_argv(self.os_name, "mkdir", folder, name)), "Making the folder failed")
 
+    def properties(self, folder: str, names: list[str]) -> list[Props]:
+        return parse_props(*self.run(props_argv(self.os_name, folder, names), timeout=600))  # (a folder: counted)
+
     # -- copies
     def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event) -> str:
         """The chosen files and folders of this computer into the VM's folder `dest`. Returns the way it went."""
@@ -847,6 +1007,13 @@ class ContainerFiles:
 
     def mkdir(self, folder: str, name: str) -> None:
         self._op("mkdir", folder, (name,), "Making the folder failed")
+
+    def properties(self, folder: str, names: list[str]) -> list[Props]:
+        done = subprocess.run(self._argv(props_argv("linux", folder, names)), capture_output=True, text=True,
+                              errors="replace", timeout=600, stdin=subprocess.DEVNULL, **procs.hidden())
+        if done.returncode == 255:
+            raise GuestError(done.stderr.strip()[:300] or "SSH to the host failed.")
+        return parse_props(done.returncode, done.stdout, done.stderr)
 
     def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event) -> str:
         total = total_size(paths)
