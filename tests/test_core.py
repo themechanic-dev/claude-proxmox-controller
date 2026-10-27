@@ -184,17 +184,18 @@ class ApiTest(unittest.TestCase):
             upload_name("/home/me/notes.txt")
 
     def test_upload_cancelled_or_wrong_certificate(self):
-        with tempfile.NamedTemporaryFile(suffix=".iso") as fh:
-            fh.write(b"x" * 300_000)
-            fh.flush()
+        with tempfile.TemporaryDirectory() as d:  # (not NamedTemporaryFile: Windows will not open that one twice)
+            path = os.path.join(d, "image.iso")
+            with open(path, "wb") as fh:
+                fh.write(b"x" * 300_000)
             with self.assertRaises(PveError) as ctx:
-                self.pve.upload("pve", "local", fh.name, cancelled=lambda: True)
+                self.pve.upload("pve", "local", path, cancelled=lambda: True)
             self.assertIn("cancelled", str(ctx.exception))
             self.assertEqual(self.srv.cluster.uploaded, {})
             sent_before = len(self.srv.requests)
             self.host.fingerprint = "00:" * 31 + "00"
             with self.assertRaises(CertificateMismatch):
-                self.pve.upload("pve", "local", fh.name)
+                self.pve.upload("pve", "local", path)
             self.assertEqual(len(self.srv.requests), sent_before)  # not a byte, not the token
 
     def test_create_and_clone_vm(self):

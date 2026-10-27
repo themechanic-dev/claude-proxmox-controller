@@ -124,7 +124,7 @@ class UiCase(unittest.TestCase):
             return True
         self.patches.append(mock.patch.object(files_window, "to_trash", to_trash))
         self.patches.append(mock.patch.object(files_window, "QDesktopServices", types.SimpleNamespace(
-            openUrl=lambda url: self.opened.append(url.toLocalFile()) or True)))
+            openUrl=lambda url: self.opened.append(os.path.normpath(url.toLocalFile())) or True)))  # (Qt's "C:/…")
         self.patches.append(mock.patch.object(files_window, "QGuiApplication", types.SimpleNamespace(
             clipboard=lambda: types.SimpleNamespace(setText=self.clipboard.append))))
         self.copied = ""  # what "this computer has copied", for the console's Paste… (never the real clipboard)
@@ -312,10 +312,15 @@ class HostViewTest(UiCase):
             view.resize(width, 760)
             QTest.qWait(30)
             used = sum(hdr.sectionSize(c) for c in range(len(host_view.COLUMNS) - 1))
-            self.assertLessEqual(abs(view.table.viewport().width() - used), 1, width)  # no gap on the right
-            self.assertEqual(view.table.horizontalScrollBar().maximum(), 0, width)  # and nothing cut off
+            name = hdr.sectionSize(host_view.COL_NAME)
+            if name > host_view.NAME_MIN_W:  # Name still had room to give: the columns fill the width exactly
+                self.assertLessEqual(abs(view.table.viewport().width() - used), 1, width)  # no gap on the right
+                self.assertEqual(view.table.horizontalScrollBar().maximum(), 0, width)  # and nothing cut off
+            else:  # a wider font than this computer's (a bare test machine's): Name gave all it could, the rest scrolls
+                self.assertEqual(name, host_view.NAME_MIN_W, width)
+                self.assertGreaterEqual(used, view.table.viewport().width(), width)  # no gap either way
             if width == 850:
-                self.assertLess(hdr.sectionSize(host_view.COL_NAME), natural)  # narrow: Name gave way
+                self.assertLess(name, natural)  # narrow: Name gave way
         self.assertEqual(hdr.sectionSize(host_view.COL_DOT), view.table.iconSize().width() + 14)  # icons stay narrow
 
     def test_selected_dot_keeps_its_colour(self):
@@ -1433,6 +1438,7 @@ class GuestDialogsTest(UiCase):
         self.assertEqual(dlg.timer.interval(), 60_000)  # Hour: every minute
         dlg.load("week")
         self.assertEqual(dlg.timer.interval(), 1_800_000)
+        self.assertTrue(wait_until(lambda: not dlg.loading))  # (a tick while it still reads is skipped, as it should)
         calls = []
         with mock.patch.object(DemoPve, "rrd", side_effect=lambda *a: calls.append(a) or []):
             dlg.timer.timeout.emit()  # what the timer does by itself
@@ -2288,7 +2294,8 @@ class UpdateTest(UiCase):
         self.assertTrue(again.update_tabs[0].isHidden())
 
     def test_install_through_the_system(self):
-        dlg = update_window.UpdateDialog(None, dict(self.FEED), "deb")
+        with mock.patch.object(updates_core, "platform_key", lambda: "linux"):  # a .deb is the Linux file, wherever this runs
+            dlg = update_window.UpdateDialog(None, dict(self.FEED), "deb")
         self.addCleanup(dlg.close)
         self.assertIn("installed through the system (it asks for your password)",
                       " ".join(lbl.text() for lbl in dlg.findChildren(QLabel)))

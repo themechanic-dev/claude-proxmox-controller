@@ -92,7 +92,11 @@ class FakePveServer:
                 if length and ctype.startswith("application/json"):
                     params.update(json.loads(self.rfile.read(length)))
                 elif length and ctype.startswith("multipart/form-data"):
-                    params.update(parse_multipart(self.rfile.read(length), ctype.split("boundary=", 1)[1]))
+                    body = self.rfile.read(length)
+                    if len(body) < length:  # the client stopped mid-upload (cancelled): Proxmox keeps nothing
+                        self.close_connection = True
+                        return
+                    params.update(parse_multipart(body, ctype.split("boundary=", 1)[1]))
                 elif length:
                     params.update({k: v[0] for k, v in parse_qs(self.rfile.read(length).decode()).items()})
                 auth = self.headers.get("Authorization", "")
