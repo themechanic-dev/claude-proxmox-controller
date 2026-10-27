@@ -12,7 +12,7 @@ shows at the next start too. Install downloads this system's file into the app's
 a cut or altered file never reaches the installer — and hands it over: on Windows the setup program (it stops the
 app itself, then replaces it); on Linux `pkexec apt-get install` of the .deb — the system asks for the password —
 then the app starts again. An app not installed that way (run from its source) opens the download page instead.
-Files come only from the app's own website, over HTTPS."""
+Files come only from the app's own website, over HTTPS (core/web: the app's User-Agent and certificates)."""
 
 from __future__ import annotations
 
@@ -24,13 +24,12 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
 from .. import VERSION
-from . import procs, store
+from . import procs, store, web
 
 FEED_URL = "https://themechanic.store/updates/proxmox-controller.json"
 PAGE_URL = "https://themechanic.store/controller"
@@ -82,19 +81,8 @@ def parse(text: str) -> dict:
     return feed
 
 
-def user_agent() -> str:
-    return f"ProxmoxController/{VERSION} ({'Windows' if platform_key() == 'windows' else 'Linux'})"
-
-
-def _open(url: str):
-    """The app's website is behind Cloudflare, which refuses Python's own User-Agent (403, «error code: 1010»,
-    measured 27/10 — 1.0.0 could read neither the feed nor an update's file): the app says who it is."""
-    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": user_agent()}),
-                                  timeout=TIMEOUT_S)
-
-
 def fetch_feed() -> str:
-    with _open(FEED_URL) as r:
+    with web.open_url(FEED_URL, timeout=TIMEOUT_S) as r:
         return r.read(256 * 1024).decode("utf-8")
 
 
@@ -160,7 +148,7 @@ def download(feed: dict, progress: Callable[[int, int], None], cancel: threading
     part = path.with_name(name + ".part")
     h, done = hashlib.sha256(), 0
     try:
-        with _open(url) as r, open(part, "wb") as out:
+        with web.open_url(url, timeout=TIMEOUT_S) as r, open(part, "wb") as out:
             total = int(r.headers.get("Content-Length") or item.get("size") or 0)
             while True:
                 if cancel.is_set():

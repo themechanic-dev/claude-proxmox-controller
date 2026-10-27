@@ -16,10 +16,9 @@ from __future__ import annotations
 import json
 import re
 import time
-import urllib.request
 from datetime import date
 
-from . import store
+from . import store, web
 
 INDEX_URL = "https://cloud-images.ubuntu.com/releases/streams/v1/index.json"
 IMAGES = "com.ubuntu.cloud:released:download"
@@ -55,13 +54,13 @@ def versions_in(index: dict) -> list[str]:
 
 
 def fetch_index() -> dict:
-    with urllib.request.urlopen(INDEX_URL, timeout=TIMEOUT_S) as r:
+    with web.open_url(INDEX_URL, timeout=TIMEOUT_S) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
 def fetch_size_mb(url: str) -> int | None:
     """An image's size, from the server's answer to a HEAD request (redirects followed)."""
-    with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=TIMEOUT_S) as r:
+    with web.open_url(url, method="HEAD", timeout=TIMEOUT_S) as r:
         n = r.headers.get("Content-Length")
     return round(int(n) / 1_000_000) if n and n.isdigit() else None
 

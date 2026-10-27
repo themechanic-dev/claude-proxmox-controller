@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import stat
 import subprocess
 import struct
@@ -24,7 +25,7 @@ from unittest import mock
 from proxmox_controller.core import apt, ssh as sshmod
 from proxmox_controller.core import (autostart, claude_access, claude_policy, connector_link, connector_tools, jobs,
                                      mcp, netinfo, screen, sounds, spice, startup, store, tasks, vault, vmhw, wol)
-from proxmox_controller.core import claude_connect, ubuntu_releases, updates
+from proxmox_controller.core import claude_connect, ubuntu_releases, updates, web
 from proxmox_controller.core import (autoinstall, cloudseed, guestfiles, isofs, setupdisc, staticnet, timezones,
                                      winsetup)
 from proxmox_controller.core.des import encrypt_block, vnc_response
@@ -3061,17 +3062,34 @@ class UpdatesTest(unittest.TestCase):
         class Answer(io.BytesIO):
             headers = {"Content-Length": str(len(body))}
 
-        def urlopen(req, timeout=None):
-            asked.append(req)
+        def urlopen(req, timeout=None, context=None):
+            asked.append((req, context))
             return Answer(body)
         feed = {"version": "9.1.0", updates.platform_key(): {"url": "https://themechanic.store/d/pc-9.1.0.deb",
                                                             "sha256": hashlib.sha256(body).hexdigest()}}
-        with mock.patch.object(updates.urllib.request, "urlopen", urlopen):
+        with mock.patch.object(web.urllib.request, "urlopen", urlopen):
             updates.fetch_feed()
             updates.download(feed, lambda d, t: None, threading.Event(), self.dir)
         self.assertEqual(len(asked), 2)
-        for req in asked:
+        for req, context in asked:
             self.assertRegex(req.get_header("User-agent"), r"^ProxmoxController/\d+\.\d+\.\d+ \((Windows|Linux)\)$")
+            self.assertIs(context, web.context())  # Mozilla's roots too (WebTest)
+
+
+class WebTest(unittest.TestCase):
+    """HTTPS to the internet: Mozilla's roots besides the system's."""
+
+    def test_the_sites_root_without_the_systems(self):
+        # A fresh Windows 11 has about twenty roots, not the one themechanic.store chains to (GTS Root R4), and Python
+        # does not fetch it as Windows' own programs do: 1.0.1 saw no update there (VM 103, 27/10).
+        web.context.cache_clear()
+        self.addCleanup(web.context.cache_clear)
+        with mock.patch.object(ssl.SSLContext, "load_default_certs", lambda self, purpose=None: None):
+            names = [str(c.get("subject")) for c in web.context().get_ca_certs()]
+        self.assertTrue(any("GTS Root R4" in n for n in names))  # Cloudflare's certificate for the site, today
+        self.assertTrue(any("ISRG Root X1" in n for n in names))  # Let's Encrypt, Cloudflare's other issuer
+        self.assertGreater(len(names), 100)
+        self.assertRegex(web.user_agent(), r"^ProxmoxController/[\d.]+ \((Windows|Linux)\)$")
 
 
 class UbuntuReleasesTest(unittest.TestCase):

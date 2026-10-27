@@ -21,12 +21,12 @@ Claude reaches your hosts only through this app, and only as far as each host's 
 | Read | state, addresses, settings, snapshots, backups, tasks, graphs | On |
 | Power | start, shut down, stop, reboot, wake | Ask |
 | Change | new guests, settings, snapshots, backups | Ask |
-| Destroy | deleting guests, snapshots, backups | Ask |
-| Host | the host's own power | Ask |
-| Console | the guest's screen: screenshots, keys, clicks | Ask |
-| Commands | commands inside guests (QEMU guest agent) | Ask |
+| Destroy | deleting guests, snapshots, backups | Off |
+| Host | the host's own power | Off |
+| Console | the guest's screen: screenshots, keys, clicks | Off |
+| Commands | commands inside guests (QEMU guest agent) | Off |
 | Files | copying files to and from guests | Off |
-| Host commands | shell commands on the Proxmox host (SSH) | Ask |
+| Host commands | shell commands on the Proxmox host (SSH) | Off |
 
 Each switch is **Off** (refused), **Ask** (a window asks you: *Allow*, *Allow this kind for an hour*, or *Deny*) or
 **On**. The approval window wears yellow-and-black warning stripes, so it is never lost among other windows.
@@ -61,7 +61,7 @@ Everything works without Claude too:
   package brings virt-viewer with it):
 
   ```bash
-  sudo apt install ./proxmox-controller_1.0.1_amd64.deb
+  sudo apt install ./proxmox-controller_1.0.2_amd64.deb
   ```
 
 - **Ubuntu / Debian, from its apt repository** — it then updates with the rest of the system:
