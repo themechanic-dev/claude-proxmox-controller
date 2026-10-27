@@ -1,10 +1,13 @@
-"""The Help window: one section per feature, in English (Qt rich text)."""
+"""The Help window: one topic per feature, in English (Qt rich text) — the topics listed on the left, the chosen
+one explained on the right."""
 
 from __future__ import annotations
 
 import html
 
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QListWidget, QScrollArea,
+                               QStackedWidget, QVBoxLayout, QWidget)
 
 from .. import APP_NAME
 from ..core import connector_tools
@@ -361,26 +364,42 @@ SECTIONS = [
 
 
 class HelpDialog(QDialog):
-    """Help in its own window, so it can stay open next to the host it explains."""
+    """Help in its own window, so it can stay open next to the host it explains. The topics are a list on the left;
+    a click (or the arrow keys) shows that topic alone on the right, instead of one long page of everything."""
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"Help — {APP_NAME}")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 12)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        body = QWidget()
-        bl = QVBoxLayout(body)
-        bl.setContentsMargins(24, 20, 24, 12)
-        bl.setSpacing(14)
+        lay.setContentsMargins(16, 16, 16, 12)
+        lay.setSpacing(12)
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        self.topics = QListWidget()
+        for title, _ in SECTIONS:
+            self.topics.addItem(title)
+        self.topics.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.topics.setFixedWidth(  # as wide as the longest title with its padding, and room for the scroll bar
+            self.topics.sizeHintForColumn(0) + 2 * self.topics.frameWidth()
+            + self.topics.verticalScrollBar().sizeHint().width() + 8)
+        self.pages = QStackedWidget()
         for title, text in SECTIONS:
-            bl.addWidget(card(label(title, "heading"), label(text, wrap=True)))
-        bl.addStretch(1)
-        scroll.setWidget(body)
-        lay.addWidget(scroll, 1)
+            body = QWidget()
+            bl = QVBoxLayout(body)
+            bl.setContentsMargins(0, 0, 8, 0)
+            bl.addWidget(card(label(title, "heading"), label(text, wrap=True, selectable=True)))
+            bl.addStretch(1)
+            page = QScrollArea()  # a long topic scrolls on its own
+            page.setWidgetResizable(True)
+            page.setFrameShape(QFrame.Shape.NoFrame)
+            page.setWidget(body)
+            self.pages.addWidget(page)
+        self.topics.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.topics.setCurrentRow(0)
+        row.addWidget(self.topics)
+        row.addWidget(self.pages, 1)
+        lay.addLayout(row, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.close)
-        buttons.setContentsMargins(24, 0, 24, 0)
         lay.addWidget(buttons)
-        self.resize(700, 720)
+        self.resize(980, 760)

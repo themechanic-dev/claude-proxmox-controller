@@ -2575,6 +2575,34 @@ class WindowsLookTest(UiCase):
         self.assertFalse(connector._TRAY["icon"].visible)
 
 
+class HelpTest(UiCase):
+    def test_topics_on_the_left_one_explanation_on_the_right(self):
+        # Help was one long page of every topic, hard to read (the user, 27/10): the topics are a list now, and a
+        # click shows the chosen one alone
+        from proxmox_controller.ui import help as help_ui
+
+        dlg = help_ui.HelpDialog()
+        try:
+            dlg.show()
+            titles = [t for t, _ in help_ui.SECTIONS]
+            self.assertEqual([dlg.topics.item(i).text() for i in range(dlg.topics.count())], titles)
+            self.assertEqual((dlg.pages.count(), dlg.pages.currentIndex()), (len(titles), 0))
+            for i in range(dlg.topics.count()):  # no title cut off: each row as wide as its text needs, inside the list
+                self.assertLessEqual(dlg.topics.sizeHintForIndex(dlg.topics.model().index(i, 0)).width(),
+                                     dlg.topics.viewport().width(), titles[i])
+
+            item = dlg.topics.item(titles.index("Wake-on-LAN"))
+            dlg.topics.scrollToItem(item)
+            QTest.mouseClick(dlg.topics.viewport(), Qt.MouseButton.LeftButton,
+                             pos=dlg.topics.visualItemRect(item).center())
+            shown = [lbl.text() for lbl in dlg.pages.currentWidget().findChildren(QLabel)]
+            self.assertIn("Wake-on-LAN", shown)
+            self.assertTrue(any("ethtool" in t for t in shown))
+            self.assertFalse(any("Get Certificate" in t for t in shown))  # another topic's words stay on their page
+        finally:
+            dlg.deleteLater()
+
+
 class ThemeTest(UiCase):
     def test_no_preference_after_dark_is_light(self):
         # GNOME's "default" (Ubuntu's Light) reaches Qt as no preference. Coming back to it from dark, the app went
