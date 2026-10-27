@@ -107,7 +107,7 @@ class ApiTest(unittest.TestCase):
             self.pve.version()
 
     def test_version_nodes_guests(self):
-        self.assertEqual(self.pve.version()["release"], "8.4")
+        self.assertEqual(self.pve.version()["release"], "9.2")
         self.assertEqual(self.pve.nodes()[0]["node"], "pve")
         guests = {g["vmid"]: g for g in self.pve.guests()}
         self.assertEqual(guests[100]["name"], "pihole")

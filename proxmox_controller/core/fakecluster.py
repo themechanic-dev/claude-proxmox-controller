@@ -188,7 +188,7 @@ class FakeCluster:
     # -- answers ---------------------------------------------------------------------------------
 
     def version(self, p):
-        return {"version": "8.4.1", "release": "8.4", "repoid": "fake"}
+        return {"version": "9.2.21", "release": "9.2", "repoid": "fake"}
 
     def nodes(self, p):
         return [{"node": NODE, "status": "online", "cpu": 0.07, "maxcpu": self.cpus, "mem": 9 << 30,
@@ -204,7 +204,7 @@ class FakeCluster:
                 "model": self.cpu_model, "sockets": 1},
                 "memory": {"used": sum(g["memory"] for g in running) * (1 << 20) + (2 << 30), "total": self.mem_total},
                 "rootfs": {"used": 21 << 30, "total": 94 << 30}, "uptime": 4 * 3600 + int(time.time()) % 3600,
-                "loadavg": ["0.31", "0.42", "0.40"], "pveversion": "pve-manager/8.4.1/fake", "kversion": "Linux 6.8.12-9-pve"}
+                "loadavg": ["0.31", "0.42", "0.40"], "pveversion": "pve-manager/9.2.21/fake", "kversion": "Linux 6.14.11-4-pve"}
 
     def node_command(self, p, node):
         if p.get("command") not in ("shutdown", "reboot"):
