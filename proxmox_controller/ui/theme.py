@@ -82,6 +82,7 @@ def apply(app: QApplication, dark: bool | None = None) -> Colors:
 def stylesheet(c: Colors) -> str:
     return f"""
     QWidget {{ font-size: 10.5pt; }}
+    QDialogButtonBox {{ dialogbuttonbox-buttons-have-icons: 0; }}
     QFrame#card {{ background: {c.card}; border: 1px solid {c.border}; border-radius: 12px; }}
     QLabel#title {{ font-size: 17pt; font-weight: 700; }}
     QLabel#heading {{ font-size: 11.5pt; font-weight: 700; }}

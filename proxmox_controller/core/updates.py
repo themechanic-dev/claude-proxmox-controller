@@ -33,7 +33,7 @@ from .. import VERSION
 from . import procs, store
 
 FEED_URL = "https://themechanic.store/updates/proxmox-controller.json"
-PAGE_URL = "https://themechanic.store/"
+PAGE_URL = "https://themechanic.store/controller"
 HOSTS = ("themechanic.store",)  # where the feed may send for a file
 CHECK_EVERY_S = 6 * 3600
 FIRST_CHECK_S = 5  # after the start: the window first
@@ -82,8 +82,19 @@ def parse(text: str) -> dict:
     return feed
 
 
+def user_agent() -> str:
+    return f"ProxmoxController/{VERSION} ({'Windows' if platform_key() == 'windows' else 'Linux'})"
+
+
+def _open(url: str):
+    """The app's website is behind Cloudflare, which refuses Python's own User-Agent (403, «error code: 1010»,
+    measured 27/10 — 1.0.0 could read neither the feed nor an update's file): the app says who it is."""
+    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": user_agent()}),
+                                  timeout=TIMEOUT_S)
+
+
 def fetch_feed() -> str:
-    with urllib.request.urlopen(FEED_URL, timeout=TIMEOUT_S) as r:
+    with _open(FEED_URL) as r:
         return r.read(256 * 1024).decode("utf-8")
 
 
@@ -149,7 +160,7 @@ def download(feed: dict, progress: Callable[[int, int], None], cancel: threading
     part = path.with_name(name + ".part")
     h, done = hashlib.sha256(), 0
     try:
-        with urllib.request.urlopen(url, timeout=TIMEOUT_S) as r, open(part, "wb") as out:
+        with _open(url) as r, open(part, "wb") as out:
             total = int(r.headers.get("Content-Length") or item.get("size") or 0)
             while True:
                 if cancel.is_set():

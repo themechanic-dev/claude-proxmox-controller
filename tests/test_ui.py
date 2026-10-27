@@ -2586,6 +2586,26 @@ class ThemeTest(UiCase):
         finally:
             theme.apply(APP, dark=True)
 
+    def test_dialog_buttons_have_no_icons(self):
+        # Linux desktops put icons on a dialog's buttons, Windows does not: Help's Close showed a dark ✗ on the dark
+        # theme (Ubuntu 26.04, 27/10). The same buttons on every system: their words only.
+        from PySide6.QtWidgets import QDialogButtonBox, QProxyStyle, QStyle, QStyleFactory
+
+        class AsGnome(QProxyStyle):
+            def styleHint(self, hint, option=None, widget=None, data=None):
+                if hint == QStyle.StyleHint.SH_DialogButtonBox_ButtonsHaveIcons:
+                    return 1
+                return super().styleHint(hint, option, widget, data)
+
+        theme.apply(APP, dark=True)
+        try:
+            APP.setStyle(AsGnome(QStyleFactory.create("Fusion")))
+            box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close | QDialogButtonBox.StandardButton.Save)
+            for which in (QDialogButtonBox.StandardButton.Close, QDialogButtonBox.StandardButton.Save):
+                self.assertTrue(box.button(which).icon().isNull())
+        finally:
+            theme.apply(APP, dark=True)
+
 
 class WindowPlaceTest(UiCase):
     def test_xwayland_only_where_it_helps(self):

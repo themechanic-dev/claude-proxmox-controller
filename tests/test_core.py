@@ -3053,6 +3053,26 @@ class UpdatesTest(unittest.TestCase):
         with self.assertRaisesRegex(updates.UpdateError, "not on the app's website"):
             updates.download(feed, lambda d, t: None, threading.Event(), self.dir)
 
+    def test_the_app_says_who_it_is(self):
+        # The app's website is behind Cloudflare, which refuses Python's own User-Agent (403, «error code: 1010»,
+        # measured 27/10): 1.0.0 could read neither the feed nor an update's file.
+        body, asked = b'{"version": "9.1.0"}', []
+
+        class Answer(io.BytesIO):
+            headers = {"Content-Length": str(len(body))}
+
+        def urlopen(req, timeout=None):
+            asked.append(req)
+            return Answer(body)
+        feed = {"version": "9.1.0", updates.platform_key(): {"url": "https://themechanic.store/d/pc-9.1.0.deb",
+                                                            "sha256": hashlib.sha256(body).hexdigest()}}
+        with mock.patch.object(updates.urllib.request, "urlopen", urlopen):
+            updates.fetch_feed()
+            updates.download(feed, lambda d, t: None, threading.Event(), self.dir)
+        self.assertEqual(len(asked), 2)
+        for req in asked:
+            self.assertRegex(req.get_header("User-agent"), r"^ProxmoxController/\d+\.\d+\.\d+ \((Windows|Linux)\)$")
+
 
 class UbuntuReleasesTest(unittest.TestCase):
     """Which Ubuntu releases a ready-made VM can be: read from Ubuntu's image index at most once a day, kept, and
