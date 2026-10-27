@@ -10,6 +10,15 @@ requests you approve in a window of the app. You stay in charge of every step.
 
 *by the mechanic — built together with Claude*
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/main-dark.webp">
+    <img src="docs/img/main-light.webp" alt="Proxmox Controller: a Proxmox host's page with its CPU, memory and storage, and the list of its containers and virtual machines">
+  </picture>
+  <br>
+  <em>A host at a glance: its CPU, memory and storage, and its containers and virtual machines.</em>
+</p>
+
 ---
 
 ## Claude Access: AI on your servers, safely
@@ -28,11 +37,29 @@ Claude reaches your hosts only through this app, and only as far as each host's 
 | Files | copying files to and from guests | Off |
 | Host commands | shell commands on the Proxmox host (SSH) | Off |
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/access-dark.webp">
+    <img src="docs/img/access-light.webp" width="600" alt="The Claude Access window: the Claude apps connected, and the switches of a host — Read On, Power and Change Ask, the rest Off">
+  </picture>
+  <br>
+  <em>The Claude Access window: the Claude apps it connected, and one host's switches.</em>
+</p>
+
 Each switch is **Off** (refused), **Ask** (a window asks you: *Allow*, *Allow this kind for an hour*, or *Deny*) or
 **On**. The approval window wears yellow-and-black warning stripes, so it is never lost among other windows.
 Claude never sees a password: where one is needed, the app asks **you** for it in its own window. Every request is
 logged with the reason Claude gave. Claude's token on each host holds only the Proxmox privileges its open switches
 need. The full list of tools is in [docs/claude-access.md](docs/claude-access.md).
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/ask-dark.webp">
+    <img src="docs/img/ask-light.webp" width="700" alt="The approval window, framed in warning stripes: Claude Desktop asks to start VM 101, with its reason, and Deny, Allow This Kind for 1 Hour and Allow">
+  </picture>
+  <br>
+  <em>An approval window: Claude asks to start a VM and says why. You answer.</em>
+</p>
 
 It works with Claude Desktop and Claude Code (the app connects them for you).
 
@@ -52,6 +79,15 @@ Everything works without Claude too:
 - **Install Guest Agent** — for VMs that lack it, typed into their console for you.
 - **Snapshots, backups, scheduled backup jobs, graphs.**
 - **Updates** — a striped tab tells you when a new version is out; one click installs it.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/newvm-dark.webp">
+    <img src="docs/img/newvm-light.webp" width="450" alt="The New VM window: an Ubuntu Server ISO that installs itself, with a user, CPU cores, memory, disk and network">
+  </picture>
+  <br>
+  <em>A new VM from an Ubuntu Server ISO that installs itself — nothing to answer.</em>
+</p>
 
 ## Install
 
