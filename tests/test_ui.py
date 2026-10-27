@@ -3687,6 +3687,11 @@ class ConnectorTest(UiCase):
         self.assertEqual((tool.also_of({}), tool.also_of({"start": True})), ((), ("power",)))  # lent only for a start
 
     def test_password_typed_by_the_user(self):
+        # the pretend VM's agent answers at once, so the app would take the setup disc away (as it should) before
+        # this test reads what reached it — on a slow machine it did
+        keep = mock.patch.object(setupdisc, "tidy", lambda pve, discs, guests: (set(), []))
+        keep.start()
+        self.addCleanup(keep.stop)
         self.admin.cluster.images.append("local:import/ubuntu-24.04-server-cloudimg-amd64.qcow2")
         claude_policy.set_switch(self.win.settings, "demo-pve", "change", "on")  # On — the password is asked anyway
         box = self.request("create_cloud_vm", wait=False, host="demo-pve", name="web",
