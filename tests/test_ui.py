@@ -3046,6 +3046,14 @@ class HostShellTest(UiCase):
         self.assertEqual(self.titles[-1], f"Proxmox Upgrade — {view.host.name}")
         dlg.close()
 
+    def test_upgrade_counted_in_the_computer_s_first_half_hour(self):
+        # time.monotonic() counts from the computer's start: a minute after it, the count still comes at once (it waited
+        # for the first half hour to pass: a fresh machine — every GitHub runner — showed a bare "Upgrade")
+        with mock.patch.object(host_view, "time", types.SimpleNamespace(monotonic=lambda: 60.0)):
+            view = self.loaded_view()
+            self.addCleanup(view.close)
+            self.assertTrue(wait_until(lambda: view.upgrade_btn.text() == "Upgrade (1)"))
+
     def test_first_console_asks_for_ssh_first(self):
         view = self.loaded_view()
         self.addCleanup(view.close)

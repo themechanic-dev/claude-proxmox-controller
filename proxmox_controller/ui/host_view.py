@@ -236,7 +236,9 @@ class HostView(QWidget):
         super().__init__()
         self.host = host
         self.on_host_changed = on_host_changed or (lambda: None)  # the host's own settings changed here (SSH): save
-        self.updates_at = 0.0  # when the waiting package updates were last counted (for the Upgrade button)
+        # when the waiting package updates were last counted (for the Upgrade button); None: not yet — not 0.0, since
+        # time.monotonic() counts from the computer's start, and in its first half hour that read as just counted
+        self.updates_at: float | None = None
         self.make_client = make_client
         self.runner = runner
         self.notify = notify
@@ -772,7 +774,7 @@ class HostView(QWidget):
         self.reboot_btn.setEnabled(bool(self.online))
         self.console_btn.setEnabled(bool(self.online))
         self.upgrade_btn.setEnabled(bool(self.online))
-        if self.online and time.monotonic() - self.updates_at > UPDATES_EVERY_S:
+        if self.online and (self.updates_at is None or time.monotonic() - self.updates_at > UPDATES_EVERY_S):
             self._count_updates()
         self.new_btn.setEnabled(bool(self.online))
         self.new_vm_btn.setEnabled(bool(self.online))
