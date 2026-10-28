@@ -47,6 +47,7 @@ class FakePveServer:
     def __init__(self):
         self.cluster = FakeCluster()
         self.requests: list[tuple[str, str, str]] = []  # (method, path, auth header)
+        self.drop: list[str] = []  # the next requests whose path ends so get no answer: the connection just closes
         self.consoles: list[FakeVncServer] = []
         self.tmp = tempfile.TemporaryDirectory()
         key, cert = Path(self.tmp.name) / "key.pem", Path(self.tmp.name) / "cert.pem"
@@ -102,6 +103,10 @@ class FakePveServer:
                 auth = self.headers.get("Authorization", "")
                 path = unquote(parts.path.removeprefix("/api2/json"))
                 server.requests.append((self.command, path, auth))
+                if server.drop and path.endswith(server.drop[0]):  # an answer lost on the way (the network)
+                    server.drop.pop(0)
+                    self.close_connection = True
+                    return
                 if self.headers.get("Upgrade", "").lower() == "websocket" and path.endswith("/vncwebsocket"):
                     self._console(path, params, auth)
                     return

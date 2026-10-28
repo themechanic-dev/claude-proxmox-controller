@@ -30,6 +30,8 @@ KINDS = ("lxc", "qemu")  # containers, virtual machines
 GUEST_ACTIONS = ("start", "shutdown", "stop", "reboot")
 DISK_CONTENT = ("images", "rootdir")  # VM disks, container disks
 NETWORK_STORAGE = ("cifs", "nfs", "cephfs", "rbd", "iscsi", "iscsidirect", "glusterfs", "pbs", "esxi")
+TASK_READ_TRIES = 4  # a task followed to its end: an answer lost on the way is asked for again, this many times in all
+TASK_RETRY_WAIT_S = 1.0  # ... waiting 1, 2, then 4 seconds between them
 
 
 def storage_order(storage: dict, content: str | None = None) -> tuple:
@@ -51,6 +53,10 @@ class PveError(Exception):
 
 class CertificateMismatch(PveError):
     """The host presented a different certificate than the one that was confirmed."""
+
+
+class ConnectionFailed(PveError):
+    """The host could not be reached, or the connection broke before its answer: the network, not the API."""
 
 
 @dataclass
@@ -150,7 +156,7 @@ class Pve:
             conn.connect()
         except (OSError, ssl.SSLError) as e:
             conn.close()
-            raise PveError(f"Could not reach {h.hostname}:{h.port} — {e}") from e
+            raise ConnectionFailed(f"Could not reach {h.hostname}:{h.port} — {e}") from e
         presented = format_fingerprint(conn.sock.getpeercert(binary_form=True))
         if presented != normalize_fingerprint(h.fingerprint):
             conn.close()
@@ -196,7 +202,7 @@ class Pve:
             resp = conn.getresponse()
             raw = resp.read()
         except (OSError, http.client.HTTPException) as e:
-            raise PveError(f"The connection to {self.host.name} failed — {e}") from e
+            raise ConnectionFailed(f"The connection to {self.host.name} failed — {e}") from e
         finally:
             conn.close()
         return self._answer(resp.status, resp.reason, raw)
@@ -656,13 +662,14 @@ class Pve:
 
     def wait_task(self, node: str, upid: str, timeout: float = 600.0, poll: float = 1.0, on_log=None) -> dict:
         """Wait for a task to finish. Raises PveError if it failed or took too long. `on_log(line)` hears each new
-        line of the task's log (a backup's progress) as it comes."""
+        line of the task's log (a backup's progress) as it comes. A lost answer is asked for again (_read_again):
+        the task goes on in Proxmox whatever happens to one of these reads."""
         end = time.monotonic() + timeout
         seen = 0
         while True:
-            st = self.task_status(node, upid)
+            st = self._read_again(lambda: self.task_status(node, upid))
             if on_log is not None:  # after the status: a finished task's last lines are read too
-                for entry in self.task_log(node, upid, start=seen):
+                for entry in self._read_again(lambda: self.task_log(node, upid, start=seen)):
                     seen = max(seen, int(entry.get("n", seen)))
                     if entry.get("t") not in (None, "", "no content"):
                         on_log(str(entry["t"]))
@@ -673,6 +680,19 @@ class Pve:
             if time.monotonic() > end:
                 raise PveError("The task is still running after the time limit; check it in Proxmox.")
             time.sleep(poll)
+
+    @staticmethod
+    def _read_again(read):
+        """read(), tried again when its answer was lost on the way (ConnectionFailed) — a few times, waiting longer
+        each time. What the API itself answers (a refusal, an error) goes up at once, and so does a certificate
+        that changed."""
+        for attempt in range(TASK_READ_TRIES):
+            try:
+                return read()
+            except ConnectionFailed:
+                if attempt == TASK_READ_TRIES - 1:
+                    raise
+                time.sleep(TASK_RETRY_WAIT_S * 2 ** attempt)
 
     # -- inside a VM, through the QEMU guest agent ---------------------------------------------------
 

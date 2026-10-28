@@ -33,9 +33,10 @@ from proxmox_controller.core.fakevnc import FakeVncServer
 from proxmox_controller.core.rfb import RfbClient, RfbError, qnum_from_evdev, qnum_from_windows
 from proxmox_controller.core.websocket import WebSocket
 from proxmox_controller.core.demo import DEMO_HOSTS, DemoPve
-from proxmox_controller.core.pve import (CertificateMismatch, Host, Pve, PveError, agent_enabled, fetch_fingerprint,
-                                         format_fingerprint, guest_macs, normalize_fingerprint, split_address,
-                                         storage_order, upload_name)
+from proxmox_controller.core import pve as pve_mod
+from proxmox_controller.core.pve import (CertificateMismatch, ConnectionFailed, Host, Pve, PveError, agent_enabled,
+                                         fetch_fingerprint, format_fingerprint, guest_macs, normalize_fingerprint,
+                                         split_address, storage_order, upload_name)
 
 try:
     from tests.fake_server import FakePveServer, openssl_available
@@ -91,6 +92,32 @@ class ApiTest(unittest.TestCase):
 
     def tearDown(self):
         self.srv.close()
+
+    def test_a_lost_answer_while_waiting_for_a_task_is_asked_for_again(self):
+        fast = mock.patch.object(pve_mod, "TASK_RETRY_WAIT_S", 0.01)
+        fast.start()
+        self.addCleanup(fast.stop)
+        upid = self.pve.guest_action("pve", "lxc", 102, "start")
+        self.srv.drop = ["/status", "/status"]  # two answers lost on the way: the task goes on in Proxmox meanwhile
+        self.assertEqual(self.pve.wait_task("pve", upid, timeout=5)["exitstatus"], "OK")
+        self.assertEqual(self.srv.drop, [])
+        lines = []  # the log's reads too
+        upid = self.pve.guest_action("pve", "lxc", 102, "shutdown")
+        self.srv.drop = ["/log"]
+        self.pve.wait_task("pve", upid, timeout=5, poll=0.05, on_log=lines.append)
+        self.assertEqual(self.srv.drop, [])
+        # lost every time: it gives up after TASK_READ_TRIES reads, as a connection error
+        self.srv.drop = ["/status"] * pve_mod.TASK_READ_TRIES
+        before = len(self.srv.requests)
+        with self.assertRaises(ConnectionFailed):
+            self.pve.wait_task("pve", upid, timeout=5)
+        self.assertEqual(len(self.srv.requests) - before, pve_mod.TASK_READ_TRIES)
+        # what the API answers is not asked again: an unknown task is one request, and the error goes up at once
+        before = len(self.srv.requests)
+        with self.assertRaises(PveError) as e:
+            self.pve.wait_task("pve", "UPID:pve:00000000:00000000:00000000:qmstart:999:root@pam:", timeout=5)
+        self.assertNotIsInstance(e.exception, ConnectionFailed)
+        self.assertEqual(len(self.srv.requests) - before, 1)
 
     def test_fetch_fingerprint_matches_certificate(self):
         self.assertEqual(fetch_fingerprint(self.srv.address), self.fp)
