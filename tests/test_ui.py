@@ -2098,7 +2098,9 @@ class ConsoleTest(UiCase):
             self.assertFalse(dlg.enter.isChecked())  # no Enter at the end unless ticked
             dlg.type_btn.click()
             self.assertTrue(wait_until(lambda: not shiboken6.isValid(dlg) or not dlg.isVisible()))
-            self.assertEqual(self.typed(srv), "echo '' > /tmp/A.txt\ncat /tmp/A.txt")
+            # (the last keys may still be on their way to the console when the window closes: Windows, CI 28/10)
+            self.assertTrue(wait_until(lambda: self.typed(srv) == "echo '' > /tmp/A.txt\ncat /tmp/A.txt"),
+                            self.typed(srv))
             self.assertEqual([k[2] for k in srv.keys if k[2] == screen_core.SHIFT][:2], [screen_core.SHIFT] * 2)
             self.assertTrue(wait_until(lambda: win.status.text() == "Connected"))
             n = len(srv.keys)

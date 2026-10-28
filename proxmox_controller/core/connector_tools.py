@@ -1407,10 +1407,11 @@ def _send(ctx: Context, a: dict):
 # -- Commands --------------------------------------------------------------------------------------
 
 # a command as one of the guest's users (the agent runs everything as root): their own HOME and folder; runuser comes
-# with util-linux, so with every common distribution
+# with util-linux, so with every common distribution. (/etc/passwd where there is no getent)
 RUN_AS = r"""
 u=$1; shift
-h=$(getent passwd "$u" | cut -d: -f6)
+h=$(getent passwd "$u" 2>/dev/null | cut -d: -f6)
+[ -n "$h" ] || h=$(awk -F: -v u="$u" '$1 == u { print $6; exit }' /etc/passwd 2>/dev/null)
 [ -n "$h" ] || { echo "There is no user $u in this VM." >&2; exit 125; }
 command -v runuser >/dev/null 2>&1 || { echo "runuser is not in this VM." >&2; exit 125; }
 cd -- "$h" 2>/dev/null || cd /
