@@ -1205,9 +1205,8 @@ class ContainerFiles:
                 raise Cancelled()
             done[0] += n
             progress(done[0], total, "ssh")
-        try:
+        try:  # (communicate() below flushes and closes stdin: closed here first, Python 3.12 fails on its flush)
             write_tar(paths, _Counting(proc.stdin, counted))
-            proc.stdin.close()
         except (Cancelled, BrokenPipeError) as e:
             proc.kill()
             if isinstance(e, Cancelled):
