@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import json
 import sys
+import time
 from concurrent.futures import Future
 from typing import Callable
 
@@ -31,8 +32,28 @@ REFUSED_403 = ("Proxmox refused it: Claude's token has no privilege for this. Th
                "Claude's access on this host needs Set Up again (Proxmox Controller → Claude Access).")
 
 
+NEW_GUEST_TOOLS = ("create_vm", "create_cloud_vm", "create_container")  # their vmid is the new guest's, still free
+
+
 def not_off(switches: dict) -> frozenset:
     return frozenset(k for k in claude_policy.KEYS if switches.get(k, OFF) != OFF)
+
+
+def guests_of(tool, args: dict) -> list[int] | None:
+    """The guests a request is about — hours given on it are for them alone (the user, 28/10) — or None for a request
+    about no guest: a new VM or container (its ID still free), an ISO, a task, the host."""
+    if isinstance(args.get("vmids"), list) and args["vmids"]:
+        return sorted({int(v) for v in args["vmids"]})
+    if isinstance(args.get("vmid"), int) and tool.name not in NEW_GUEST_TOOLS:
+        return [args["vmid"]]
+    return None
+
+
+def guests_words(guests: list[int] | None) -> str:
+    """'108' · '108, 109' · '5 guests' — the guests' numbers only (the user's, 28/10), or '' for none."""
+    if not guests:
+        return ""
+    return ", ".join(map(str, guests)) if len(guests) <= 3 else f"{len(guests)} guests"
 
 
 def refused_403(e: PveError) -> str:
@@ -92,7 +113,8 @@ class ApprovalDialog(QDialog):
 
     def __init__(self, client: str, host: Host, kind: str, what: str, details: list[str], reason: str,
                  timeout_s: int = ASK_TIMEOUT_S, secret_prompt: str = "", secret_repeat: bool = True,
-                 secret_min: int = 1, picture: bytes | None = None, state: str = ASK):
+                 secret_min: int = 1, picture: bytes | None = None, state: str = ASK,
+                 guests: list[int] | None = None):
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle("Claude asks — Proxmox Controller")
         self.setModal(False)
@@ -145,9 +167,18 @@ class ApprovalDialog(QDialog):
         row = QHBoxLayout()
         self.deny_btn = button("Deny")
         self.hour_btn = QToolButton()  # a click: 1 hour; the arrow: 3, 8 or 12 — as the host page's Console button
-        self.hour_btn.setText("Allow This Kind for 1 Hour")
-        self.hour_btn.setToolTip(f"Further {claude_policy.TITLES.get(kind, kind)} requests on {host.name} are allowed "
-                                 "without asking for the next hour — the arrow: 3, 8 or 12 hours (while the app runs).")
+        title, where = claude_policy.TITLES.get(kind, kind), guests_words(guests)
+        if where:  # hours for these guests only: another one is asked about again (the user, 28/10)
+            self.hour_btn.setText(f"Allow on {where} for 1 Hour")
+            self.hour_btn.setToolTip(f"Further {title} requests for {'guest' if len(guests) == 1 else 'guests'} "
+                                     f"{where} on {host.name} are allowed without asking for the next hour — the "
+                                     "arrow: 3, 8 or 12 hours (while the app runs). Other guests are still asked "
+                                     "about.")
+        else:
+            self.hour_btn.setText("Allow Requests Like This for 1 Hour")
+            self.hour_btn.setToolTip(f"Further {title} requests on {host.name} that are about no guest (a new VM, an "
+                                     "ISO, the host) are allowed without asking for the next hour — the arrow: 3, 8 "
+                                     "or 12 hours (while the app runs). Requests about a guest are still asked about.")
         self.hour_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.hour_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.hour_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -345,7 +376,8 @@ class Connector(QObject):
                 return self._done(entry, "allowed", ok_result(self.on_gui(self._hosts_info)))
             kind = tool.kind_of(args)
             entry["kind"] = kind
-            info = self.on_gui(lambda: self._prepare(args.get("host", ""), kind))
+            guests = guests_of(tool, args)
+            info = self.on_gui(lambda: self._prepare(args.get("host", ""), kind, guests))
             host = info["host"]
             entry["host"] = host.name
             ctx = Context(host=host, pve=self.make_client(info["claude"]), admin=self.make_client(host),
@@ -368,11 +400,11 @@ class Connector(QObject):
             if info["state"] == ASK or prompt:  # a password is always asked of the user, whatever the switch
                 repeat = tool.repeat_secret(args)
                 fut = self.on_gui(lambda: self._ask(key, client, host, kind, what, details, args.get("reason", ""),
-                                                    prompt, tool, picture, info["state"], repeat))
+                                                    prompt, tool, picture, info["state"], repeat, guests))
                 answer, ctx.secret = fut.result(ASK_TIMEOUT_S + 30)
                 hours = allowed_hours(answer)
-                if hours:
-                    self.on_gui(lambda: self.allowances.grant(host.id, kind, hours * 3600))
+                if hours:  # for this request's guests alone
+                    self.on_gui(lambda: self.allowances.grant(host.id, kind, hours * 3600, guests))
                 if answer != "allow" and not hours:
                     raise Refused({"deny": "The user denied it.",
                                    "timeout": f"No answer from the user within {ASK_TIMEOUT_S // 60} minutes: not done.",
@@ -428,15 +460,26 @@ class Connector(QObject):
         out = []
         for h in self.win.hosts:
             ready = bool(self.tokens.get(h.id))
-            out.append({"host": h.id, "name": h.name, "address": h.address,
-                        "online": {"online": True, "offline": False}.get(self.win.state.get(h.id, "")),
-                        "claude_access_set_up": ready,
-                        "allowed": claude_policy.host_switches(self.win.settings, h.id) if ready else None})
-        return {"hosts": out, "note": "off: refused · ask: the user approves each request · on: done at once. A host "
-                                      "whose Claude access is not set up cannot be used (the user sets it up in "
-                                      "Proxmox Controller → Claude Access)."}
+            one = {"host": h.id, "name": h.name, "address": h.address,
+                   "online": {"online": True, "offline": False}.get(self.win.state.get(h.id, "")),
+                   "claude_access_set_up": ready,
+                   "allowed": claude_policy.host_switches(self.win.settings, h.id) if ready else None}
+            hours = {}
+            for k in claude_policy.KEYS:
+                given = {str(v) if v is not None else "no guest": time.strftime(
+                    "%H:%M", time.localtime(time.time() + left)) for v, left in self.allowances.given(h.id, k)}
+                if given:
+                    hours[k] = given
+            if ready and hours:
+                one["hours_given"] = hours
+            out.append(one)
+        return {"hosts": out, "note": "off: refused · ask: the user approves each request · on: done at once. "
+                                      "hours_given: what the user allowed without asking until a time (local), for "
+                                      "those guests only — any other guest is asked about. A host whose Claude access "
+                                      "is not set up cannot be used (the user sets it up in Proxmox Controller → "
+                                      "Claude Access)."}
 
-    def _prepare(self, host_id: str, kind: str) -> dict:
+    def _prepare(self, host_id: str, kind: str, guests: list[int] | None = None) -> dict:
         if not claude_policy.enabled(self.win.settings):
             raise Refused("Claude's access is turned off in Proxmox Controller (Claude Access → the switch at the "
                           "top).")
@@ -447,7 +490,7 @@ class Connector(QObject):
         if not secret:
             raise Refused(f"Claude's access is not set up on {host.name} (Proxmox Controller → Claude Access → Set "
                           "Up).", "not-set-up")
-        state = claude_policy.decide(self.win.settings, host.id, kind, self.allowances)
+        state = claude_policy.decide(self.win.settings, host.id, kind, self.allowances, guests)
         claude = Host(id=host.id, name=host.name, address=host.address, token_id=claude_access.TOKEN_ID,
                       token_secret=secret, fingerprint=host.fingerprint, mac=host.mac, broadcast=host.broadcast)
         return {"state": state, "host": host, "claude": claude,
@@ -455,12 +498,12 @@ class Connector(QObject):
 
     def _ask(self, key: str, client: str, host: Host, kind: str, what: str, details: list[str], reason: str,
              prompt: str = "", tool=None, picture: bytes | None = None, state: str = ASK,
-             repeat: bool = True) -> Future:
+             repeat: bool = True, guests: list[int] | None = None) -> Future:
         """The approval window; the future gets (answer, the password typed — or "")."""
         fut: Future = Future()
         dlg = ApprovalDialog(client, host, kind, what, details, reason, secret_prompt=prompt,
                              secret_repeat=repeat, secret_min=getattr(tool, "secret_min", 1),
-                             picture=picture, state=state)
+                             picture=picture, state=state, guests=guests)
         self.approvals[key] = dlg
 
         def decided(answer: str) -> None:

@@ -891,6 +891,10 @@ class ScreenTest(unittest.TestCase):
         self.assertEqual(screen.click(wide_opener, 866, 0), (2598, 0))  # the picture's last column
         with self.assertRaises(ValueError):
             screen.click(wide_opener, 867, 0)
+        cw, ch, part = screen.crop(4, 3, bytes(range(48)), 1, 1, 9, 2)  # kept inside the screen
+        self.assertEqual((cw, ch, part), (3, 1, bytes(range(20, 32))))
+        with self.assertRaises(ValueError):
+            screen.crop(4, 3, bytes(48), 4, 0, 6, 2)
         w, h = 64, 48
         marked = screen.mark(w, h, bytes(w * h * 4), 32, 24)
         px = lambda x, y: marked[(y * w + x) * 4:(y * w + x) * 4 + 4]  # noqa: E731
@@ -982,11 +986,27 @@ class ClaudeAccessTest(unittest.TestCase):
         # (the eighth, Host commands, 17/10: Off for every new host — root on the host is the most there is)
         allow = claude_policy.Allowances()
         self.assertEqual(allow.remaining("h", "power"), 0)
-        allow.grant("h", "power", 60)
+        allow.grant("h", "power", 60)  # given on a request about no guest (a new VM, an ISO, the host)
         self.assertEqual(claude_policy.decide(settings, "h", "power", allow), "on")  # "for 1 hour"
         self.assertTrue(59 < allow.remaining("h", "power") <= 60)
+        self.assertEqual(claude_policy.decide(settings, "h", "power", allow, [108]), "ask")  # never for a guest
         self.assertEqual(claude_policy.TEMP_ALLOW_HOURS, (1, 3, 8, 12))  # the arrow's choices (the user's, 19/10)
         self.assertEqual(claude_policy.decide(settings, "other", "power", allow), "ask")
+        # hours given for guest 108 are for 108 alone (the user, 28/10): 109 is asked about again
+        allow.grant("h", "console", 120, [108])
+        self.assertEqual([claude_policy.decide(settings, "h", "console", allow, g) for g in ([108], [109], None)],
+                         ["off"] * 3)  # (Console is Off by default: hours count only under Ask)
+        claude_policy.set_switch(settings, "h", "console", "ask")
+        self.assertEqual([claude_policy.decide(settings, "h", "console", allow, g) for g in ([108], [109], None)],
+                         ["on", "ask", "ask"])
+        self.assertEqual(claude_policy.decide(settings, "h", "console", allow, [108, 109]), "ask")  # each one
+        allow.grant("h", "console", 30, [109, 110])
+        self.assertEqual(claude_policy.decide(settings, "h", "console", allow, [108, 109]), "on")
+        self.assertTrue(29 < allow.remaining("h", "console", [108, 109]) <= 30)  # the shortest of them
+        self.assertEqual([v for v, _ in allow.given("h", "console")], [108, 109, 110])
+        self.assertEqual([v for v, _ in allow.given("h", "power")], [None])
+        allow.end("h", "console")  # a click on the switch ends every guest's hours of that kind
+        self.assertEqual((allow.given("h", "console"), allow.remaining("h", "power") > 0), ([], True))
         claude_policy.set_switch(settings, "h", "power", "off")
         self.assertEqual(claude_policy.decide(settings, "h", "power", allow), "off")  # Off beats an hour granted
         with self.assertRaises(ValueError):
@@ -1439,14 +1459,22 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertEqual((data["ssh_authorized_keys"], data["packages"]), (["ssh-ed25519 AAAA me@pc"],
                                                                           ["qemu-guest-agent"]))
         self.assertNotIn("rdp-password", files)
+        self.assertEqual((data["user"]["sudo"], made["sudo"]), ("ALL=(ALL) ALL", "asks for the user's password"))
+        self.assertIn("sudo asks for that password", self.words("create_cloud_vm", host="demo-pve", name="w3",
+                                                                image=image, reason="r")[1][1])
+        self.assertIn("sudo without a password", self.words("create_cloud_vm", host="demo-pve", name="w3",
+                                                            image=image, sudo_asks_password=False, reason="r")[1][1])
         self.assertIn("installs the updates and the QEMU guest agent", " ".join(made["next_steps"]))
         self.assertIn(f"import-from={image}", cfg["scsi0"])
         self.assertEqual((self.cluster.guests[vmid]["disk_gb"], self.status(vmid)), (20, "running"))
         self.assertNotIn("tablet", cfg)  # the server edition: the default display, which keeps Proxmox's tablet
         self.assertEqual(cfg["cpu"], "x86-64-v2-AES")  # not the API's kvm64
         desk = self.run_tool("create_cloud_vm", secret="x", host="demo-pve", name="desk", image=image,
-                             edition="desktop", start=False, reason="r")
+                             edition="desktop", start=False, sudo_asks_password=False, reason="r")
         dcfg = self.pve.guest_config("pve", "qemu", desk["vmid"])
+        _, dfiles = read_iso(self.cluster.files[dcfg["ide2"].split(",")[0].split("/")[1]], joliet=True)
+        self.assertNotIn("sudo", json.loads(dfiles["user-data"].decode().split("\n", 1)[1])["user"])
+        self.assertEqual(desk["sudo"], "no password")
         self.assertEqual((dcfg["vga"], dcfg["memory"], dcfg["cores"], dcfg["cpu"], self.status(desk["vmid"])),
                          ("qxl", 8192, 4, "host", "stopped"))
         self.assertEqual(str(dcfg["tablet"]), "1")  # SPICE would leave it out
@@ -1866,6 +1894,45 @@ class ConnectorToolsTest(unittest.TestCase):
             with self.assertRaises(connector_tools.ToolError) as caught:  # a container: over the host's SSH key
                 self.run_tool("list_guest_files", host="demo-pve", vmid=100, reason="r")
             self.assertIn("SSH with this app's key is not set up", str(caught.exception))
+
+    def test_screenshot_region(self):
+        def decoded(image):  # (width, height, rows of red-green-blue bytes)
+            w, h = struct.unpack(">II", image[16:24])
+            raw = zlib.decompress(image[image.index(b"IDAT") + 4:image.index(b"IEND") - 8])
+            return w, h, [raw[y * (1 + w * 3) + 1:(y + 1) * (1 + w * 3)] for y in range(h)]
+
+        # 720×400 is shown whole: a region is the same pixels, cut out
+        part = self.run_tool("console_screenshot", host="demo-pve", vmid=201, region=[10, 20, 110, 70], reason="r")
+        self.assertEqual(decoded(part.png)[:2], (100, 50))
+        self.assertIn("the screen's own pixels", part.text)
+        self.assertIn("10 + px, 20 + py of the whole picture", part.text)
+        self.assertEqual(self.words("console_screenshot", host="demo-pve", vmid=201, region=[10, 20, 110, 70],
+                                    reason="r")[1], ["Only the part from 10, 20 to 110, 70, at full size."])
+        for bad in ([5, 5, 5, 10], [0, 0, 10], [0, 0, 10, True], [-1, 0, 10, 10], [10, 10, 5, 20]):
+            with self.assertRaises(connector_tools.ToolError):
+                self.words("console_screenshot", host="demo-pve", vmid=201, region=bad, reason="r")
+        with self.assertRaises(connector_tools.ToolError):
+            self.run_tool("console_screenshot", host="demo-pve", vmid=201, region=[720, 0, 800, 10], reason="r")
+        # 2600 wide is shown a third as wide: the region comes back at the screen's own pixels
+        w, h = 2600, 300
+        pixels = b"".join(bytes((x % 256, x // 256, y % 256, 0)) for y in range(h) for x in range(w))
+        with mock.patch.object(connector_tools.screen, "capture", return_value=(w, h, pixels)):
+            part = self.run_tool("console_screenshot", host="demo-pve", vmid=201, region=[100, 10, 140, 30],
+                                 reason="r")
+            pw, ph, rows = decoded(part.png)
+            self.assertEqual((pw, ph), (120, 60))  # 40×20 of the picture = 120×60 of the screen
+            self.assertEqual(tuple(rows[0][:3]), (30, 300 // 256, 300 % 256))  # its first pixel: x 300, y 30
+            self.assertEqual(tuple(rows[-1][-3:]), (89, 419 // 256, 419 % 256))  # its last: x 419, y 89
+            self.assertIn("100 + px × 1/3, 10 + py × 1/3", part.text)
+            edge = self.run_tool("console_screenshot", host="demo-pve", vmid=201, region=[800, 0, 900, 50],
+                                 reason="r")
+            self.assertEqual(decoded(edge.png)[:2], (200, 150))  # kept inside the screen: x 2400–2599
+            whole = self.run_tool("console_screenshot", host="demo-pve", vmid=201, region=[0, 0, 866, 100],
+                                  reason="r")
+            self.assertEqual(decoded(whole.png)[:2], (866, 100))  # as wide as the whole: shrunk as the whole
+            self.assertIn("0 + px, 0 + py of the whole picture", whole.text)
+            with self.assertRaises(connector_tools.ToolError):
+                self.run_tool("console_screenshot", host="demo-pve", vmid=201, region=[867, 0, 900, 10], reason="r")
 
     def test_console_and_commands(self):
         picture = self.run_tool("console_screenshot", host="demo-pve", vmid=201, reason="r")
@@ -3698,7 +3765,8 @@ class CloudSeedTest(unittest.TestCase):
     def test_desktop_with_remote_desktop(self):
         cfg = self.config(remote_desktop=True)
         self.assertEqual((cfg["user"], cfg["users"], cfg["hostname"], cfg["fqdn"]),
-                         ({"name": "nikos", "gecos": "nikos"}, ["default"], "desk", "desk.lan"))
+                         ({"name": "nikos", "gecos": "nikos", "sudo": "ALL=(ALL) ALL"}, ["default"], "desk",
+                          "desk.lan"))
         salt = cfg["password"].split("$")[2]
         self.assertEqual(cfg["password"], cloudseed.sha512_crypt("Pw-1234", salt))
         self.assertEqual(cfg["ssh_authorized_keys"], ["ssh-ed25519 AAAA me@pc"])
@@ -3806,9 +3874,19 @@ class CloudSeedTest(unittest.TestCase):
         for desktop_only in ("gnome-initial-setup", "NetworkManager", "dconf", "grdctl"):
             self.assertNotIn(desktop_only, dumped)
         files = cloudseed.seed_files(vm_name="srv", vmid=7, user="u", password="", ssh_keys=["ssh-ed25519 K"],
-                                     desktop=False)
+                                     desktop=False, sudo_password=False)
         self.assertIn("network-config", files)  # the same address after a restart, a server too
         self.assertNotIn(b'"password"', files["user-data"])  # an SSH key alone: no password at all
+
+    def test_sudo_asks_for_the_password(self):
+        self.assertEqual(self.config()["user"]["sudo"], "ALL=(ALL) ALL")  # as a normal Ubuntu (27/10)
+        self.assertEqual(self.config(desktop=False)["user"]["sudo"], "ALL=(ALL) ALL")  # a server too
+        self.assertNotIn("NOPASSWD", json.dumps(self.config()))
+        self.assertNotIn("sudo", self.config(sudo_password=False)["user"])  # the image's own: no password asked
+        with self.assertRaises(ValueError):  # an SSH key alone: sudo would ask for a password there is not
+            cloudseed.user_data(vm_name="d", user="u", password="", ssh_keys=["ssh-ed25519 K"], desktop=False)
+        self.assertNotIn('"password"', cloudseed.user_data(vm_name="d", user="u", password="", ssh_keys=["k"],
+                                                           desktop=False, sudo_password=False))
 
     def test_meta_data(self):
         one, two = (json.loads(cloudseed.meta_data("desk.lan", 120)) for _ in range(2))

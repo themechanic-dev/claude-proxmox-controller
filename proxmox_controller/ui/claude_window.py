@@ -24,25 +24,20 @@ LOG_ROWS = 200
 
 
 class SwitchRow:
-    """Off / Ask / On for one kind of request."""
+    """Off / Ask / On for one kind of request, and under it the hours given in approval windows: each guest's number
+    with the time its hours end (the user's, 28/10: clearly, the number only)."""
 
     def __init__(self, grid: QGridLayout, row: int, key: str, title: str, text: str, changed):
         self.key = key
-        head = QHBoxLayout()
-        head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(8)
-        head.addWidget(label(f"<b>{title}</b>"))
-        self.grant = label("", "grant")  # what the approval window's "Allow This Kind for … Hours" gave
-        self.grant.setToolTip("Given in an approval window, while the app runs. Click Off, Ask or On to end it now.")
-        self.grant.hide()
-        head.addWidget(self.grant)
-        head.addStretch(1)
-        title_holder = QWidget()
-        title_holder.setLayout(head)
-        grid.addWidget(title_holder, row * 2, 0)
+        grid.addWidget(label(f"<b>{title}</b>"), row * 3, 0)
         caption = label(text, "caption")  # one line: wrapped labels in a grid overlapped the next row
         caption.setToolTip(text)
-        grid.addWidget(caption, row * 2 + 1, 0)
+        grid.addWidget(caption, row * 3 + 1, 0)
+        self.grant = label("", "grant")  # what the approval windows' "Allow on … for N Hours" gave (one line too)
+        self.grant.setToolTip("Given in approval windows, for those guests only, while the app runs. Click Off, Ask "
+                              "or On to end them all now.")
+        self.grant.hide()
+        grid.addWidget(self.grant, row * 3 + 2, 0, 1, 2)
         box = QHBoxLayout()
         box.setSpacing(4)
         self.group = QButtonGroup()
@@ -59,19 +54,21 @@ class SwitchRow:
         holder = QWidget()
         holder.setLayout(box)
         box.setContentsMargins(0, 0, 0, 0)
-        grid.addWidget(holder, row * 2, 1, 2, 1, Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(holder, row * 3, 1, 2, 1, Qt.AlignmentFlag.AlignVCenter)
 
     def show(self, state: str, enabled: bool) -> None:
         self.buttons[state].setChecked(True)
         for b in self.buttons.values():
             b.setEnabled(enabled)
 
-    def show_grant(self, left: float) -> None:
-        """Seconds left of the hours given (0: none)."""
-        if left > 0:
-            until = time.strftime("%H:%M", time.localtime(time.time() + left))
-            self.grant.setText(f"· allowed without asking until {until}")
-        self.grant.setVisible(left > 0)
+    def show_grant(self, given: list[tuple[int | None, float]]) -> None:
+        """The hours running now: (guest — None for requests about no guest —, seconds left)."""
+        if given:
+            now = time.time()
+            self.grant.setText("Allowed without asking:  " + "  ·  ".join(
+                f"{vmid if vmid is not None else 'requests about no guest'} until "
+                f"{time.strftime('%H:%M', time.localtime(now + left))}" for vmid, left in given))
+        self.grant.setVisible(bool(given))
 
 
 class ClaudeWindow(QDialog):
@@ -282,7 +279,7 @@ class ClaudeWindow(QDialog):
     def show_grants(self) -> None:
         h = self.current_host()
         for r in self.rows:
-            r.show_grant(self.connector.allowances.remaining(h.id, r.key) if h else 0)
+            r.show_grant(self.connector.allowances.given(h.id, r.key) if h else [])
 
     # -- changes -------------------------------------------------------------------------------------
 
@@ -308,7 +305,7 @@ class ClaudeWindow(QDialog):
         if h is None:
             return
         claude_policy.set_switch(self.settings(), h.id, key, state)
-        self.connector.allowances.until.pop((h.id, key), None)  # hours given end with any click here (Ask too)
+        self.connector.allowances.end(h.id, key)  # hours given end with any click here (Ask too), every guest's
         self.win._save_settings()
         self.show_host()
         if self.connector.tokens.get(h.id):

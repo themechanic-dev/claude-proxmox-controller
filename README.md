@@ -48,8 +48,8 @@ Claude reaches your hosts only through this app, and only as far as each host's 
   <em>The Claude Access window: the Claude apps it connected, and one host's switches.</em>
 </p>
 
-Each switch is **Off** (refused), **Ask** (a window asks you: *Allow*, *Allow this kind for an hour*, or *Deny*) or
-**On**. The approval window wears yellow-and-black warning stripes, so it is never lost among other windows.
+Each switch is **Off** (refused), **Ask** (a window asks you: *Allow*, *Allow on this guest for an hour* — another
+guest is asked about again — or *Deny*) or **On**. The approval window wears yellow-and-black warning stripes, so it is never lost among other windows.
 Claude never sees a password: where one is needed, the app asks **you** for it in its own window. Every request is
 logged with the reason Claude gave. Claude's token on each host holds only the Proxmox privileges its open switches
 need. The full list of tools is in [docs/claude-access.md](docs/claude-access.md).

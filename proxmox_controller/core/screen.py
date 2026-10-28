@@ -120,6 +120,16 @@ def png(w: int, h: int, bgra: bytes, max_width: int = MAX_WIDTH) -> tuple[bytes,
     return image, w, h
 
 
+def crop(w: int, h: int, bgra: bytes, x0: int, y0: int, x1: int, y1: int) -> tuple[int, int, bytes]:
+    """The part from (x0, y0) up to (x1, y1) — not included — of a screen, in its own pixels, kept inside the screen:
+    (width, height, pixels). A small part of a wide screen, read at full size (png() shrinks only what is wide)."""
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("That part is outside the screen.")
+    rows = [bgra[(y * w + x0) * 4:(y * w + x1) * 4] for y in range(y0, y1)]
+    return x1 - x0, y1 - y0, b"".join(rows)
+
+
 def keysym_of(ch: str) -> int:
     if ch == "\n":
         return KEYS["enter"]

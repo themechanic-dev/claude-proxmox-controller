@@ -273,10 +273,15 @@ class CreateVmDialog(_Busy, QDialog):
         self.rdp.setToolTip("Sign in from another computer with a Remote Desktop app (RDP, port 3389) — with this user "
                             "and password")
         self.dark = QCheckBox("Dark theme")
+        self.sudo_password = QCheckBox("sudo asks for the password")  # (a ready-made Ubuntu's own sudo asks for none)
+        self.sudo_password.setToolTip("As a normal Ubuntu: sudo asks for this user's password. Unticked: sudo without "
+                                      "a password, as Ubuntu's cloud image sets it up.")
+        self.sudo_password.setChecked(True)
         options_row = QHBoxLayout()
         options_row.setSpacing(16)
         options_row.addWidget(self.rdp)
         options_row.addWidget(self.dark)
+        options_row.addWidget(self.sudo_password)
         options_row.addStretch(1)
         # a fixed address of its own (Ubuntu): only the address — the rest is the host's own network
         self.static = QCheckBox("Static IP")
@@ -616,6 +621,7 @@ class CreateVmDialog(_Busy, QDialog):
         self.edition.setEnabled(setup)
         self.language.setEnabled(setup)
         self.dark.setVisible(setup or desktop)
+        self.sudo_password.setVisible(cloud)  # (an ISO's own installer makes sudo ask already)
         self.rdp.setEnabled(setup or desktop)
         if cloud and not desktop:
             self.rdp.setChecked(False)
@@ -862,6 +868,8 @@ class CreateVmDialog(_Busy, QDialog):
                 return "Ubuntu's cloud image is not on the host yet: Get Image first."
             if not cloudvm.USERNAME.match(self.user.text()):
                 return "The Linux user name: small letters, digits, '_' and '-', starting with a letter."
+            if not password and self.sudo_password.isChecked():
+                return "Give the user a password (sudo asks for it), or untick “sudo asks for the password”."
             if not password and (self.desktop() or not self.ssh_key.text().strip()):
                 return ("Give the user a password (the desktop's login asks for it)." if self.desktop() else
                         "Give the user a password, or an SSH key to sign in with.")
@@ -1017,6 +1025,7 @@ class CreateVmDialog(_Busy, QDialog):
         """Ubuntu from its cloud image, set up by the app's setup disc (Server and Desktop alike)."""
         desktop = self.desktop()
         rdp, dark = desktop and self.rdp.isChecked(), desktop and self.dark.isChecked()
+        sudo_password = self.sudo_password.isChecked()
         static = self.static_settings()
         user, password, key = self.user.text(), self.password.text(), self.ssh_key.text().strip()
         disk, start = self.disk.value(), self.start.isChecked()
@@ -1040,7 +1049,7 @@ class CreateVmDialog(_Busy, QDialog):
             place = timezones.region(timezones.host_zone(pve, node))
             files = cloudseed.seed_files(vm_name=name, vmid=vmid, user=user, password=password, ssh_keys=[key],
                                          desktop=desktop, remote_desktop=rdp, dark=dark, time_zone=place["iana"],
-                                         keyboard=place["keyboard"], static=static)
+                                         keyboard=place["keyboard"], static=static, sudo_password=sudo_password)
             volid = setupdisc.upload(pve, node, seed_storage, vmid, files, cloudseed.SEED_LABEL)
             params["ide2"] = f"{volid},media=cdrom"
             disc = setupdisc.entry("", node, vmid, volid, "ide2", True)

@@ -83,30 +83,51 @@ def privileges(switches: dict, available: tuple | None = None) -> list[str]:
 
 
 class Allowances:
-    """'Allow this kind for 1, 3, 8 or 12 hours', remembered only while the app runs."""
+    """'Allow for 1, 3, 8 or 12 hours', remembered only while the app runs — for the guests of the request it was
+    given on, and only them (the user, 28/10: hours given for 108 are not for 109; 103 asks again). A request about
+    guests goes without asking when each of them was given hours of its kind; a request about no guest (a new VM, an
+    ISO, the host) when hours were given on such a request — those never stand for a guest."""
 
     def __init__(self):
-        self.until: dict[tuple[str, str], float] = {}
+        self.until: dict[tuple[str, str, int | None], float] = {}  # (host, kind, guest or None) → when it ends
 
-    def grant(self, host_id: str, key: str, seconds: float = TEMP_ALLOW_S) -> None:
-        self.until[(host_id, key)] = time.monotonic() + seconds
+    def grant(self, host_id: str, key: str, seconds: float = TEMP_ALLOW_S, guests: list[int] | None = None) -> None:
+        end = time.monotonic() + seconds
+        for vmid in guests or [None]:
+            self.until[(host_id, key, vmid)] = end
 
-    def active(self, host_id: str, key: str) -> bool:
-        return self.until.get((host_id, key), 0) > time.monotonic()
+    def active(self, host_id: str, key: str, guests: list[int] | None = None) -> bool:
+        return self.remaining(host_id, key, guests) > 0
 
-    def remaining(self, host_id: str, key: str) -> float:
-        """Seconds left of what was granted for hours (0: none)."""
-        return max(0.0, self.until.get((host_id, key), 0) - time.monotonic())
+    def remaining(self, host_id: str, key: str, guests: list[int] | None = None) -> float:
+        """Seconds left of the hours given for all these guests (or, without guests, for requests about none):
+        the shortest of them; 0 where one has none."""
+        now = time.monotonic()
+        return max(0.0, min(self.until.get((host_id, key, vmid), 0) - now for vmid in guests or [None]))
+
+    def given(self, host_id: str, key: str) -> list[tuple[int | None, float]]:
+        """The hours of this kind running now on the host: (guest — None for requests about no guest —, seconds
+        left), the guests first, by number."""
+        now = time.monotonic()
+        out = [(vmid, end - now) for (h, k, vmid), end in self.until.items() if h == host_id and k == key and end > now]
+        return sorted(out, key=lambda x: (x[0] is None, x[0] or 0))
+
+    def end(self, host_id: str, key: str) -> None:
+        """Every hour given of this kind on the host ends now."""
+        for k in [k for k in self.until if k[:2] == (host_id, key)]:
+            del self.until[k]
 
     def clear(self) -> None:
         self.until.clear()
 
 
-def decide(settings: dict, host_id: str, key: str, allowances: Allowances | None = None) -> str:
-    """'off' | 'ask' | 'on' for one request; everything is off while the switch for all is off."""
+def decide(settings: dict, host_id: str, key: str, allowances: Allowances | None = None,
+           guests: list[int] | None = None) -> str:
+    """'off' | 'ask' | 'on' for one request about these guests (None: about no guest); everything is off while the
+    switch for all is off."""
     if not enabled(settings):
         return OFF
     state = host_switches(settings, host_id)[key]
-    if state == ASK and allowances is not None and allowances.active(host_id, key):
+    if state == ASK and allowances is not None and allowances.active(host_id, key, guests):
         return ON
     return state

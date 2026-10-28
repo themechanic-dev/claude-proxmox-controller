@@ -1900,8 +1900,13 @@ class VmDialogTest(UiCase):
         self.assertTrue(dlg.image_btn.isVisible() or not dlg.isVisible())
         dlg.get_image()
         self.assertTrue(wait_until(lambda: dlg.isEnabled() and dlg.image_state.text() == "image on the host"))
+        self.assertTrue(self.visible(dlg, dlg.sudo_password) and dlg.sudo_password.isChecked())  # as a normal Ubuntu
+        dlg.create()
+        self.assertIn("sudo asks for it", self.errors[-1][1])  # no password: sudo could never be used
+        dlg.sudo_password.setChecked(False)
         dlg.create()
         self.assertIn("password, or an SSH key", self.errors[-1][1])
+        dlg.sudo_password.setChecked(True)
         dlg.password.setText("srv-pw")
         dlg.password2.setText("srv-pw")
         dlg.static.setChecked(True)  # a fixed address, the rest from the host's network
@@ -1920,6 +1925,7 @@ class VmDialogTest(UiCase):
         self.assertIn(b"installing the updates and the QEMU guest agent", srv["user-data"])
         self.assertEqual(json.loads(srv["network-config"])["ethernets"]["ens18"]["addresses"], ["192.168.1.63/24"])
         self.assertNotIn(b"srv-pw", srv["user-data"])
+        self.assertEqual(json.loads(srv["user-data"].decode().split("\n", 1)[1])["user"]["sudo"], "ALL=(ALL) ALL")
         desk = vm_dialog.CreateVmDialog(None, self.client, self.runner, ["pve"], remember=kept.append)
         self.assertTrue(wait_until(lambda: desk.isEnabled() and desk.iso.count()))
         desk.from_cloud.setChecked(True)
@@ -1931,6 +1937,7 @@ class VmDialogTest(UiCase):
         self.assertFalse(desk.dark.isHidden())  # the dark theme: Ubuntu Desktop too
         desk.rdp.setChecked(True)
         desk.dark.setChecked(True)
+        desk.sudo_password.setChecked(False)  # sudo without a password, as the image sets it up
         desk.name.setText("desk")
         desk.user.setText("Nikos")
         desk.password.setText("d-pw")
@@ -1954,6 +1961,7 @@ class VmDialogTest(UiCase):
         self.assertEqual(files["rdp-password"], b"d-pw\n")
         self.assertIn('"timezone": "Europe/Athens"', data)
         self.assertNotIn("d-pw", data)
+        self.assertNotIn("sudo", json.loads(data.split("\n", 1)[1])["user"])
         self.assertEqual(desk.boot_keys, None)  # only Windows waits for a key
 
     def test_download_an_iso(self):
@@ -3536,18 +3544,24 @@ class ConnectorTest(UiCase):
         self.assertEqual(self.admin.cluster.guests[102]["status"], "running")
         box = self.request("guest_power", wait=False, host="demo-pve", vmid=102, action="shutdown", reason="r")
         self.assertTrue(wait_until(lambda: len(self.windows) == 3))
+        self.assertEqual(self.windows[-1].hour_btn.text(), "Allow on 102 for 1 Hour")  # for that guest only
         self.windows[-1].hour_btn.click()  # the button itself (not its arrow): 1 hour
         self.assertTrue(wait_until(lambda: "answer" in box))
-        self.assertTrue(3600 - 60 < self.conn.allowances.remaining("demo-pve", "power") <= 3600)
+        self.assertTrue(3600 - 60 < self.conn.allowances.remaining("demo-pve", "power", [102]) <= 3600)
+        self.assertEqual(self.conn.allowances.remaining("demo-pve", "power"), 0)  # nor for requests about no guest
+        hosts = json.loads(self.text(self.request("list_hosts")))["hosts"]
+        self.assertEqual(list(hosts[0]["hours_given"]), ["power"])  # Claude is told which guests go without asking
+        self.assertEqual(list(hosts[0]["hours_given"]["power"]), ["102"])
         self.request("guest_power", host="demo-pve", vmid=102, action="start", reason="r")
-        self.assertEqual(len(self.windows), 3)  # within the hour: no window
+        self.assertEqual(len(self.windows), 3)  # 102 within the hour: no window
         box = self.request("guest_power", wait=False, host="demo-pve", vmid=100, action="reboot", reason="r")
         self.request("guest_details", host="demo-pve", vmid=100)  # (reads go on meanwhile)
-        self.assertEqual(len(self.windows), 3)
+        self.assertTrue(wait_until(lambda: len(self.windows) == 4))  # another guest: asked again (the user, 28/10)
+        self.windows[-1].deny_btn.click()
         self.assertTrue(wait_until(lambda: "answer" in box))
-        decisions = [e["decision"] for e in connector_log.last()][-6:]
-        self.assertEqual(decisions[:4], ["approved", "denied", "approved", "granted"])  # (hours given, not On)
-        self.assertEqual(sorted(decisions[4:]), ["allowed", "granted"])  # the read (On) and the reboot, either first
+        decisions = [e["decision"] for e in connector_log.last()][-7:]
+        self.assertEqual(decisions[:5], ["approved", "denied", "approved", "allowed", "granted"])  # (list_hosts: On)
+        self.assertEqual(sorted(decisions[5:]), ["allowed", "denied"])  # the read (On) and 100's reboot, either first
 
     def test_hours_from_the_arrow(self):
         """The arrow beside 'Allow This Kind for 1 Hour' (19/10: Claude works the night through): 1, 3, 8 or 12
@@ -3568,10 +3582,10 @@ class ConnectorTest(UiCase):
         self.assertFalse(dlg.isVisible())
         self.assertTrue(wait_until(lambda: "answer" in box, 10))
         self.assertFalse(box["answer"]["result"]["isError"], self.text(box))
-        self.assertTrue(8 * 3600 - 60 < self.conn.allowances.remaining("demo-pve", "power") <= 8 * 3600)
-        self.assertEqual(self.conn.allowances.remaining("demo-pve", "change"), 0)  # that kind only
+        self.assertTrue(8 * 3600 - 60 < self.conn.allowances.remaining("demo-pve", "power", [102]) <= 8 * 3600)
+        self.assertEqual(self.conn.allowances.remaining("demo-pve", "change", [102]), 0)  # that kind only
         self.assertTrue(wait_until(power.grant.isVisible))
-        self.assertRegex(power.grant.text(), r"^· allowed without asking until \d\d:\d\d$")
+        self.assertRegex(power.grant.text(), r"^Allowed without asking:  102 until \d\d:\d\d$")  # the number only
         end = time.strftime("%H:%M", time.localtime(time.time() + 8 * 3600))
         self.assertIn(power.grant.text()[-5:], (end, time.strftime("%H:%M", time.localtime(time.time() + 8 * 3600 - 60))))
         self.assertFalse(next(r for r in access.rows if r.key == "change").grant.isVisible())
@@ -3580,17 +3594,40 @@ class ConnectorTest(UiCase):
         self.assertTrue(wait_until(lambda: access.log.rowCount() >= 2))
         self.assertEqual(access.log.item(0, 4).text(), "Allowed (hours you gave)")
         self.assertEqual(access.log.item(1, 4).text(), "Approved by you")
-        power.buttons["ask"].click()  # already Ask: the click ends the hours
-        self.assertEqual(self.conn.allowances.remaining("demo-pve", "power"), 0)
+        box = self.request("guest_power", wait=False, host="demo-pve", vmid=100, action="reboot", reason="r")
+        self.assertTrue(wait_until(lambda: len(self.windows) == 2))  # another guest asks again
+        self.windows[-1].hour_btn.click()
+        self.assertTrue(wait_until(lambda: "answer" in box))
+        self.assertTrue(wait_until(lambda: power.grant.text().count("until") == 2))
+        self.assertRegex(power.grant.text(),
+                         r"^Allowed without asking:  100 until \d\d:\d\d  ·  102 until \d\d:\d\d$")  # each one
+        power.buttons["ask"].click()  # already Ask: the click ends the hours, every guest's
+        self.assertEqual(self.conn.allowances.remaining("demo-pve", "power", [102]), 0)
+        self.assertEqual(self.conn.allowances.given("demo-pve", "power"), [])
         self.assertFalse(power.grant.isVisible())
         self.assertEqual(claude_policy.host_switches(self.win.settings, "demo-pve")["power"], "ask")
         box = self.request("guest_power", wait=False, host="demo-pve", vmid=102, action="start", reason="r")
-        self.assertTrue(wait_until(lambda: len(self.windows) == 2))  # asked again
+        self.assertTrue(wait_until(lambda: len(self.windows) == 3))  # asked again
         self.windows[-1].deny_btn.click()
         self.assertTrue(wait_until(lambda: "answer" in box))
         self.assertEqual([connector.allowed_hours(a) for a in ("allow-hours:12", "allow-hours:5", "allow-hours:",
                                                                "allow-hours:24", "allow", "deny")],
                          [12, 0, 0, 0, 0, 0])  # only what the window offers
+
+    def test_hours_are_for_the_guests_asked_about(self):
+        """Hours given on a request stand for its guests alone (the user, 28/10); a new VM's ID is not a guest yet."""
+        T = connector.TOOLS
+        self.assertEqual(connector.guests_of(T["guest_power"], {"vmid": 108}), [108])
+        self.assertEqual(connector.guests_of(T["bulk_power"], {"vmids": [109, 101, 109]}), [101, 109])
+        self.assertIsNone(connector.guests_of(T["bulk_power"], {}))
+        for tool in ("create_vm", "create_cloud_vm", "create_container"):
+            self.assertIsNone(connector.guests_of(T[tool], {"vmid": 120}))
+        self.assertIsNone(connector.guests_of(T["download_iso"], {"url": "https://example.org/x.iso"}))
+        host = self.win.hosts[0]
+        texts = [connector.ApprovalDialog("Claude", host, "power", "x", [], "r", guests=g).hour_btn.text()
+                 for g in ([108], [101, 109], [1, 2, 3, 4], None)]
+        self.assertEqual(texts, ["Allow on 108 for 1 Hour", "Allow on 101, 109 for 1 Hour", "Allow on 4 guests for 1 Hour",
+                                 "Allow Requests Like This for 1 Hour"])
 
     def test_no_answer_and_cancel(self):
         box = self.request("guest_power", wait=False, host="demo-pve", vmid=102, action="start", reason="r")

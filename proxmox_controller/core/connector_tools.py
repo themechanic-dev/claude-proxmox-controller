@@ -915,7 +915,9 @@ def _cloud_vm_words(ctx: Context, a: dict):
     lines = [f"From {a['image']}: {p['cores']} cores (CPU type {p['cpu']}), {p['memory']} MiB, disk {disk} GB, "
              + _address_words(_static_for(ctx, node, a)),
              f"User '{user}', with the password you type below (Claude does not see it)" +
-             (" and an SSH key" if a.get("ssh_public_key") else "")]
+             (" and an SSH key" if a.get("ssh_public_key") else "") +
+             ("; sudo asks for that password" if a.get("sudo_asks_password", True) else
+              "; sudo without a password (as Ubuntu's cloud image sets it up)")]
     if desktop:
         lines.append("On the first start it installs Ubuntu Desktop and the QEMU guest agent" +
                      (", and turns on Ubuntu's own Remote Desktop (RDP, with that user and password)"
@@ -935,10 +937,14 @@ def _cloud_vm(ctx: Context, a: dict):
     vmid, desktop, rdp = p["vmid"], a.get("edition") == "desktop", bool(a.get("remote_desktop"))
     user = a.get("username", "user")
     place = timezones.region(timezones.host_zone(ctx.admin or ctx.pve, node))
-    seed = cloudseed.seed_files(vm_name=p["name"], vmid=vmid, user=user, password=ctx.secret,
-                                ssh_keys=[a.get("ssh_public_key", "")], desktop=desktop, remote_desktop=rdp,
-                                dark=bool(a.get("dark_theme")), time_zone=place["iana"], keyboard=place["keyboard"],
-                                static=_static_for(ctx, node, a))
+    try:
+        seed = cloudseed.seed_files(vm_name=p["name"], vmid=vmid, user=user, password=ctx.secret,
+                                    ssh_keys=[a.get("ssh_public_key", "")], desktop=desktop, remote_desktop=rdp,
+                                    dark=bool(a.get("dark_theme")), time_zone=place["iana"],
+                                    keyboard=place["keyboard"], static=_static_for(ctx, node, a),
+                                    sudo_password=bool(a.get("sudo_asks_password", True)))
+    except ValueError as e:  # (no password typed, where sudo or Remote Desktop needs one)
+        raise ToolError(str(e)) from e
     volid = setupdisc.upload(ctx.pve, node, _seed_storage(ctx, node), vmid, seed, cloudseed.SEED_LABEL)
     p["ide2"] = f"{volid},media=cdrom"
     try:
@@ -949,7 +955,8 @@ def _cloud_vm(ctx: Context, a: dict):
     if ctx.remember is not None:
         ctx.remember(setupdisc.entry(ctx.host.id, node, vmid, volid, "ide2", True))
     out = {"vmid": vmid, "name": p["name"], "node": node, "user": user,
-           "password": "set by the user (not shown to you)" if ctx.secret else "none", **made}
+           "password": "set by the user (not shown to you)" if ctx.secret else "none",
+           "sudo": "asks for the user's password" if a.get("sudo_asks_password", True) else "no password", **made}
     if made["status"] != "done":
         out["note"] = "The disk is still being made from the image: start the VM when task_log shows it finished."
         return out
@@ -1319,15 +1326,48 @@ def _opener(ctx: Context, g: dict) -> Callable[[], tuple]:
     return lambda: ctx.pve.open_vnc(g["node"], g["type"], g["vmid"])
 
 
+def _region_of(a: dict) -> tuple[int, int, int, int] | None:
+    """region as (x0, y0, x1, y1) of the whole picture, or None. ToolError for anything else."""
+    r = a.get("region")
+    if r is None:
+        return None
+    if not (isinstance(r, list) and len(r) == 4 and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0
+                                                        for n in r)):
+        raise ToolError("region must be [x0, y0, x1, y1]: four whole numbers from the console_screenshot picture.")
+    if r[0] >= r[2] or r[1] >= r[3]:
+        raise ToolError("region: its top-left corner first, then its bottom-right (x0 < x1, y0 < y1).")
+    return r[0], r[1], r[2], r[3]
+
+
 def _screenshot_words(ctx: Context, a: dict):
-    return f"See the screen of {what(ctx.guest(a['vmid']))}", []
+    r = _region_of(a)
+    return (f"See the screen of {what(ctx.guest(a['vmid']))}",
+            [f"Only the part from {r[0]}, {r[1]} to {r[2]}, {r[3]}, at full size."] if r else [])
 
 
 def _screenshot(ctx: Context, a: dict):
     g = ctx.guest(a["vmid"])
+    r = _region_of(a)
     w, h, pixels = screen.capture(_opener(ctx, g))
-    image, sw, sh = screen.png(w, h, pixels)
-    return Image(image, f"The screen of {what(g)}: {w}×{h}" + (f", shown at {sw}×{sh}" if (sw, sh) != (w, h) else ""))
+    if r is None:
+        image, sw, sh = screen.png(w, h, pixels)
+        return Image(image, f"The screen of {what(g)}: {w}×{h}" +
+                     (f", shown at {sw}×{sh}" if (sw, sh) != (w, h) else ""))
+    # the region is in the whole picture's numbers, as console_click's x, y: back to the screen's own pixels
+    step = screen.scale_of(w)
+    pw, ph = len(range(0, w, step)), len(range(0, h, step))
+    if r[0] >= pw or r[1] >= ph:
+        raise ToolError(f"region starts outside the picture, which is {pw}×{ph}.")
+    sx0, sy0 = r[0] * step, r[1] * step
+    cw, ch, part = screen.crop(w, h, pixels, sx0, sy0, r[2] * step, r[3] * step)
+    image, sw, sh = screen.png(cw, ch, part)
+    k = screen.scale_of(cw)  # (a region wider than a picture is shrunk as the whole screen is)
+    factor = "" if k == step else f" × {k}" if step == 1 else f" × {k}/{step}"
+    return Image(image, f"Part of the screen of {what(g)} ({w}×{h}): {r[0]}, {r[1]} to {r[0] + cw // step}, "
+                        f"{r[1] + ch // step} of the whole {pw}×{ph} picture, shown at {sw}×{sh}"
+                        + (" — the screen's own pixels" if k == 1 else "") +
+                        f". For console_click, a point px, py here is {r[0]} + px{factor}, {r[1]} + py{factor} "
+                        "of the whole picture.")
 
 
 def _click_words(ctx: Context, a: dict):
@@ -1810,7 +1850,11 @@ def _tools() -> list[Tool]:
               "dark_theme": {"type": "boolean", "description": "Desktop only."},
               "host_cpu": {"type": "boolean", "description": "The host's own CPU type (else x86-64-v2-AES). "
                            "Default: true for the desktop, false for a server."},
-              "username": {"type": "string", "description": "Default: user."}, "vmid": {"type": "integer", "minimum": 100},
+              "username": {"type": "string", "description": "Default: user."},
+              "sudo_asks_password": {"type": "boolean", "description": "As a normal Ubuntu, sudo asks for the user's "
+                                     "password (at a console prompt: console_type_password). Default: true. false: "
+                                     "sudo without a password, as the cloud image's own default."},
+              "vmid": {"type": "integer", "minimum": 100},
               "cores": {"type": "integer", "minimum": 1, "maximum": 512}, "memory_mib": {"type": "integer", "minimum": 512},
               "disk_gb": {"type": "integer", "minimum": 4}, "storage": {"type": "string"}, "bridge": {"type": "string"},
               "ssh_public_key": {"type": "string"}, "start": {"type": "boolean", "description": "Default: true."},
@@ -1861,8 +1905,13 @@ def _tools() -> list[Tool]:
         Tool("host_power", "host", "Shut down or reboot the host itself (its guests are shut down first).",
              {**host, "action": {"type": "string", "enum": ["shutdown", "reboot"]}, "node": {"type": "string"}},
              ("host", "action"), _host_power, _host_words),
-        Tool("console_screenshot", "console", "A picture of a running guest's screen.", vm, ("host", "vmid"),
-             _screenshot, _screenshot_words),
+        Tool("console_screenshot", "console", "A picture of a running guest's screen — wider screens are shrunk by a "
+             "whole factor (1920×1080 comes as 960×540). To read small text, give region: that part of the picture "
+             "comes back at the screen's own pixels. console_click always takes x, y of the whole picture.",
+             {**vm, "region": {"type": "array", "items": {"type": "integer"},
+                               "description": "[x0, y0, x1, y1] in the whole picture's numbers (as console_click's x, "
+                                              "y): its top-left and bottom-right corners."}},
+             ("host", "vmid"), _screenshot, _screenshot_words),
         Tool("console_send", "console", "Type text into a running guest's console and/or press keys: enter, tab, "
              "escape, backspace, delete, arrows (up, down, left, right), home, end, pageup, pagedown, f1–f12, and "
              "combinations such as ctrl+alt+delete or ctrl+c. Text is typed as on a US keyboard. With text and keys, "
@@ -1981,7 +2030,7 @@ def access_table() -> list[dict]:
         if key == "host_commands":
             enforced = ("This app only: the commands go over SSH with the app's key, not through Proxmox's API, so "
                         "Proxmox cannot refuse them on its own. Each one is shown in the approval window, every time "
-                        "(no 'Allow This Kind for 1 Hour', nor longer). The app's SSH key file itself is not encrypted, "
+                        "(no hours without asking). The app's SSH key file itself is not encrypted, "
                         "nor are the hosts' API tokens in its settings (both readable by you alone): a program running "
                         "as you on this computer (Claude Code with a shell, too) could read them and use them without "
                         "asking — Off stops the connector, not that.")
@@ -2005,9 +2054,9 @@ def access_markdown() -> str:
     lines = ["# What Claude may do — the switches", "",
              "<!-- Made by tools/claude_access_doc.py from the code (connector_tools.access_table): do not edit. -->", "",
              "Claude reaches your Proxmox hosts only through Proxmox Controller, and only as far as each host's switches "
-             "let it. Every switch is **Off** (refused), **Ask** (a window of the app asks you: *Allow*, *Allow This "
-             "Kind for 1 Hour* — its arrow: 3, 8 or 12 hours — or *Deny*; no answer in two minutes is a No) or **On** "
-             "(done at once). Above them, "
+             "let it. Every switch is **Off** (refused), **Ask** (a window of the app asks you: *Allow*, *Allow on "
+             "<guest> for 1 Hour* — its arrow: 3, 8 or 12 hours, for that guest only: another guest is asked about "
+             "again — or *Deny*; no answer in two minutes is a No) or **On** (done at once). Above them, "
              "*Let Claude use Proxmox Controller* turns all of it off. Passwords never go through Claude: where one is "
              "needed, the app asks you for it in its own window. Every request is logged with the reason Claude gave.",
              "",

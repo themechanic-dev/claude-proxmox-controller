@@ -2,7 +2,7 @@
 
 <!-- Made by tools/claude_access_doc.py from the code (connector_tools.access_table): do not edit. -->
 
-Claude reaches your Proxmox hosts only through Proxmox Controller, and only as far as each host's switches let it. Every switch is **Off** (refused), **Ask** (a window of the app asks you: *Allow*, *Allow This Kind for 1 Hour* — its arrow: 3, 8 or 12 hours — or *Deny*; no answer in two minutes is a No) or **On** (done at once). Above them, *Let Claude use Proxmox Controller* turns all of it off. Passwords never go through Claude: where one is needed, the app asks you for it in its own window. Every request is logged with the reason Claude gave.
+Claude reaches your Proxmox hosts only through Proxmox Controller, and only as far as each host's switches let it. Every switch is **Off** (refused), **Ask** (a window of the app asks you: *Allow*, *Allow on <guest> for 1 Hour* — its arrow: 3, 8 or 12 hours, for that guest only: another guest is asked about again — or *Deny*; no answer in two minutes is a No) or **On** (done at once). Above them, *Let Claude use Proxmox Controller* turns all of it off. Passwords never go through Claude: where one is needed, the app asks you for it in its own window. Every request is logged with the reason Claude gave.
 
 The switches govern Claude as it works through this app. A program that runs as you on this computer — Claude Code with a shell of its own, too — is outside them: it can read the app's files, the hosts' API tokens and the app's SSH key among them, which are not encrypted, only readable by you alone.
 
@@ -91,7 +91,7 @@ See a guest's screen, type into it and click on it.
 
 | Tool | What it does |
 |---|---|
-| `console_screenshot` | A picture of a running guest's screen. |
+| `console_screenshot` | A picture of a running guest's screen — wider screens are shrunk by a whole factor (1920×1080 comes as 960×540). |
 | `console_send` | Type text into a running guest's console and/or press keys: enter, tab, escape, backspace, delete, arrows (up, down, left, right), home, end, pageup, pagedown, f1–f12, and combinations such as ctrl+alt+delete or ctrl+c. |
 | `console_click` | Click — or double-click, right-click, or turn the wheel (scroll: + up, − down) — on a running guest's screen at x, y of the latest console_screenshot picture (take a fresh one first: the click lands where things are now). |
 | `console_type_password` | Type a password into a running guest's console — at a login, a sudo prompt, or an installer's password screen. *(asks you for a password)* |
@@ -122,7 +122,7 @@ Copy files between this computer and VMs or containers, and list their folders.
 
 Run commands on the host itself, as root, over the app's SSH key.
 
-*This app only: the commands go over SSH with the app's key, not through Proxmox's API, so Proxmox cannot refuse them on its own. Each one is shown in the approval window, every time (no 'Allow This Kind for 1 Hour', nor longer). The app's SSH key file itself is not encrypted, nor are the hosts' API tokens in its settings (both readable by you alone): a program running as you on this computer (Claude Code with a shell, too) could read them and use them without asking — Off stops the connector, not that.*
+*This app only: the commands go over SSH with the app's key, not through Proxmox's API, so Proxmox cannot refuse them on its own. Each one is shown in the approval window, every time (no hours without asking). The app's SSH key file itself is not encrypted, nor are the hosts' API tokens in its settings (both readable by you alone): a program running as you on this computer (Claude Code with a shell, too) could read them and use them without asking — Off stops the connector, not that.*
 
 | Tool | What it does |
 |---|---|

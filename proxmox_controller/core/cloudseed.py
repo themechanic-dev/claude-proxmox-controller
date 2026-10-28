@@ -67,6 +67,10 @@ REBOOT_REQUIRED = "/var/run/reboot-required"  # (left by an update that needs a 
 # The first boot's SSH keys made without a word on the console: cloud-init printed their fingerprints and pictures
 # over the text login, which then looked broken (the user's test, 26/10). Still in /var/log/cloud-init-output.log
 QUIET_KEYS = {"ssh_quiet_keygen": True, "ssh": {"emit_keys_to_console": False}, "no_ssh_fingerprints": True}
+# sudo as a normal Ubuntu: it asks for the user's password. The cloud image gives its default user NOPASSWD:ALL
+# (/etc/sudoers.d/90-cloud-init-users) — measured 27/10 on a desktop made by the app: sudo never asked — and the
+# "user" settings here are merged over that default user, so this rule takes the place of that one
+SUDO_WITH_PASSWORD = "ALL=(ALL) ALL"
 
 
 def sha512_crypt(password: str, salt: str | None = None, rounds: int = 5000) -> str:
@@ -136,18 +140,24 @@ def _rdp_commands(host: str, user: str) -> tuple[list, list]:
 
 
 def user_data(*, vm_name: str, user: str, password: str, ssh_keys: list[str], desktop: bool = True,
-              remote_desktop: bool = False, dark: bool = False, time_zone: str = "", keyboard: str = "") -> str:
+              remote_desktop: bool = False, dark: bool = False, time_zone: str = "", keyboard: str = "",
+              sudo_password: bool = True) -> str:
     """The cloud-config: Proxmox's own user settings (the user as the image's default user, its password, SSH keys),
     then the packages and what turns them on. Written as JSON, which is YAML too: nothing to quote by hand.
     `time_zone` (IANA) and `keyboard` (an X11 layout, after US English) come from the Proxmox host's place; the menus
-    stay in English (the user's choice, 24/10). Remote Desktop also needs the rdp-password file (see seed_files)."""
+    stay in English (the user's choice, 24/10). Remote Desktop also needs the rdp-password file (see seed_files).
+    `sudo_password`: sudo asks for the user's password, as on a normal Ubuntu; False leaves the image's own sudo
+    without one."""
     if remote_desktop and not password:
         raise ValueError("Remote Desktop needs a password: it signs in with the VM user's own.")
+    if sudo_password and not password:
+        raise ValueError("sudo asks for the user's password: give the user one, or let sudo ask for none.")
     host = hostname_of(vm_name)
     packages = (["qemu-guest-agent"] + (DESKTOP_PACKAGES if desktop else []) + (RDP_PACKAGES if remote_desktop else [])
                 + (DARK_PACKAGES if dark else []))
     cfg: dict = {"hostname": host, "manage_etc_hosts": True, "fqdn": vm_name,
-                 "user": {"name": user, "gecos": user},  # (else the login screen calls the user "Ubuntu")
+                 "user": {"name": user, "gecos": user,  # (else the login screen calls the user "Ubuntu")
+                          **({"sudo": SUDO_WITH_PASSWORD} if sudo_password else {})},
                  "chpasswd": {"expire": False}, "users": ["default"], "package_update": True,
                  "package_upgrade": True,  # (as Proxmox's own: the image on the host ages, the VM starts up to date)
                  "packages": packages, "runcmd": [], **QUIET_KEYS}
@@ -222,11 +232,11 @@ def meta_data(vm_name: str, vmid: int) -> str:
 
 def seed_files(*, vm_name: str, vmid: int, user: str, password: str, ssh_keys: list[str], desktop: bool = True,
                remote_desktop: bool = False, dark: bool = False, time_zone: str = "", keyboard: str = "",
-               static: dict | None = None) -> dict[str, bytes]:
+               static: dict | None = None, sudo_password: bool = True) -> dict[str, bytes]:
     """The setup disc's files for an Ubuntu VM (`static`: its fixed address, see network_config)."""
     files = {"user-data": user_data(vm_name=vm_name, user=user, password=password, ssh_keys=ssh_keys, desktop=desktop,
                                     remote_desktop=remote_desktop, dark=dark, time_zone=time_zone,
-                                    keyboard=keyboard).encode(),
+                                    keyboard=keyboard, sudo_password=sudo_password).encode(),
              "meta-data": meta_data(vm_name, vmid).encode(),
              "network-config": (json.dumps(network_config(static), indent=2) + "\n").encode()}
     if remote_desktop:
