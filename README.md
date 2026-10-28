@@ -1,5 +1,7 @@
 # Claude Proxmox Controller
 
+[![Tests](https://github.com/themechanic-dev/claude-proxmox-controller/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/themechanic-dev/claude-proxmox-controller/actions/workflows/tests.yml)
+
 **Your Proxmox VE hosts in one window — and Claude, working on them as far as you let it.**
 
 Proxmox Controller is a desktop app for Windows and Linux. On its own it is a fast home for your hosts: containers
