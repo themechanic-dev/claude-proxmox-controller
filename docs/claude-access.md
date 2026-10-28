@@ -4,6 +4,8 @@
 
 Claude reaches your Proxmox hosts only through Proxmox Controller, and only as far as each host's switches let it. Every switch is **Off** (refused), **Ask** (a window of the app asks you: *Allow*, *Allow This Kind for 1 Hour* — its arrow: 3, 8 or 12 hours — or *Deny*; no answer in two minutes is a No) or **On** (done at once). Above them, *Let Claude use Proxmox Controller* turns all of it off. Passwords never go through Claude: where one is needed, the app asks you for it in its own window. Every request is logged with the reason Claude gave.
 
+The switches govern Claude as it works through this app. A program that runs as you on this computer — Claude Code with a shell of its own, too — is outside them: it can read the app's files, the hosts' API tokens and the app's SSH key among them, which are not encrypted, only readable by you alone.
+
 ## Read — default: On
 
 State, addresses, settings, notes, snapshots, backups, jobs, tasks, graphs.
@@ -120,7 +122,7 @@ Copy files between this computer and VMs or containers, and list their folders.
 
 Run commands on the host itself, as root, over the app's SSH key.
 
-*This app only: the commands go over SSH with the app's key, not through Proxmox's API, so Proxmox cannot refuse them on its own. Each one is shown in the approval window, every time (no 'Allow This Kind for 1 Hour', nor longer). The app's SSH key file itself is not encrypted: a program running as you on this computer (Claude Code with a shell, too) could read it and use it without asking — Off stops the connector, not that.*
+*This app only: the commands go over SSH with the app's key, not through Proxmox's API, so Proxmox cannot refuse them on its own. Each one is shown in the approval window, every time (no 'Allow This Kind for 1 Hour', nor longer). The app's SSH key file itself is not encrypted, nor are the hosts' API tokens in its settings (both readable by you alone): a program running as you on this computer (Claude Code with a shell, too) could read them and use them without asking — Off stops the connector, not that.*
 
 | Tool | What it does |
 |---|---|

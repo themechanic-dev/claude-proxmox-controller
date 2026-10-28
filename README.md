@@ -52,6 +52,10 @@ Claude never sees a password: where one is needed, the app asks **you** for it i
 logged with the reason Claude gave. Claude's token on each host holds only the Proxmox privileges its open switches
 need. The full list of tools is in [docs/claude-access.md](docs/claude-access.md).
 
+The switches govern Claude as it works through this app. A program that runs as you on your computer (Claude Code
+with a shell of its own, too) is outside them: it can read the app's files — the hosts' API tokens and the app's SSH
+key among them, which are not encrypted, only readable by you alone.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/ask-dark.webp">
@@ -97,7 +101,7 @@ Everything works without Claude too:
   package brings virt-viewer with it):
 
   ```bash
-  sudo apt install ./proxmox-controller_1.0.2_amd64.deb
+  sudo apt install ./proxmox-controller_1.0.3_amd64.deb
   ```
 
 - **Ubuntu / Debian, from its apt repository** — it then updates with the rest of the system:
