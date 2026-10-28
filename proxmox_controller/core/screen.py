@@ -182,21 +182,29 @@ def parse_combo(combo: str) -> list[int]:
 
 
 def send(open_console: Callable[[], tuple], text: str = "", keys: list[str] | tuple = (),
-         timeout: float = 10.0) -> int:
-    """Types the text, then presses each combination ('enter', 'ctrl+alt+delete', 'f2'). Returns the keys pressed."""
-    combos = [parse_combo(k) for k in keys]  # every name checked before anything is typed
+         timeout: float = 10.0, steps: list[tuple[str, object]] | None = None) -> int:
+    """Types the text, then presses each combination ('enter', 'ctrl+alt+delete', 'f2') — or, with steps, does
+    [("text", "…"), ("keys", [...]), …] in their order (ctrl+l before an address). Returns the keys pressed."""
+    if steps is None:
+        steps = [("text", text), ("keys", keys)]
+    plan = [(kind, str(what) if kind == "text" else [parse_combo(k) for k in what])  # every name checked first
+            for kind, what in steps]
     ws = None
     try:
         ws, client, _, _ = _connect(open_console, timeout)
         client.next_update()  # the first screen: read, so the console is not left waiting to send it
-        pressed = type_keys(client.key, text)
-        for syms in combos:
-            for sym in syms:
-                client.key(True, sym)
-            for sym in reversed(syms):
-                client.key(False, sym)
-            pressed += 1
-            time.sleep(KEY_GAP_S)
+        pressed = 0
+        for kind, what in plan:
+            if kind == "text":
+                pressed += type_keys(client.key, what)
+                continue
+            for syms in what:
+                for sym in syms:
+                    client.key(True, sym)
+                for sym in reversed(syms):
+                    client.key(False, sym)
+                pressed += 1
+                time.sleep(KEY_GAP_S)
         time.sleep(0.2)  # let the last keys leave before the console closes
         return pressed
     except socket.timeout as e:

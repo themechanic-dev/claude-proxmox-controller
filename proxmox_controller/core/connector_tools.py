@@ -1367,23 +1367,38 @@ def _click(ctx: Context, a: dict):
     return out
 
 
+def _send_steps(a: dict) -> list[tuple[str, object]]:
+    """What console_send does, in order: steps as given, or else the text and then the keys."""
+    if a.get("steps"):
+        if a.get("text") or a.get("keys"):
+            raise ToolError("Give steps, or text and keys — not both.")
+        out = []
+        for i, s in enumerate(a["steps"], 1):
+            if not isinstance(s, dict) or len(s) != 1 or not ({"text", "keys"} & set(s)):
+                raise ToolError(f"steps[{i}]: either {{\"text\": \"…\"}} or {{\"keys\": [\"…\"]}}.")
+            out.append(("text", str(s["text"])) if "text" in s else ("keys", list(s["keys"])))
+        return out
+    if not a.get("text") and not a.get("keys"):
+        raise ToolError("Give text, keys, or both — or steps.")
+    return [*([("text", a["text"])] if a.get("text") else []), *([("keys", a["keys"])] if a.get("keys") else [])]
+
+
 def _send_words(ctx: Context, a: dict):
     g = ctx.guest(a["vmid"])
     lines = []
-    if a.get("text"):
-        shown = a["text"] if len(a["text"]) <= 200 else a["text"][:200] + "…"
-        lines.append(f"Type: {shown!r}")
-    if a.get("keys"):
-        lines.append("Press: " + ", ".join(a["keys"]))
+    for kind, what_ in _send_steps(a):
+        if kind == "text":
+            lines.append(f"Type: {what_ if len(what_) <= 200 else what_[:200] + '…'!r}")
+        else:
+            lines.append("Press: " + ", ".join(what_))
     return f"Type into the console of {what(g)}", lines
 
 
 def _send(ctx: Context, a: dict):
     g = ctx.guest(a["vmid"])
-    if not a.get("text") and not a.get("keys"):
-        raise ToolError("Give text, keys, or both.")
+    steps = _send_steps(a)
     try:
-        pressed = screen.send(_opener(ctx, g), a.get("text", ""), a.get("keys", []))
+        pressed = screen.send(_opener(ctx, g), steps=steps)
     except ValueError as e:
         raise ToolError(str(e)) from e
     return {"guest": what(g), "keys_pressed": pressed}
@@ -1391,9 +1406,23 @@ def _send(ctx: Context, a: dict):
 
 # -- Commands --------------------------------------------------------------------------------------
 
+# a command as one of the guest's users (the agent runs everything as root): their own HOME and folder; runuser comes
+# with util-linux, so with every common distribution
+RUN_AS = r"""
+u=$1; shift
+h=$(getent passwd "$u" | cut -d: -f6)
+[ -n "$h" ] || { echo "There is no user $u in this VM." >&2; exit 125; }
+command -v runuser >/dev/null 2>&1 || { echo "runuser is not in this VM." >&2; exit 125; }
+cd -- "$h" 2>/dev/null || cd /
+exec runuser -u "$u" -- env HOME="$h" USER="$u" LOGNAME="$u" "$@"
+"""
+USER_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}")
+
+
 def _exec_words(ctx: Context, a: dict):
     g = ctx.guest(a["vmid"])
     return f"Run a command inside {what(g)}", [" ".join(a["command"])] + (
+        [f"As the user {a['user']}"] if a.get("user") else ["As root"]) + (
         [f"With {len(a['input'])} characters of input"] if a.get("input") else [])
 
 
@@ -1405,7 +1434,15 @@ def _exec(ctx: Context, a: dict):
         raise ToolError(f"{what(g)} is not running.")
     if not a["command"] or not all(isinstance(c, str) for c in a["command"]):
         raise ToolError("command is the program and its arguments, as a list of strings.")
-    pid = ctx.pve.agent_exec(g["node"], g["vmid"], a["command"], a.get("input", ""))
+    command = list(a["command"])
+    if a.get("user"):
+        if not USER_NAME.fullmatch(a["user"]):
+            raise ToolError(f"user: '{a['user']}' — a user name of the VM.")
+        reader = ctx.admin or ctx.pve
+        if guestfiles.os_of(reader.guest_config(g["node"], "qemu", g["vmid"])) == "windows":
+            raise ToolError("user is for Linux guests; on Windows the command runs as the guest agent (SYSTEM).")
+        command = ["sh", "-c", RUN_AS, "sh", a["user"], *command]
+    pid = ctx.pve.agent_exec(g["node"], g["vmid"], command, a.get("input", ""))
     end = time.monotonic() + min(int(a.get("timeout_s", 60)), EXEC_WAIT_S)
     while True:
         st = ctx.pve.agent_exec_status(g["node"], g["vmid"], pid)
@@ -1492,12 +1529,21 @@ def _send_files_words(ctx: Context, a: dict):
     return f"Copy {len(paths)} item{'s' if len(paths) != 1 else ''} from this computer into {what(g)}", [
         *(f"{p}" for p in paths[:12]), *([f"… and {len(paths) - 12} more"] if len(paths) > 12 else []),
         f"Into: {a['folder']}  ({_bytes(size)})",
+        *([f"Given to: {a['owner']}"] if a.get("owner") else []),
         "Replaces items of the same name there." if a.get("replace") else "Nothing there is replaced."]
+
+
+def _owner(a: dict) -> str:
+    try:
+        return guestfiles.owner_spec(a.get("owner"))
+    except ValueError as e:
+        raise ToolError(str(e)) from e
 
 
 def _send_files(ctx: Context, a: dict):
     g = ctx.guest(a["vmid"])
     paths = _local_paths(a)
+    owner = _owner(a)
     files = _files_of(ctx, g)
     try:
         folder, entries = files.list(a["folder"])
@@ -1506,7 +1552,7 @@ def _send_files(ctx: Context, a: dict):
             raise ToolError(f"Already in {folder}: {', '.join(clash)}. Nothing was copied; ask with replace: true to "
                             "replace them.")
         t0 = time.monotonic()
-        way = files.send(paths, folder, lambda *_: None, _never())
+        way = files.send(paths, folder, lambda *_: None, _never(), owner)
     except guestfiles.GuestError as e:
         raise ToolError(str(e)) from e
     return {"guest": what(g), "sent": [p.name for p in paths], "into": folder, "bytes": guestfiles.total_size(paths),
@@ -1531,11 +1577,13 @@ def _receive_files(ctx: Context, a: dict):
     files = _files_of(ctx, g)
     try:
         t0 = time.monotonic()
-        moved = [0]
-        way = files.receive(a["folder"], list(a["names"]), to, lambda done, *_: moved.__setitem__(0, done), _never())
+        way = files.receive(a["folder"], list(a["names"]), to, lambda *_: None, _never())
     except guestfiles.GuestError as e:
         raise ToolError(str(e)) from e
-    return {"guest": what(g), "received": list(a["names"]), "into": str(to), "bytes": moved[0],
+    # the size of what arrived (the archive's bytes, counted on the way, add its headers and padding: 40,960 for a
+    # file of 29,563 — 27/10)
+    return {"guest": what(g), "received": list(a["names"]), "into": str(to),
+            "bytes": guestfiles.total_size([to / n for n in a["names"]]),
             "seconds": round(time.monotonic() - t0, 1), "way": way}
 
 
@@ -1816,8 +1864,15 @@ def _tools() -> list[Tool]:
              _screenshot, _screenshot_words),
         Tool("console_send", "console", "Type text into a running guest's console and/or press keys: enter, tab, "
              "escape, backspace, delete, arrows (up, down, left, right), home, end, pageup, pagedown, f1–f12, and "
-             "combinations such as ctrl+alt+delete or ctrl+c. Text is typed as on a US keyboard.",
-             {**vm, "text": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}}},
+             "combinations such as ctrl+alt+delete or ctrl+c. Text is typed as on a US keyboard. With text and keys, "
+             "the text is typed first and the keys pressed after it (type a command, then enter). For another order "
+             "— keys first, or several of each — give steps instead, done in their order: for example "
+             "[{\"keys\": [\"ctrl+l\"]}, {\"text\": \"example.org\"}, {\"keys\": [\"enter\"]}].",
+             {**vm, "text": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}},
+              "steps": {"type": "array", "description": "In order; each either {\"text\": \"…\"} or "
+                        "{\"keys\": [\"…\"]}. Instead of text and keys.",
+                        "items": {"type": "object", "properties": {
+                            "text": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}}}}}},
              ("host", "vmid"), _send, _send_words),
         Tool("console_click", "console", "Click — or double-click, right-click, or turn the wheel (scroll: + up, − down) — "
              "on a running guest's screen at x, y of the latest console_screenshot picture (take a fresh one first: "
@@ -1856,6 +1911,9 @@ def _tools() -> list[Tool]:
              "replaced unless replace is true. The user sees every path in the approval window.",
              {**vm, "paths": {"type": "array", "items": {"type": "string"}},
               "folder": {"type": "string", "description": "The guest's folder it goes into."},
+              "owner": {"type": "string", "description": "Linux guests: the user (or user:group) the copied items "
+                        "are given to. Without it they get the folder's owner — root in /tmp, where then only root "
+                        "can remove them."},
               "replace": {"type": "boolean"}}, ("host", "vmid", "paths", "folder"), _send_files, _send_files_words),
         Tool("receive_files", "files", "Copy files and folders (names) from a folder of a running VM or container into "
              "a folder of the user's computer (a whole path that exists). What is there already is not replaced "
@@ -1866,8 +1924,11 @@ def _tools() -> list[Tool]:
               "replace": {"type": "boolean"}}, ("host", "vmid", "folder", "names", "to"), _receive_files,
              _receive_files_words),
         Tool("run_command", "commands", "Run a program inside a running VM through the QEMU guest agent and get its "
-             "output (for example [\"systemctl\", \"status\", \"nginx\"], or [\"sh\", \"-c\", \"df -h\"]).",
+             "output (for example [\"systemctl\", \"status\", \"nginx\"], or [\"sh\", \"-c\", \"df -h\"]). It runs "
+             "as root (SYSTEM on Windows) unless user is given.",
              {**vm, "command": {"type": "array", "items": {"type": "string"}},
+              "user": {"type": "string", "description": "Linux guests: run it as this user of the VM, from their home "
+                       "folder with their HOME — so what it makes is theirs, not root's."},
               "input": {"type": "string", "description": "Text given to the program's standard input."},
               "timeout_s": {"type": "integer", "minimum": 1, "maximum": EXEC_WAIT_S}},
              ("host", "vmid", "command"), _exec, _exec_words),
@@ -1919,9 +1980,10 @@ def access_table() -> list[dict]:
         if key == "host_commands":
             enforced = ("This app only: the commands go over SSH with the app's key, not through Proxmox's API, so "
                         "Proxmox cannot refuse them on its own. Each one is shown in the approval window, every time "
-                        "(no 'Allow This Kind for 1 Hour', nor longer). The app's SSH key file itself is not encrypted: a program "
-                        "running as you on this computer (Claude Code with a shell, too) could read it and use it "
-                        "without asking — Off stops the connector, not that.")
+                        "(no 'Allow This Kind for 1 Hour', nor longer). The app's SSH key file itself is not encrypted, "
+                        "nor are the hosts' API tokens in its settings (both readable by you alone): a program running "
+                        "as you on this computer (Claude Code with a shell, too) could read them and use them without "
+                        "asking — Off stops the connector, not that.")
         elif key == "files":
             enforced = ("VMs — this app and Proxmox: lent to Claude's token only for a request the app allows: "
                         f"{', '.join(privs)}; only the app's own copy and listing commands run with it. Containers — "
@@ -1947,6 +2009,10 @@ def access_markdown() -> str:
              "(done at once). Above them, "
              "*Let Claude use Proxmox Controller* turns all of it off. Passwords never go through Claude: where one is "
              "needed, the app asks you for it in its own window. Every request is logged with the reason Claude gave.",
+             "",
+             "The switches govern Claude as it works through this app. A program that runs as you on this computer — "
+             "Claude Code with a shell of its own, too — is outside them: it can read the app's files, the hosts' API "
+             "tokens and the app's SSH key among them, which are not encrypted, only readable by you alone.",
              ""]
     for row in access_table():
         lines += [f"## {row['title']} — default: {row['default'].capitalize()}", "", f"{row['covers']}.", "",

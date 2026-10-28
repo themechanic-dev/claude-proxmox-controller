@@ -180,13 +180,13 @@ def _names_b64(names: Iterable[str]) -> str:
     return base64.b64encode("\0".join(names).encode("utf-8")).decode("ascii")
 
 
-# Linux, over the network: the archive comes on curl's pipe into tar; what came is given to the folder's owner.
-# (Expect: — curl would wait a second for a "100 Continue" the channel does not send.)
+# Linux, over the network: the archive comes on curl's pipe into tar; what came is given to the owner asked for ($4),
+# or else to the folder's owner. (Expect: — curl would wait a second for a "100 Continue" the channel does not send.)
 LINUX_SEND_NET = r"""
 cd -- "$(printf %s "$1" | base64 -d)" || { echo "ERR No such folder"; exit 4; }
-o=$(stat -c %u:%g .)
+o=${4:-$(stat -c %u:%g .)}
 curl -fsS --connect-timeout 5 "$3" | tar -x --no-same-owner -f - || exit 5
-printf %s "$2" | base64 -d | xargs -0 -r chown -R "$o" -- 2>/dev/null
+printf %s "$2" | base64 -d | xargs -0 -r chown -R "$o" -- 2>/dev/null || [ -z "$4" ] || { echo "ERR Copied, but not given to $4"; exit 6; }
 exit 0
 """
 LINUX_RECV_NET = r"""
@@ -196,10 +196,10 @@ printf %s "$2" | base64 -d | tar -c --null -T - -f - | curl -fsS --connect-timeo
 # Linux, through Proxmox: the parts written by file-write, joined into tar; and the archive packed for file-read
 LINUX_JOIN = r"""
 d="$1"; cd -- "$(printf %s "$2" | base64 -d)" || { rm -rf -- "$d"; echo "ERR No such folder"; exit 4; }
-o=$(stat -c %u:%g .)
+o=${4:-$(stat -c %u:%g .)}
 cat "$d"/p* | tar -x --no-same-owner -f - ; s=$?
 rm -rf -- "$d"
-printf %s "$3" | base64 -d | xargs -0 -r chown -R "$o" -- 2>/dev/null
+printf %s "$3" | base64 -d | xargs -0 -r chown -R "$o" -- 2>/dev/null || [ -z "$4" ] || { echo "ERR Copied, but not given to $4"; exit 6; }
 exit $s
 """
 LINUX_PACK = r"""
@@ -659,6 +659,20 @@ def local_props(folder: Path, names: Iterable[str]) -> list[Props]:
 
 # -- the archive on this computer -----------------------------------------------------------------------
 
+OWNER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?")
+
+
+def owner_spec(owner: str | None) -> str:
+    """Who copied items are given to on a Linux guest, for chown: "" (the folder's owner), "user:group", or "user:"
+    for a bare user name (with that user's own group). ValueError for anything else."""
+    owner = (owner or "").strip()
+    if not owner:
+        return ""
+    if not OWNER.fullmatch(owner):
+        raise ValueError(f"owner: '{owner}' — a user name, or user:group.")
+    return owner if ":" in owner else owner + ":"
+
+
 def total_size(paths: Iterable[Path]) -> int:
     n = 0
     for p in paths:
@@ -934,8 +948,11 @@ class VmFiles:
         ops_result(*self.run(perms_argv(folder, names, mode, owner, scope), timeout=600), "Setting the permissions failed")
 
     # -- copies
-    def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event) -> str:
-        """The chosen files and folders of this computer into the VM's folder `dest`. Returns the way it went."""
+    def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event, owner: str = "") -> str:
+        """The chosen files and folders of this computer into the VM's folder `dest`. Returns the way it went.
+        owner (Linux, from owner_spec): who they are given to — else the folder's owner."""
+        if owner and self.os_name == "windows":
+            raise GuestError("An owner for the copied items is for Linux guests.")
         total = total_size(paths)
         done = [0]
 
@@ -952,7 +969,7 @@ class VmFiles:
                            .replace("{url}", channel.url("get")))
             else:
                 argv = ["sh", "-c", LINUX_SEND_NET, "sh", b64(dest), _names_b64(p.name for p in paths),
-                        channel.url("get")]
+                        channel.url("get"), owner]
             pid = self.start(argv)
             reached, st = self._reached(pid, channel, cancel, CONNECT_WAIT_S)
             if reached:
@@ -964,7 +981,7 @@ class VmFiles:
             self.kill(pid)
         finally:
             channel.close()
-        return self._send_through_proxmox(paths, dest, writer, progress, cancel)
+        return self._send_through_proxmox(paths, dest, writer, progress, cancel, owner)
 
     def _reached(self, pid: int, channel: Channel, cancel: threading.Event,
                  wait_s: float | None) -> tuple[bool, dict | None]:
@@ -1030,7 +1047,7 @@ class VmFiles:
         return self._receive_through_proxmox(folder, names, dest, progress, cancel)
 
     # -- through Proxmox (slow, but needs nothing between the VM and this computer)
-    def _send_through_proxmox(self, paths, dest, writer, progress, cancel) -> str:
+    def _send_through_proxmox(self, paths, dest, writer, progress, cancel, owner: str = "") -> str:
         with tempfile.TemporaryFile() as archive:
             writer(paths, archive)
             size = archive.tell()
@@ -1053,7 +1070,7 @@ class VmFiles:
         if self.os_name == "windows":
             argv = _ps(WINDOWS_JOIN.replace("{parts}", parts).replace("{dest}", b64(dest)))
         else:
-            argv = ["sh", "-c", LINUX_JOIN, "sh", parts, b64(dest), _names_b64(p.name for p in paths)]
+            argv = ["sh", "-c", LINUX_JOIN, "sh", parts, b64(dest), _names_b64(p.name for p in paths), owner]
         code, out, err = self.run(argv, timeout=600)
         if code != 0:
             raise GuestError((out + err).strip()[:300] or f"Unpacking in the VM failed ({code}).")
@@ -1191,12 +1208,14 @@ class ContainerFiles:
     def set_permissions(self, folder: str, names: list[str], mode: str, owner: str, scope: str = "self") -> None:
         self._exec(perms_argv(folder, names, mode, owner, scope), "Setting the permissions failed", 600)
 
-    def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event) -> str:
+    def send(self, paths: list[Path], dest: str, progress: Progress, cancel: threading.Event, owner: str = "") -> str:
         total = total_size(paths)
-        script = ('cd -- "$(printf %s "$1" | base64 -d)" || exit 4; o=$(stat -c %u:%g .); '
+        script = ('cd -- "$(printf %s "$1" | base64 -d)" || exit 4; o=${3:-$(stat -c %u:%g .)}; '
                   'tar -x --no-same-owner -f - || exit 5; '
-                  'printf %s "$2" | base64 -d | xargs -0 -r chown -R "$o" -- 2>/dev/null; exit 0')
-        proc = subprocess.Popen(self._argv(["sh", "-c", script, "sh", b64(dest), _names_b64(p.name for p in paths)]),
+                  'printf %s "$2" | base64 -d | xargs -0 -r chown -R "$o" -- 2>/dev/null || [ -z "$3" ] || '
+                  '{ echo "Copied, but not given to $3" >&2; exit 6; }; exit 0')
+        proc = subprocess.Popen(self._argv(["sh", "-c", script, "sh", b64(dest), _names_b64(p.name for p in paths),
+                                            owner]),
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **procs.hidden())
         done = [0]
 

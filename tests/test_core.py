@@ -849,6 +849,13 @@ class ScreenTest(unittest.TestCase):
         self.assertEqual(syms[6:9], [0xFFE3, 0xFFE9, 0xFFFF])  # ctrl, alt, delete held together
         with self.assertRaises(ValueError):
             screen.send(opener, keys=["hyperspace"])  # nothing typed when a key name is wrong
+        self.assertEqual(screen.send(opener, steps=[("keys", ["ctrl+l"]), ("text", "a"), ("keys", ["enter"])]), 3)
+        server = pve.cluster.consoles[-1]
+        self.assertTrue(wait_for(lambda: len([k for k in server.keys if k[1]]) >= 4))
+        downs = [k[2] for k in server.keys if k[1]]
+        self.assertEqual(downs[-4:], [0xFFE3, ord("l"), ord("a"), 0xFF0D])  # ctrl+l first, then the text, then enter
+        with self.assertRaises(ValueError):
+            screen.send(opener, steps=[("text", "typed?"), ("keys", ["hyperspace"])])  # checked before anything
 
     def test_click_scroll_and_mark(self):
         DemoPve._clusters.clear()
@@ -1783,12 +1790,14 @@ class ConnectorToolsTest(unittest.TestCase):
             def list(self, folder):
                 return folder, [guestfiles.Entry("docs", True, 0, 0), guestfiles.Entry("a.txt", False, 3, 1700000000)]
 
-            def send(self, paths, dest, progress, cancel):
-                made.append(("send", [p.name for p in paths], dest))
+            def send(self, paths, dest, progress, cancel, owner=""):
+                made.append(("send", [p.name for p in paths], dest) + ((owner,) if owner else ()))
                 return "network"
 
             def receive(self, folder, names, dest, progress, cancel, total=None):
-                progress(42, None, "proxmox")
+                progress(42, None, "proxmox")  # the archive's bytes, headers and padding with them
+                for n in names:
+                    (dest / n).write_bytes(b"y" * 29)
                 made.append(("receive", folder, names, str(dest)))
                 return "proxmox"
 
@@ -1818,6 +1827,17 @@ class ConnectorToolsTest(unittest.TestCase):
             out = self.run_tool("send_files", host="demo-pve", vmid=201, paths=[str(local / "a.txt")], folder="/home",
                                 replace=True, reason="r")
             self.assertEqual((out["way"], made[-1]), ("network", ("send", ["a.txt"], "/home")))
+            # given to a user (in /tmp they would be root's): user alone means that user's own group
+            what, lines = self.words("send_files", host="demo-pve", vmid=201, paths=[str(local / "b.bin")],
+                                     folder="/tmp", owner="user", reason="r")
+            self.assertIn("Given to: user", lines)
+            self.run_tool("send_files", host="demo-pve", vmid=201, paths=[str(local / "b.bin")], folder="/tmp",
+                          owner="user", reason="r")
+            self.assertEqual(made[-1], ("send", ["b.bin"], "/tmp", "user:"))
+            for bad in ("two words", "user:", ":grp", "a;rm"):
+                with self.assertRaises(connector_tools.ToolError):
+                    self.run_tool("send_files", host="demo-pve", vmid=201, paths=[str(local / "b.bin")],
+                                  folder="/tmp", owner=bad, reason="r")
             for bad in (["relative/a.txt"], [str(local / "nope")], []):
                 with self.assertRaises(connector_tools.ToolError):
                     self.words("send_files", host="demo-pve", vmid=201, paths=bad, folder="/home", reason="r")
@@ -1830,8 +1850,8 @@ class ConnectorToolsTest(unittest.TestCase):
             self.assertEqual(lines, ["From: /home", "• c.txt", f"Into: {local}", "Nothing there is replaced."])
             out = self.run_tool("receive_files", host="demo-pve", vmid=201, folder="/home", names=["c.txt"],
                                 to=str(local), reason="r")
-            self.assertEqual((out["bytes"], out["way"], made[-1]), (42, "proxmox", ("receive", "/home", ["c.txt"],
-                                                                                    str(local))))
+            self.assertEqual((out["bytes"], out["way"], made[-1]), (29, "proxmox", ("receive", "/home", ["c.txt"],
+                                                                                    str(local))))  # what arrived
             for names in (["../etc"], ["a/b"], [""]):
                 with self.assertRaises(connector_tools.ToolError):
                     self.words("receive_files", host="demo-pve", vmid=201, folder="/home", names=names, to=str(local),
@@ -1858,6 +1878,16 @@ class ConnectorToolsTest(unittest.TestCase):
                 self.run_tool("console_screenshot", host="demo-pve", vmid=vmid, reason="r")
         with self.assertRaises(connector_tools.ToolError):
             self.run_tool("console_send", host="demo-pve", vmid=201, keys=["warp"], reason="r")
+        # steps: keys first where the order matters (ctrl+l, then the address), shown so in the approval window
+        steps = [{"keys": ["ctrl+l"]}, {"text": "ab"}, {"keys": ["enter"]}]
+        self.assertEqual(self.words("console_send", host="demo-pve", vmid=201, steps=steps, reason="r")[1],
+                         ["Press: ctrl+l", "Type: 'ab'", "Press: enter"])
+        self.assertEqual(self.run_tool("console_send", host="demo-pve", vmid=201, steps=steps,
+                                       reason="r")["keys_pressed"], 4)
+        for bad in ({"steps": steps, "text": "x"}, {"steps": [{"text": "a", "keys": ["enter"]}]},
+                    {"steps": [{"click": 1}]}, {}):
+            with self.assertRaises(connector_tools.ToolError):
+                self.run_tool("console_send", host="demo-pve", vmid=201, reason="r", **bad)
         out = self.run_tool("run_command", host="demo-pve", vmid=201, command=["uname", "-a"], reason="r")
         self.assertEqual(out["exit_code"], 0)
         self.assertIn("ubuntu-desktop", out["stdout"])
@@ -1867,6 +1897,28 @@ class ConnectorToolsTest(unittest.TestCase):
                                        reason="r")["exit_code"], 1)
         with self.assertRaises(connector_tools.ToolError):
             self.run_tool("run_command", host="demo-pve", vmid=100, command=["ls"], reason="r")  # a container
+        # as a user of the VM (the agent runs everything as root): wrapped in RUN_AS, shown in the approval window
+        self.assertIn("As root", self.words("run_command", host="demo-pve", vmid=201, command=["ls"], reason="r")[1])
+        self.assertIn("As the user user", self.words("run_command", host="demo-pve", vmid=201, command=["ls"],
+                                                     user="user", reason="r")[1])
+        sent = []
+        real = DemoPve.agent_exec
+        with mock.patch.object(DemoPve, "agent_exec",
+                               lambda me, node, vmid, argv, input_data="": sent.append(argv) or real(me, node, vmid,
+                                                                                                    ["true"])):
+            self.run_tool("run_command", host="demo-pve", vmid=201, command=["git", "log"], user="user", reason="r")
+        self.assertEqual(sent[-1], ["sh", "-c", connector_tools.RUN_AS, "sh", "user", "git", "log"])
+        for bad in ("two words", "-u", "root;id"):
+            with self.assertRaises(connector_tools.ToolError):
+                self.run_tool("run_command", host="demo-pve", vmid=201, command=["ls"], user=bad, reason="r")
+        with mock.patch.object(connector_tools.guestfiles, "os_of", lambda cfg: "windows"), \
+                self.assertRaises(connector_tools.ToolError) as caught:
+            self.run_tool("run_command", host="demo-pve", vmid=201, command=["whoami"], user="user", reason="r")
+        self.assertIn("Linux guests", str(caught.exception))
+        # the wrapper itself, here: a user the VM does not have is said so (running as one needs root: not here)
+        done = subprocess.run(["sh", "-c", connector_tools.RUN_AS, "sh", "no-such-user-pc", "true"],
+                              capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stderr.strip()), (125, "There is no user no-such-user-pc in this VM."))
 
 
 class FakeRegistry:
@@ -2789,6 +2841,22 @@ class GuestFilesLinuxTest(unittest.TestCase):
         self.assertEqual([p for p in os.listdir("/tmp") if p.startswith("pcx-")], [])  # Proxmox's way cleans up
         for argv in self.agent.started:  # the agent is never given anything but ASCII (it stalls on other text)
             self.assertTrue(all(ord(c) < 128 for a in argv for c in a), argv)
+
+    def test_given_to_an_owner_or_said_so(self):
+        """send_files' owner (27/10: a file sent into /tmp was root's, and the user could not remove it): both ways
+        give the items to the owner asked for, and say so when they could not."""
+        import getpass
+        me = guestfiles.owner_spec(getpass.getuser())
+        for unreachable in (False, True):
+            files = self.files(unreachable)
+            dest = self.vm / f"to-{unreachable}"
+            dest.mkdir()
+            files.send([self.pc / "setup.bin"], str(dest), self.note, threading.Event(), me)
+            self.assertEqual((dest / "setup.bin").stat().st_uid, os.getuid())
+            with self.assertRaises(guestfiles.GuestError) as caught:
+                files.send([self.pc / "φάκελος"], str(dest), self.note, threading.Event(), "no-such-user-pc:")
+            self.assertIn("not given to no-such-user-pc", str(caught.exception))
+            self.assertTrue((dest / "φάκελος" / "μέσα" / "σημειώσεις.txt").exists())  # copied all the same
 
     def test_a_small_file_ends_while_the_app_looks(self):
         """26/10: a small PDF went over whole while the app was still waiting for the guest's curl to come; the agent
