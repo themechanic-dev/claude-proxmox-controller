@@ -988,7 +988,7 @@ class ClaudeAccessTest(unittest.TestCase):
         self.assertEqual(allow.remaining("h", "power"), 0)
         allow.grant("h", "power", 60)  # given on a request about no guest (a new VM, an ISO, the host)
         self.assertEqual(claude_policy.decide(settings, "h", "power", allow), "on")  # "for 1 hour"
-        self.assertTrue(59 < allow.remaining("h", "power") <= 60)
+        self.assertTrue(59 < round(allow.remaining("h", "power"), 6) <= 60)  # (rounded: on Windows the clock may not have ticked, and end − now is then 60 plus a hair of float)
         self.assertEqual(claude_policy.decide(settings, "h", "power", allow, [108]), "ask")  # never for a guest
         self.assertEqual(claude_policy.TEMP_ALLOW_HOURS, (1, 3, 8, 12))  # the arrow's choices (the user's, 19/10)
         self.assertEqual(claude_policy.decide(settings, "other", "power", allow), "ask")
@@ -1002,7 +1002,7 @@ class ClaudeAccessTest(unittest.TestCase):
         self.assertEqual(claude_policy.decide(settings, "h", "console", allow, [108, 109]), "ask")  # each one
         allow.grant("h", "console", 30, [109, 110])
         self.assertEqual(claude_policy.decide(settings, "h", "console", allow, [108, 109]), "on")
-        self.assertTrue(29 < allow.remaining("h", "console", [108, 109]) <= 30)  # the shortest of them
+        self.assertTrue(29 < round(allow.remaining("h", "console", [108, 109]), 6) <= 30)  # the shortest of them
         self.assertEqual([v for v, _ in allow.given("h", "console")], [108, 109, 110])
         self.assertEqual([v for v, _ in allow.given("h", "power")], [None])
         allow.end("h", "console")  # a click on the switch ends every guest's hours of that kind

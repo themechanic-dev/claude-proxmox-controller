@@ -3547,7 +3547,7 @@ class ConnectorTest(UiCase):
         self.assertEqual(self.windows[-1].hour_btn.text(), "Allow on 102 for 1 Hour")  # for that guest only
         self.windows[-1].hour_btn.click()  # the button itself (not its arrow): 1 hour
         self.assertTrue(wait_until(lambda: "answer" in box))
-        self.assertTrue(3600 - 60 < self.conn.allowances.remaining("demo-pve", "power", [102]) <= 3600)
+        self.assertTrue(3600 - 60 < round(self.conn.allowances.remaining("demo-pve", "power", [102]), 6) <= 3600)
         self.assertEqual(self.conn.allowances.remaining("demo-pve", "power"), 0)  # nor for requests about no guest
         hosts = json.loads(self.text(self.request("list_hosts")))["hosts"]
         self.assertEqual(list(hosts[0]["hours_given"]), ["power"])  # Claude is told which guests go without asking
@@ -3582,7 +3582,7 @@ class ConnectorTest(UiCase):
         self.assertFalse(dlg.isVisible())
         self.assertTrue(wait_until(lambda: "answer" in box, 10))
         self.assertFalse(box["answer"]["result"]["isError"], self.text(box))
-        self.assertTrue(8 * 3600 - 60 < self.conn.allowances.remaining("demo-pve", "power", [102]) <= 8 * 3600)
+        self.assertTrue(8 * 3600 - 60 < round(self.conn.allowances.remaining("demo-pve", "power", [102]), 6) <= 8 * 3600)
         self.assertEqual(self.conn.allowances.remaining("demo-pve", "change", [102]), 0)  # that kind only
         self.assertTrue(wait_until(power.grant.isVisible))
         self.assertRegex(power.grant.text(), r"^Allowed without asking:  102 until \d\d:\d\d$")  # the number only
