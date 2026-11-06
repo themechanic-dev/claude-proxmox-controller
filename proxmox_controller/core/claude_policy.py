@@ -37,7 +37,8 @@ PRIVILEGES = {
                "VM.Config.HWType", "VM.Config.CDROM", "VM.Config.Cloudinit", "VM.Snapshot", "VM.Backup", "VM.Clone",
                "VM.Allocate", "Datastore.AllocateSpace", "Datastore.AllocateTemplate", "SDN.Use",
                "Sys.AccessNetwork"),  # (the newer privilege for downloads by URL; left out where Proxmox lacks it)
-    "destroy": ("VM.Allocate", "VM.Snapshot", "VM.Snapshot.Rollback", "VM.Backup", "Datastore.AllocateSpace"),
+    "destroy": ("VM.Allocate", "VM.Snapshot", "VM.Snapshot.Rollback", "VM.Backup", "Datastore.AllocateSpace",
+                "SDN.Use"),  # a restore over a guest: Proxmox checks the bridges of the backup (the task fails)
     "host": ("Sys.PowerMgmt",),
     "console": ("VM.Console",),
     "commands": ("VM.GuestAgent.Unrestricted",),

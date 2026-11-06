@@ -3761,6 +3761,23 @@ class ConnectorTest(UiCase):
         tool = connector_tools.TOOLS["create_vm"]
         self.assertEqual((tool.also_of({}), tool.also_of({"start": True})), ((), ("power",)))  # lent only for a start
 
+    def test_restore_over_a_guest_lends_its_bridge(self):
+        """A restore over a guest is a Destroy request, and inside the task Proxmox checks SDN.Use on the bridges of the
+        backup (found on the real pve 05/11: every one failed): Destroy's own privileges are enough, with Change Off."""
+        claude_policy.set_switch(self.win.settings, "demo-pve", "destroy", "ask")
+        claude_policy.set_switch(self.win.settings, "demo-pve", "change", "off")
+        self.admin.wait_task("pve", self.admin.backup_now("pve", 201, "local", "snapshot", "zstd", "vm"), timeout=5)
+        for vmid in (201, 101):  # a VM, a container
+            self.admin.cluster.guests[vmid]["status"] = "stopped"
+            box = self.request("restore_backup", wait=False, host="demo-pve", vmid=vmid, replace=True, reason="r",
+                               volid=self.admin.backups("pve", vmid)[0]["volid"])
+            self.assertTrue(wait_until(lambda: self.windows and self.windows[-1].isVisible()))
+            self.windows[-1].allow_btn.click()
+            self.assertTrue(wait_until(lambda: "answer" in box, 10))
+            self.assertFalse(box["answer"]["result"]["isError"], self.text(box))
+            self.assertEqual(self.admin.cluster.restored_with["force"], "1")
+            self.assertEqual(self.role(), list(claude_policy.PRIVILEGES["read"]))  # all lent went back
+
     def test_password_typed_by_the_user(self):
         # the pretend VM's agent answers at once, so the app would take the setup disc away (as it should) before
         # this test reads what reached it — on a slow machine it did

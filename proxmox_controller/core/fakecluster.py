@@ -772,6 +772,12 @@ class FakeCluster:
                 raise ValueError(f"unable to restore VM {vmid} - VM {vmid} already exists")
             if old["status"] == "running":
                 raise ValueError(f"unable to restore VM {vmid} - VM is running")
+        if (not self.allowed([("SDN.Use",)]) and not self.is_root()
+                and (kind == "qemu" or "bridge=" in b["guest"].get("net0", ""))):
+            # as Proxmox: checked inside the task, on the bridges of the backup (found on the real pve, 05/11)
+            upid = self._task("qmrestore" if kind == "qemu" else "vzrestore", vmid)
+            self.finish_task(upid, "403 Permission check failed (/sdn/zones/localnetwork/vmbr0, SDN.Use)")
+            return upid
         self.restored_with = dict(p)  # what the request asked for, for the tests (unique: new MAC addresses)
         g = deepcopy(b["guest"])
         g.update(vmid=vmid, status="running" if p.get("start") == "1" else "stopped")

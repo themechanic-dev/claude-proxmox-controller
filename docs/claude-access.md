@@ -62,7 +62,7 @@ Edit, notes, snapshots, Back Up Now, new VMs and containers, copies, ISOs.
 
 Delete guests, roll back or delete snapshots, delete backups, restore over.
 
-*This app and Proxmox: lent to Claude's token only for a request the app allows: VM.Allocate, VM.Snapshot, VM.Snapshot.Rollback, VM.Backup, Datastore.AllocateSpace*
+*This app and Proxmox: lent to Claude's token only for a request the app allows: VM.Allocate, VM.Snapshot, VM.Snapshot.Rollback, VM.Backup, Datastore.AllocateSpace, SDN.Use*
 
 | Tool | What it does |
 |---|---|
