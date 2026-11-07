@@ -103,7 +103,7 @@ Everything works without Claude too:
   package brings virt-viewer with it):
 
   ```bash
-  sudo apt install ./proxmox-controller_1.0.5_amd64.deb
+  sudo apt install ./proxmox-controller_1.0.6_amd64.deb
   ```
 
 - **Ubuntu / Debian, from its apt repository** — it then updates with the rest of the system:
