@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -946,6 +947,46 @@ class ClaudeAccessTest(unittest.TestCase):
             c.guest_action("pve", "lxc", 102, "stop")  # the inner request ended; the outer one still runs
         self.refused(lambda: c.guest_action("pve", "lxc", 102, "start"))  # given back
         self.assertEqual(self.cluster.roles[claude_access.ROLE], list(claude_policy.PRIVILEGES["read"]))
+
+    def test_loans_ending_out_of_order(self):
+        """Requests end in any order. One that began first and ends last must not take back what a later one was
+        lent (found on the real host, 07/11: a long command, a start in between, then a copy: the copy got a 403)."""
+        secret, _ = claude_access.setup(self.admin, self.switches)
+        c, loans, switches = self.claude(secret), claude_access.Loans(), lambda: self.switches
+        agent = "VM.GuestAgent.Unrestricted"
+        command = loans.lend("demo-pve", self.admin, switches, claude_policy.PRIVILEGES["commands"])
+        command.__enter__()  # a long command runs
+        with loans.lend("demo-pve", self.admin, switches, claude_policy.PRIVILEGES["power"]):
+            c.guest_action("pve", "lxc", 102, "start")  # a start comes and goes meanwhile
+        copy = loans.lend("demo-pve", self.admin, switches, claude_policy.PRIVILEGES["files"])
+        copy.__enter__()  # then a copy begins
+        command.__exit__(None, None, None)  # the command ends first
+        self.assertIn(agent, self.cluster.roles[claude_access.ROLE])  # the copy still holds it
+        self.assertEqual(loans.lent("demo-pve"), [agent])
+        copy.__exit__(None, None, None)
+        self.assertEqual((loans.lent("demo-pve"), self.cluster.roles[claude_access.ROLE]),
+                         ([], list(claude_policy.PRIVILEGES["read"])))
+
+    def test_loans_in_any_order(self):
+        """Requests of every kind beginning and ending in a shuffled order: the role holds exactly reading plus what
+        the requests running at that moment were lent — never less, never more — and reading alone at the end."""
+        claude_access.setup(self.admin, self.switches)
+        loans, switches, rnd = claude_access.Loans(), lambda: self.switches, random.Random(7)
+        read, running = set(claude_policy.PRIVILEGES["read"]), []
+        for _ in range(300):
+            if running and (len(running) > 4 or rnd.random() < 0.5):
+                loan, _kind = running.pop(rnd.randrange(len(running)))
+                loan.__exit__(None, None, None)
+            else:
+                kind = rnd.choice(("commands", "files", "power", "console", "change", "destroy"))
+                loan = loans.lend("demo-pve", self.admin, switches, claude_policy.PRIVILEGES[kind])
+                loan.__enter__()
+                running.append((loan, kind))
+            held = set().union(*(claude_policy.PRIVILEGES[k] for _, k in running))
+            self.assertEqual(set(self.cluster.roles[claude_access.ROLE]), read | held)
+        for loan, _kind in running:
+            loan.__exit__(None, None, None)
+        self.assertEqual((loans.lent("demo-pve"), set(self.cluster.roles[claude_access.ROLE])), ([], read))
 
     def test_switches_and_removal(self):
         secret, _ = claude_access.setup(self.admin, self.switches)

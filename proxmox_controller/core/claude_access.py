@@ -81,7 +81,10 @@ def sync(admin: Pve, switches: dict, lent: list[str] | tuple = ()) -> list[str]:
 
 class Loans:
     """Privileges lent to running requests, per host, counted: two requests at once share them, and they go back
-    only when the last one ends. Role changes are made one at a time."""
+    only when the last one ends — in whatever order the requests end. Role changes are made one at a time.
+    Each host keeps one counter for good: one put in its place would leave a request that began before it counting
+    on the old one, so its end would take back what a later request holds and give back nothing of its own
+    (found 07/11: a copy refused mid-way, and the agent's privilege left on the role at rest)."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -106,7 +109,8 @@ class Loans:
         finally:
             with self.lock:
                 counter.subtract(privs)
-                self.active[host_id] = +counter  # (drops what reached zero)
+                for p in [p for p, n in counter.items() if n <= 0]:
+                    del counter[p]  # in place: the host's one counter, shared with requests still running
                 sync(admin, switches(), self.lent(host_id))
 
 
