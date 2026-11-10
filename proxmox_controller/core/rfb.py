@@ -1,5 +1,6 @@
 """The VNC protocol (RFB 3.3–3.8), client side, enough for a Proxmox console: VNC authentication, a 32-bit true-colour
-screen with Raw and CopyRect updates, resolution changes, keys and the mouse.
+screen with Raw and CopyRect updates, resolution changes, keys and the mouse. A recording also asks for Tight (far
+fewer bytes than Raw: core/tight.py) and for the pointer's position, which it draws into its frames.
 
 Keys travel as physical key codes (QEMU's extended key event) when the server offers it, so the layout chosen on
 this computer (Greek, English…) does not matter — the guest applies its own. Containers (vncterm) get key symbols.
@@ -10,9 +11,11 @@ from __future__ import annotations
 import struct
 
 from .des import vnc_response
+from .tight import COMPRESS_LEVEL_0, ENC_TIGHT, JPEG_QUALITY_0, TightDecoder
 from .websocket import WebSocket
 
 ENC_RAW, ENC_COPYRECT, ENC_DESKTOP_SIZE, ENC_CURSOR, ENC_QEMU_EXT_KEY = 0, 1, -223, -239, -258
+ENC_POINTER_POS = -232  # where the guest's pointer is (asked for by a recording, which draws the pointer itself)
 
 # Linux input codes (evdev) → QEMU key numbers (PC/XT scan codes; 0x80 marks the E0-prefixed keys).
 # Codes 1–88 are the same in both; the rest are the extended keys.
@@ -65,13 +68,18 @@ class RfbError(Exception):
 
 
 class RfbClient:
-    def __init__(self, ws: WebSocket, password: str = ""):
+    def __init__(self, ws: WebSocket, password: str = "", tight: TightDecoder | None = None,
+                 jpeg_quality: int = 7, compress_level: int = 6, pipelined: bool = False):
         self.ws = ws
         self.password = password
         self.buf = bytearray()
         self.width = self.height = 0
         self.name = ""
         self.ext_keys = False  # the server takes physical key codes
+        self.tight, self.jpeg_quality = tight, jpeg_quality  # Tight asked for only with a decoder (a recording)
+        self.compress_level = compress_level  # Tight's zlib level on the server: lower is faster for QEMU
+        self.pipelined = pipelined  # the next update asked for before this one is read: the server works meanwhile
+        self.received = 0  # bytes of the console stream so far
 
     # -- the stream on top of WebSocket messages ---------------------------------------------------
 
@@ -80,6 +88,7 @@ class RfbClient:
             message = self.ws.recv()
             if message is None:
                 raise ConnectionError("The console was closed.")
+            self.received += len(message)
             self.buf += message
         out = bytes(self.buf[:n])
         del self.buf[:n]
@@ -129,6 +138,9 @@ class RfbClient:
         # 32-bit little-endian 0x00RRGGBB — the byte order of a QImage in Format_RGB32
         self._send(struct.pack(">B3xBBBBHHHBBB3x", 0, 32, 24, 0, 1, 255, 255, 255, 16, 8, 0))
         encodings = (ENC_COPYRECT, ENC_RAW, ENC_DESKTOP_SIZE, ENC_CURSOR, ENC_QEMU_EXT_KEY)
+        if self.tight is not None:  # first in the list: the one the server prefers
+            encodings = (ENC_TIGHT,) + encodings + (ENC_POINTER_POS, JPEG_QUALITY_0 + self.jpeg_quality,
+                                                     COMPRESS_LEVEL_0 + self.compress_level)
         self._send(struct.pack(">BxH", 2, len(encodings)) + b"".join(struct.pack(">i", e) for e in encodings))
         self.request_update(incremental=False)
         return self.width, self.height, self.name
@@ -144,13 +156,16 @@ class RfbClient:
         """Waits for the next screen update and returns its pieces:
         ("raw", x, y, w, h, bytes) · ("copy", src_x, src_y, x, y, w, h) · ("size", w, h) · ("bell",) · ("cut", text)
         · ("cursor", hot_x, hot_y, w, h, argb) — the guest's mouse pointer as 32-bit pixels with real alpha
-          (w = h = 0: the guest shows no pointer)"""
+          (w = h = 0: the guest shows no pointer) · ("pointer", x, y) — where the pointer is (only when asked for)"""
         while True:
             kind = self._read(1)[0]
             if kind == 0:
                 self._read(1)
                 ops = []
-                for _ in range(int.from_bytes(self._read(2), "big")):
+                count = int.from_bytes(self._read(2), "big")
+                if self.pipelined:
+                    self.request_update(incremental=True)
+                for _ in range(count):
                     x, y, w, h, enc = struct.unpack(">HHHHi", self._read(12))
                     if enc == ENC_RAW:
                         ops.append(("raw", x, y, w, h, opaque(self._read(w * h * 4))))
@@ -166,9 +181,14 @@ class RfbClient:
                         ops.append(("cursor", x, y, w, h, cursor_argb(pixels, mask, w, h)))
                     elif enc == ENC_QEMU_EXT_KEY:
                         self.ext_keys = True
+                    elif enc == ENC_TIGHT and self.tight is not None:
+                        ops.append(("raw", x, y, w, h, self.tight.rect(self._read, w, h)))
+                    elif enc == ENC_POINTER_POS:
+                        ops.append(("pointer", x, y))
                     else:
                         raise RfbError(f"The console sent a picture format this app does not know ({enc}).")
-                self.request_update(incremental=True)
+                if not self.pipelined:
+                    self.request_update(incremental=True)
                 return ops
             if kind == 1:  # colour map entries: unused with true colour
                 self._read(1)

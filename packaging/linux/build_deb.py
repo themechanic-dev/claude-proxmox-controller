@@ -8,8 +8,9 @@ It needs PyInstaller in that environment (pip install pyinstaller, beside requir
   2. the package's tree: /opt/proxmox-controller (the app), /usr/bin/proxmox-controller, the menu entry and icons;
   3. dpkg-deb: dist/linux/proxmox-controller_<version>_amd64.deb, and its SHA-256.
 
-The package needs virt-viewer (the SPICE console: apt installs it with the app) and the few system libraries Qt
-draws with; it is what the app's own updates install (core/updates: pkexec apt-get install)."""
+The package needs virt-viewer (the SPICE console: apt installs it with the app), GStreamer (recording a console:
+gst-launch-1.0 with openh264 and AAC, core/recorder.py) and the few system libraries Qt draws with; it is what the
+app's own updates install (core/updates: pkexec apt-get install)."""
 
 from __future__ import annotations
 
@@ -31,6 +32,8 @@ sys.path.insert(0, str(ROOT))
 from proxmox_controller import APP_ID, APP_NAME, VERSION  # noqa: E402
 
 DEPENDS = ["virt-viewer", "libegl1", "libgl1", "libxkbcommon0", "libfontconfig1", "libdbus-1-3",
+           # recording a console (core/recorder.py): gst-launch-1.0, raw parsers, MP4, openh264 + AAC (plugins-bad)
+           "gstreamer1.0-tools", "gstreamer1.0-plugins-base", "gstreamer1.0-plugins-good", "gstreamer1.0-plugins-bad",
            # Qt's X11 side, which the app uses on GNOME's Wayland too (through XWayland: windows reopen where they
            # were). Ubuntu Desktop 26.04 has few of these: the app did not start from its menu there (26/10, VM 109).
            # Listed with ldd over the whole package.
@@ -39,7 +42,8 @@ DEPENDS = ["virt-viewer", "libegl1", "libgl1", "libxkbcommon0", "libfontconfig1"
            # ... and the X11 libraries the package no longer carries (the spec's DROP: one version, the system's)
            "libx11-6", "libx11-xcb1", "libxcb-cursor0", "libxcb-glx0", "libxcb-image0", "libxcb-randr0",
            "libxcb-render0", "libxcb-render-util0", "libxcb-shm0", "libxcb-sync1", "libxcb-util1", "libxcb-xfixes0"]
-RECOMMENDS = ["openssh-client"]  # (the host's Console and Upgrade)
+RECOMMENDS = ["openssh-client",  # (the host's Console and Upgrade)
+              "gstreamer1.0-plugins-ugly"]  # x264: recording where openh264 is missing
 
 
 def control_text(installed_kb: int, version: str = VERSION) -> str:

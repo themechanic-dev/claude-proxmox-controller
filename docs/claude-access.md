@@ -85,13 +85,14 @@ Shut down or reboot the host itself.
 
 ## Console — default: Off
 
-See a guest's screen, type into it and click on it.
+See a guest's screen, type and click in it, record it as a video.
 
 *This app and Proxmox: lent to Claude's token only for a request the app allows: VM.Console*
 
 | Tool | What it does |
 |---|---|
 | `console_screenshot` | A picture of a running guest's screen — wider screens are shrunk by a whole factor (1920×1080 comes as 960×540). |
+| `console_record` | Record a running guest's console as a video (MP4, H.264), with the VM's sound when it has a SPICE sound card, at the guest's own resolution, with nothing shown on the user's screen. |
 | `console_send` | Type text into a running guest's console and/or press keys: enter, tab, escape, backspace, delete, arrows (up, down, left, right), home, end, pageup, pagedown, f1–f12, and combinations such as ctrl+alt+delete or ctrl+c. |
 | `console_click` | Click — or double-click, right-click, or turn the wheel (scroll: + up, − down) — on a running guest's screen at x, y of the latest console_screenshot picture (take a fresh one first: the click lands where things are now). |
 | `console_type_password` | Type a password into a running guest's console — at a login, a sudo prompt, or an installer's password screen. *(asks you for a password)* |

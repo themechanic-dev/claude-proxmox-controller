@@ -55,6 +55,10 @@ fi
 if [ "${XDG_SESSION_TYPE:-}" = "x11" ] && ! /sbin/ldconfig -p 2>/dev/null | grep -q 'libxcb-cursor\.so\.0'; then
   echo "Note: on an X11 session Qt also needs libxcb-cursor0 (Ubuntu / Debian: sudo apt install libxcb-cursor0)." >&2
 fi
+if ! command -v gst-launch-1.0 >/dev/null 2>&1; then
+  echo "Note: recording a console needs GStreamer (Ubuntu / Debian: sudo apt install gstreamer1.0-tools" \
+       "gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad)." >&2
+fi
 
 # --- 3. launcher and icon -----------------------------------------------------------------------
 mkdir -p "$APPS" "$ICONS/scalable/apps"

@@ -2442,7 +2442,13 @@ class ConsoleChoiceTest(UiCase):
         self.assertTrue(wait_until(lambda: self.errors))
         self.assertIn("built-in console", self.errors[-1][1])
         menu = view.act["console"].menu()
-        self.assertEqual([a.text() for a in menu.actions()], [t for _h, t in host_view.CONSOLE_WAYS])
+        self.assertEqual([a.text() for a in menu.actions()],
+                         [t for _h, t in host_view.CONSOLE_WAYS] + ["", "Record Console"])  # (a line between)
+        menu.aboutToShow.emit()  # Record Console for the selected guest: running, so it can be used
+        self.assertTrue(view.record_action.isEnabled())
+        self.select(view, 102)  # a stopped container: nothing to record
+        menu.aboutToShow.emit()
+        self.assertEqual((view.record_action.text(), view.record_action.isEnabled()), ("Record Console", False))
 
 
 class GraphWallTest(UiCase):
@@ -3899,6 +3905,90 @@ class ConnectorTest(UiCase):
         content = box["answer"]["result"]["content"]
         self.assertEqual((content[0]["type"], content[0]["mimeType"]), ("image", "image/png"))
         self.assertEqual(self.role(), list(claude_policy.PRIVILEGES["read"]))  # VM.Console only while it ran
+
+    class RecordEncoder:
+        """A pretend encoder: the frames counted, a file left behind."""
+
+        def __init__(self, path, w, h, fps, audio):
+            self.path, self.frames, self.audio_on = path, 0, audio
+
+        def video(self, frame):
+            self.frames += 1
+
+        def audio(self, pcm):
+            pass
+
+        def close(self):
+            self.path.write_bytes(b"video")
+
+    def test_console_recording_for_claude(self):
+        """console_record: a video of the console in the background, VM.Console lent only to start it, the red mark
+        while it runs (Claude's), and where the video is when it stops."""
+        from proxmox_controller.core import recorder
+        claude_policy.set_switch(self.win.settings, "demo-pve", "console", "on")
+        folder = Path(self.private) / "Videos"
+        self.addCleanup(recorder.stop_all)
+        with mock.patch.object(recorder, "videos_folder", lambda: folder), \
+                mock.patch.object(recorder, "make_encoder", self.RecordEncoder):
+            start = json.loads(self.text(self.request("console_record", host="demo-pve", vmid=201, action="start",
+                                                       reason="record the build")))
+            self.assertEqual((start["guest"], start["sound"], start["by"]), ("VM 201 (ubuntu-desktop)", False, "Claude"))
+            self.assertIn("no SPICE sound card", start["sound_note"])  # (the demo has none)
+            self.assertEqual(Path(start["file"]).parent, folder)
+            self.assertIn("console_record with action stop", start["next"])
+            self.assertEqual(self.role(), list(claude_policy.PRIVILEGES["read"]))  # lent to start it only
+            self.win.recording_mark.refresh()
+            self.assertIn("Claude is recording VM 201 (ubuntu-desktop)", self.win.recording_mark.text.text())
+            again = self.request("console_record", host="demo-pve", vmid=201, action="start", reason="twice")
+            self.assertIn("already being recorded", self.text(again))
+            time.sleep(0.5)
+            status = json.loads(self.text(self.request("console_record", host="demo-pve", vmid=201,
+                                                        action="status", reason="see")))
+            self.assertTrue(status["recording"])
+            stop = json.loads(self.text(self.request("console_record", host="demo-pve", vmid=201, action="stop",
+                                                      reason="done")))
+            self.assertEqual((stop["ended"], stop["file"], stop["bytes"]), ("stopped", start["file"], 5))
+            self.assertGreater(stop["seconds"], 0.3)
+            self.win.recording_mark.refresh()
+            self.assertIn("Saved: " + Path(start["file"]).name, self.win.recording_mark.text.text())
+            self.assertTrue(self.win.recording_mark.show_btn.isVisibleTo(self.win.recording_mark))
+            stopped = self.request("console_record", host="demo-pve", vmid=102, action="start", reason="r")
+            self.assertIn("is not running: start it first", self.text(stopped))  # (102: a stopped container)
+        log = [e for e in connector_log.last() if e["tool"] == "console_record"]
+        self.assertEqual(log[0]["what"], "Record the console of VM 201 (ubuntu-desktop) as a video")
+
+    def test_console_recording_for_the_user(self):
+        """Record Console (the guest's Console menu, the console window): the user's own token, the same mark, Stop
+        from the mark."""
+        from proxmox_controller.core import recorder
+        from proxmox_controller.ui import recording
+        folder = Path(self.private) / "Videos"
+        self.addCleanup(recorder.stop_all)
+        host = self.win.hosts[0]
+        g = {"vmid": 201, "node": "pve", "type": "qemu", "name": "ubuntu-desktop", "status": "running"}
+        other = recording.RecordingIndicator(self.win.runner, lambda _m: None)
+        self.addCleanup(other.deleteLater)
+        with mock.patch.object(recorder, "videos_folder", lambda: folder), \
+                mock.patch.object(recorder, "make_encoder", self.RecordEncoder):
+            recording.toggle(self.win, host, self.win.make_client, self.win.runner, g, self.win.notify)
+            self.assertTrue(wait_until(lambda: recording.recording(host.id, 201), 10))
+            self.assertFalse(recording.with_sound(host.id, 201))  # the demo has no SPICE
+            self.win.recording_mark.refresh()
+            self.assertIn("Recording ubuntu-desktop (201)", self.win.recording_mark.text.text())
+            win = console.show(f"{host.id}/201", "t", lambda: DemoPve(DEMO_HOSTS[0]).open_vnc("pve", "qemu", 201),
+                               record=lambda: None)
+            win._show_recording()
+            self.assertTrue(win.record_btn.text().startswith("● Stop Recording"))
+            time.sleep(0.4)
+            self.win.recording_mark.stop_btn.click()  # Stop, from the mark
+            self.assertTrue(wait_until(lambda: not recording.recording(host.id, 201), 10))
+            self.assertTrue(wait_until(lambda: (self.win.recording_mark.refresh() or
+                                                "Saved:" in self.win.recording_mark.text.text()), 10))
+            other.refresh()  # another window's mark (earlier tests' windows are still open): it has the news too
+            self.assertEqual(other.text.text(), self.win.recording_mark.text.text())
+            win._show_recording()
+            self.assertEqual(win.record_btn.text(), "Record")
+            console.close_all()
 
     def test_approval_window_stands_out(self):
         """Hazard stripes along the top (the title on a plate in the middle) and all round, and the sound chosen in

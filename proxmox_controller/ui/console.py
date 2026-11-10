@@ -448,9 +448,10 @@ OPEN: dict[str, "ConsoleWindow"] = {}  # key → open window, so a second click 
 
 
 class ConsoleWindow(QWidget):
-    def __init__(self, key: str, title: str, open_console: Callable[[], tuple]):
+    def __init__(self, key: str, title: str, open_console: Callable[[], tuple],
+                 record: Callable[[], None] | None = None):
         super().__init__(None, Qt.WindowType.Window)
-        self.key, self.open_console = key, open_console
+        self.key, self.open_console, self.record = key, open_console, record
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle(title)
         self.session: _Session | None = None
@@ -470,11 +471,15 @@ class ConsoleWindow(QWidget):
         self.full_btn = button("Full Screen")
         self.full_btn.setCheckable(True)
         self.full_btn.toggled.connect(self._full_screen)
+        self.record_btn = button("Record", tooltip="Record this console as a video (with the VM's sound, when it "
+                                                   "has SPICE) into the Videos folder — nothing extra shows on screen")
+        self.record_btn.clicked.connect(lambda: self.record() if self.record is not None else None)
+        self.record_btn.setVisible(record is not None)
         self.status = label("Connecting…", "dim")
         self.reconnect_btn = button("Reconnect", "suggested")
         self.reconnect_btn.clicked.connect(self.connect_now)
         self.reconnect_btn.hide()
-        for w in (self.cad_btn, self.paste_btn, self.full_btn):
+        for w in (self.cad_btn, self.paste_btn, self.full_btn, self.record_btn):
             bl.addWidget(w)
         bl.addStretch(1)
         bl.addWidget(self.status)
@@ -490,9 +495,17 @@ class ConsoleWindow(QWidget):
         self.job_timer = QTimer(self)
         self.job_timer.setInterval(PasteDialog.LOOK_MS)
         self.job_timer.timeout.connect(self._job_look)
+        self.rec_timer = QTimer(self)  # Record ↔ Stop Recording, with the time, as the recording goes
+        self.rec_timer.timeout.connect(self._show_recording)
+        self.rec_timer.start(1000)
         self.resize(820, 520)
         OPEN[key] = self
         self.connect_now()
+
+    def _show_recording(self) -> None:
+        from ..core import recorder
+        rec = recorder.get(self.key)
+        self.record_btn.setText(f"● Stop Recording {rec.status()['recording_for']}" if rec is not None else "Record")
 
     @property
     def client(self) -> RfbClient | None:
@@ -565,6 +578,8 @@ class ConsoleWindow(QWidget):
                 client.pointer(buttons, x, y)
             except OSError:
                 pass
+            from ..core import recorder
+            recorder.pointer_moved(self.key, x, y)  # (a recording of this guest draws the pointer there)
 
     def ctrl_alt_del(self) -> None:
         client = self.client
@@ -645,11 +660,13 @@ class ConsoleWindow(QWidget):
         super().closeEvent(ev)
 
 
-def show(key: str, title: str, open_console: Callable[[], tuple]) -> ConsoleWindow:
-    """Open a console window, or bring back the one already open for this guest."""
+def show(key: str, title: str, open_console: Callable[[], tuple],
+         record: Callable[[], None] | None = None) -> ConsoleWindow:
+    """Open a console window, or bring back the one already open for this guest. record: Record's action
+    (core/recorder.py), or None for no Record button."""
     win = OPEN.get(key)
     if win is None:
-        win = ConsoleWindow(key, title, open_console)
+        win = ConsoleWindow(key, title, open_console, record)
     win.show()
     win.raise_()
     win.activateWindow()

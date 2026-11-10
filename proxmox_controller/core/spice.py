@@ -60,7 +60,17 @@ def vv_text(cfg: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def launch(cfg: dict, program: str | None = None) -> subprocess.Popen:
+VIEWERS: dict[str, subprocess.Popen] = {}  # "host id/vmid" → the remote-viewer this app opened there
+
+
+def viewer_open(key: str) -> bool:
+    """Whether a remote-viewer this app opened for that guest still runs. SPICE takes one viewer at a time, so a
+    recording's sound would end it (core/recorder.py asks first)."""
+    proc = VIEWERS.get(key)
+    return proc is not None and proc.poll() is None
+
+
+def launch(cfg: dict, program: str | None = None, key: str = "") -> subprocess.Popen:
     """Write the connection file where only this user can read it and start the viewer on it. The viewer deletes
     the file once read (delete-this-file=1); a timer removes it anyway if the viewer never gets that far."""
     program = program or viewer()
@@ -76,4 +86,6 @@ def launch(cfg: dict, program: str | None = None) -> subprocess.Popen:
     timer = threading.Timer(60.0, lambda: shutil.rmtree(folder, ignore_errors=True))
     timer.daemon = True
     timer.start()
+    if key:
+        VIEWERS[key] = proc
     return proc

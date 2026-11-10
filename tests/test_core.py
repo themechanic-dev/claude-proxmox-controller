@@ -4286,3 +4286,360 @@ class SetupDiscTest(unittest.TestCase):
         servers.clear()
         self.assertFalse(screen.answer_prompt(open_console, setupdisc.boot_prompt_on, timeout=1.0, quiet=0.3))
         self.assertTrue(servers and not any(s.keys for s in servers))
+
+
+class TightTest(unittest.TestCase):
+    """The picture of a recording: Tight rectangles as QEMU sends them, into the client's 32-bit pixels."""
+
+    @staticmethod
+    def stream(data: bytes):
+        buf = io.BytesIO(data)
+
+        def read(n):
+            out = buf.read(n)
+            assert len(out) == n, (len(out), n)
+            return out
+        return read
+
+    @staticmethod
+    def compact(n: int) -> bytes:
+        out = bytearray([n & 0x7F])
+        if n > 0x7F:
+            out[0] |= 0x80
+            out.append((n >> 7) & 0x7F)
+            if n > 0x3FFF:
+                out[1] |= 0x80
+                out.append((n >> 14) & 0xFF)
+        return bytes(out)
+
+    def test_every_kind_of_rectangle(self):
+        from proxmox_controller.core.tight import TightDecoder, bgrx_from_rgb
+        d = TightDecoder(None)
+        self.assertEqual(d.rect(self.stream(bytes([0x80, 10, 20, 30])), 4, 2), bytes((30, 20, 10, 255)) * 8)  # fill
+        rgb = b"".join(bytes((x * 10, y * 20, x + y)) for y in range(3) for x in range(5))
+        z = zlib.compressobj()
+        data = z.compress(rgb) + z.flush(zlib.Z_SYNC_FLUSH)
+        self.assertEqual(d.rect(self.stream(bytes([0x00]) + self.compact(len(data)) + data), 5, 3), bgrx_from_rgb(rgb))
+        more = bytes(range(45))  # the same zlib stream goes on in the next rectangle
+        data = z.compress(more) + z.flush(zlib.Z_SYNC_FLUSH)
+        self.assertEqual(d.rect(self.stream(bytes([0x00]) + self.compact(len(data)) + data), 5, 3), bgrx_from_rgb(more))
+        # two colours, a bit a pixel, rows padded to whole bytes (4 bytes in all: under 12, not compressed)
+        pal = bytes((255, 0, 0, 0, 0, 255))
+        px = d.rect(self.stream(bytes([0x50, 1, 1]) + pal + bytes([0b10101010, 0b11000000, 0, 0b01000000])), 10, 2)
+        red, blue = bytes((0, 0, 255, 255)), bytes((255, 0, 0, 255))
+        self.assertEqual(px, b"".join([blue if b else red for b in (1, 0, 1, 0, 1, 0, 1, 0, 1, 1)] +
+                                      [blue if b else red for b in (0,) * 9 + (1,)]))
+        # three colours, a byte a pixel, compressed on stream 2
+        pal3, idx = bytes(range(1, 10)), bytes(i % 3 for i in range(16))
+        z2 = zlib.compressobj()
+        data = z2.compress(idx) + z2.flush(zlib.Z_SYNC_FLUSH)
+        px = d.rect(self.stream(bytes([0x60, 1, 2]) + pal3 + self.compact(len(data)) + data), 4, 4)
+        self.assertEqual(px, b"".join(bytes((pal3[i * 3 + 2], pal3[i * 3 + 1], pal3[i * 3], 255)) for i in idx))
+        # a reset of stream 0 before the rectangle: a fresh zlib stream
+        z3 = zlib.compressobj()
+        data = z3.compress(rgb) + z3.flush(zlib.Z_SYNC_FLUSH)
+        self.assertEqual(d.rect(self.stream(bytes([0x01]) + self.compact(len(data)) + data), 5, 3), bgrx_from_rgb(rgb))
+        # the gradient filter: each value the difference from left + above - above-left
+        out = d.rect(self.stream(bytes([0x40, 2]) + bytes([5] * 9)), 3, 1)  # 3×1 (9 bytes: as is), each +5
+        self.assertEqual(out, bgrx_from_rgb(bytes([5, 5, 5, 10, 10, 10, 15, 15, 15])))
+        two_rows = bytes([5, 5, 5] * 4)  # 2×2 is 12 bytes: compressed, on stream 0
+        z4 = zlib.compressobj()
+        data = z4.compress(two_rows) + z4.flush(zlib.Z_SYNC_FLUSH)
+        out = d.rect(self.stream(bytes([0x41, 2]) + self.compact(len(data)) + data), 2, 2)
+        self.assertEqual(out, bgrx_from_rgb(bytes([5, 5, 5, 10, 10, 10, 10, 10, 10, 20, 20, 20])))
+        self.assertEqual(d.counts, {"fill": 1, "copy": 3, "palette2": 1, "palette": 1, "gradient": 2})
+        for n in (5, 300, 70000):
+            self.assertEqual(TightDecoder._length(self.stream(self.compact(n))), n)
+
+    def test_jpeg(self):
+        from PySide6.QtCore import QBuffer, QByteArray
+        from PySide6.QtGui import QColor, QImage
+        from proxmox_controller.core import recorder
+        from proxmox_controller.core.tight import TightDecoder
+        img = QImage(16, 8, QImage.Format.Format_RGB32)
+        img.fill(QColor(200, 100, 50))
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QBuffer.OpenModeFlag.WriteOnly)
+        img.save(buf, "JPEG", 95)
+        jpeg = bytes(ba)
+        px = TightDecoder(recorder._decode_jpeg).rect(self.stream(bytes([0x90]) + self.compact(len(jpeg)) + jpeg), 16, 8)
+        b, g, r, a = px[:4]
+        self.assertTrue(abs(r - 200) < 6 and abs(g - 100) < 6 and abs(b - 50) < 6 and a == 255, (r, g, b, a))
+        with self.assertRaises(Exception):
+            TightDecoder(None).rect(self.stream(bytes([0xA0])), 1, 1)  # PNG: never asked for
+
+
+class FakeSpice:
+    """A pretend SPICE server over plain sockets: the link with its RSA key and the ticket, the main channel's
+    session, the playback channel's 16-bit PCM — as QEMU does after spiceproxy's TLS (which is the real host's)."""
+
+    _key = None
+
+    def __init__(self, password="ticket", pcm=b"", end_main=False):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        if FakeSpice._key is None:
+            FakeSpice._key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+        self.password, self.pcm, self.end_main = password, pcm, end_main
+        self.tickets, self.links, self.client_said = [], [], []
+        self.session = 0x1234
+
+    def opener(self, cfg, timeout):
+        mine, theirs = socket.socketpair()
+        threading.Thread(target=self.serve, args=(theirs,), daemon=True).start()
+        mine.settimeout(timeout)
+        return mine
+
+    @staticmethod
+    def exact(sock, n):
+        data = b""
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError
+            data += chunk
+        return data
+
+    def message(self, sock):
+        """The client's next message, its ACKs aside (sent every window, as SET_ACK asked)."""
+        while True:
+            kind, size = struct.unpack("<HI", self.exact(sock, 6))
+            payload = self.exact(sock, size) if size else b""
+            self.client_said.append(kind)
+            if kind != 2:
+                return kind, payload
+
+    @staticmethod
+    def send(sock, kind, payload=b""):
+        sock.sendall(struct.pack("<HI", kind, len(payload)) + payload)
+
+    def serve(self, sock):
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+        try:
+            magic, major, minor, size = struct.unpack("<4sIII", self.exact(sock, 16))
+            conn_id, channel = struct.unpack_from("<IB", self.exact(sock, size))
+            self.links.append((conn_id, channel))
+            der = self._key.public_key().public_bytes(serialization.Encoding.DER,
+                                                      serialization.PublicFormat.SubjectPublicKeyInfo)
+            assert len(der) == 162
+            reply = struct.pack("<I", 0) + der + struct.pack("<IIII", 1, 0, 178, 1 << 3)
+            sock.sendall(struct.pack("<4sIII", b"REDQ", 2, 2, len(reply)) + reply)
+            ticket = self._key.decrypt(self.exact(sock, 128), padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA1()), algorithm=hashes.SHA1(), label=None))
+            self.tickets.append(ticket)
+            sock.sendall(struct.pack("<I", 0 if ticket == self.password.encode() + b"\0" else 7))
+            if channel == 1:  # main
+                self.send(sock, 3, struct.pack("<II", 9, 2))  # SET_ACK: the client must answer ACK_SYNC
+                assert self.message(sock) == (1, struct.pack("<I", 9))
+                self.send(sock, 103, struct.pack("<I", self.session) + bytes(28))  # MAIN_INIT
+                assert self.message(sock)[0] == 104  # ATTACH_CHANNELS
+                self.send(sock, 4, struct.pack("<IQ", 5, 77) + b"pad")  # PING: the client must answer PONG
+                assert self.message(sock) == (3, struct.pack("<IQ", 5, 77))
+                if self.end_main:
+                    time.sleep(0.3)
+                    self.send(sock, 6)  # DISCONNECTING: another viewer took over
+                while True:
+                    self.message(sock)
+            elif channel == 5:  # playback
+                assert conn_id == self.session
+                self.send(sock, 103, struct.pack("<IHII", 2, 1, 48000, 0))  # START: stereo S16 48 kHz
+                for i in range(0, len(self.pcm), 1920):
+                    self.send(sock, 101, struct.pack("<I", i) + self.pcm[i:i + 1920])  # DATA
+                    time.sleep(0.005)
+                while True:
+                    self.message(sock)
+        except (ConnectionError, OSError, AssertionError):
+            pass
+        finally:
+            sock.close()
+
+
+class SpiceAudioTest(unittest.TestCase):
+    def test_connect_carries_the_ticket_in_host(self):
+        from proxmox_controller.core import spice_audio
+        line = spice_audio.connect_request({"host": "pvespiceproxy:abc::def:301:pve", "tls-port": 61000})
+        self.assertTrue(line.startswith(b"CONNECT pvespiceproxy:abc::def:301:pve:61000 HTTP/1.0\r\n"))
+        self.assertIn(b"\r\nHost: pvespiceproxy:abc::def:301:pve:61000\r\n\r\n", line)
+
+    def test_link_session_and_sound(self):
+        from proxmox_controller.core.spice_audio import SpiceAudio
+        pcm = bytes(range(256)) * 60
+        fake = FakeSpice(pcm=pcm)
+        got, fmt = bytearray(), []
+        audio = SpiceAudio({"password": "ticket"}, lambda c, r: fmt.append((c, r)), got.extend, opener=fake.opener)
+        audio.start()
+        self.assertTrue(wait_for(lambda: len(got) == len(pcm)))
+        audio.stop()
+        self.assertEqual((bytes(got), fmt), (pcm, [(2, 48000)]))
+        self.assertEqual(fake.links, [(0, 1), (0x1234, 5)])  # main first, then playback in its session
+        self.assertEqual(fake.tickets, [b"ticket\0"] * 2)  # RSA-OAEP, as spice-server decrypts it
+        self.assertEqual(audio.ended, "")
+
+    def test_refused_ticket_and_taken_over(self):
+        from proxmox_controller.core.spice_audio import SpiceAudio, SpiceError
+        audio = SpiceAudio({"password": "wrong"}, lambda c, r: None, lambda d: None, opener=FakeSpice().opener)
+        with self.assertRaises(SpiceError):
+            audio.start()
+        audio = SpiceAudio({"password": "ticket"}, lambda c, r: None, lambda d: None,
+                           opener=FakeSpice(end_main=True).opener)
+        audio.start()
+        self.assertTrue(wait_for(lambda: audio.ended))
+        self.assertIn("another viewer", audio.ended)
+        audio.stop()
+
+
+class RecorderTest(unittest.TestCase):
+    """A console into a video: steady frames, the sound in step, the ends — with a pretend console and encoder."""
+
+    class Encoder:
+        made: list = []
+
+        def __init__(self, path, w, h, fps, audio):
+            self.path, self.size, self.fps, self.audio_on = path, (w, h), fps, audio
+            self.frames, self.chunks, self.closed = [], [], False
+            RecorderTest.Encoder.made.append(self)
+
+        def video(self, frame):
+            self.frames.append(frame)
+
+        def audio(self, pcm):
+            self.chunks.append(pcm)
+
+        def close(self):
+            self.closed = True
+            self.path.write_bytes(b"mp4")
+
+    def setUp(self):
+        from proxmox_controller.core import recorder
+        self.recorder = recorder
+        self.folder = Path(tempfile.mkdtemp(prefix="pvc-rec-"))
+        self.addCleanup(lambda: shutil.rmtree(self.folder, True))
+        RecorderTest.Encoder.made = []
+        self.servers = []
+        self.addCleanup(recorder.stop_all)
+        self.seen, _ = recorder.news()  # (what earlier tests left)
+
+    def open_console(self, w=64, h=48):
+        def opener():
+            a, b = socket.socketpair()
+            self.servers.append(FakeVncServer(WebSocket(b, client=False), "pw", w, h, "t").start())
+            return WebSocket(a), "pw"
+        return opener
+
+    def record(self, key="h/301", **kw):
+        rec = self.recorder.Recording(key, "VM 301 (t)", self.recorder.file_for("t v", 301, self.folder),
+                                      kw.pop("opener", self.open_console()), encoder=RecorderTest.Encoder, **kw)
+        return self.recorder.start(rec)
+
+    def test_steady_frames_and_the_typing(self):
+        rec = self.record()
+        self.assertEqual((rec.w, rec.h, rec.fps, rec.sound), (64, 48, 30, False))
+        self.assertRegex(rec.path.name, r"^301-t-v-\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d\.mp4$")
+        with self.assertRaises(self.recorder.RecordError):
+            self.record()  # one recording a guest
+        time.sleep(0.4)
+        for ch in "ab":
+            self.servers[0]._typed(True, ord(ch))
+        time.sleep(0.6)
+        rec.cursor = (0, 0, 2, 2, b"\x00\x00\xff\xff" * 4)  # the pointer's shape, as QEMU sends it...
+        self.recorder.pointer_moved("h/301", 10, 5)  # ...and where the app's own click put it
+        time.sleep(0.2)
+        result = self.recorder.stop("h/301")
+        enc = RecorderTest.Encoder.made[0]
+        self.assertEqual(enc.frames[-1][(5 * 64 + 10) * 4:(5 * 64 + 10) * 4 + 3], b"\x00\x00\xff")  # drawn in
+        self.assertTrue(enc.closed)
+        self.assertTrue(30 <= len(enc.frames) <= 42, len(enc.frames))  # 30 a second for its 1.2 s, whatever the screen did
+        self.assertTrue(all(len(f) == 64 * 48 * 4 for f in enc.frames))
+        self.assertNotEqual(enc.frames[0], enc.frames[-1])  # the typing is in the video
+        self.assertEqual((result["ended"], result["sound"], result["bytes"]), ("stopped", False, 3))
+        self.assertIsNone(self.recorder.get("h/301"))
+        self.assertEqual(self.recorder.stop("h/301")["file"], str(rec.path))  # asked again: the last result
+        last, ended = self.recorder.news(self.seen)
+        self.assertEqual([k for k, _ in ended], ["h/301"])
+        self.assertEqual(self.recorder.news(self.seen), (last, ended))  # each reader keeps its own place:
+        self.assertEqual(self.recorder.news(last), (last, []))  # read again, it is still there; after it, nothing
+
+    def test_sound_in_step_with_silence_first(self):
+        from proxmox_controller.core import spice_audio
+        second = 48000 * 4
+        pcm = bytes((i * 7) % 251 + 1 for i in range(second // 2))  # half a second of non-silence
+        fake = FakeSpice(pcm=pcm)
+        real = spice_audio.SpiceAudio
+        with mock.patch.object(spice_audio, "SpiceAudio",
+                               lambda cfg, on_start, on_data: real(cfg, on_start, on_data, opener=fake.opener)):
+            self.record(spice_config=lambda: {"password": "ticket"})
+            time.sleep(1.2)
+            result = self.recorder.stop("h/301")
+        enc = RecorderTest.Encoder.made[0]
+        self.assertTrue(result["sound"] and enc.audio_on)
+        self.assertTrue(all(len(c) == second // 30 for c in enc.chunks))  # one frame's sound with each frame
+        self.assertEqual(len(enc.chunks), len(enc.frames))
+        self.assertEqual(enc.chunks[0], bytes(second // 30))  # silence until the cushion fills
+        self.assertIn(pcm[:second // 30], b"".join(enc.chunks))  # then the guest's own sound, in order
+
+    def test_ends_by_itself(self):
+        rec = self.record(max_seconds=1)
+        self.assertTrue(rec.done.wait(5))
+        self.assertIn("time limit", rec.result["ended"])
+        self.assertEqual(len(RecorderTest.Encoder.made[0].frames), 30)
+        rec = self.record(key="h/302")
+        time.sleep(0.3)
+        self.servers[-1].ws.close()  # the guest stopped: its console closes
+        self.assertTrue(rec.done.wait(5))
+        self.assertIn("console closed", rec.result["ended"])
+
+    def test_a_new_resolution_fits_the_first(self):
+        rec = self.recorder.Recording("x", "t", self.folder / "x.mp4", None)
+        rec.w, rec.h = 80, 40
+        rec.client = mock.Mock()
+        rec.fb, rec.fb_w, rec.fb_h = bytearray(b"\x10\x20\x30\xff" * 80 * 40), 80, 40
+        self.assertEqual(len(rec._frame()), 80 * 40 * 4)
+        rec._apply(("size", 40, 40))  # the guest changed resolution
+        rec.fb = bytearray(b"\xff\xff\xff\xff" * 40 * 40)
+        frame = rec._frame()
+        self.assertEqual(len(frame), 80 * 40 * 4)  # still the first size: the new picture fitted in, black sides
+        self.assertEqual(frame[:4], bytes((0, 0, 0, 255)))
+        self.assertEqual(frame[(20 * 80 + 40) * 4:(20 * 80 + 40) * 4 + 3], b"\xff\xff\xff")
+        rec.cursor, rec.pointer = (0, 0, 2, 2, b"\x00\x00\xff\xff" * 4), (20, 20)  # a red pointer, drawn in
+        at = (20 * 80 + 20 + 20) * 4  # (the picture sits 20 pixels in: it is 40 wide in 80)
+        self.assertEqual(rec._frame()[at:at + 3], b"\x00\x00\xff")
+
+    @unittest.skipIf(sys.platform.startswith("win"), "GStreamer is the Linux encoder")
+    def test_gstreamer_makes_a_playable_mp4(self):
+        from proxmox_controller.core.recorder import GstEncoder, RecordError
+        if not shutil.which("gst-launch-1.0"):
+            self.skipTest("no GStreamer here")
+        path = self.folder / "with space" / "v.mp4"
+        path.parent.mkdir()
+        try:
+            enc = GstEncoder(path, 64, 48, 30, True)
+        except RecordError as e:
+            self.skipTest(str(e))
+        for i in range(30):
+            if enc.audio_on:
+                enc.audio(bytes(6400))
+            enc.video(bytes([i * 8 % 256, 0, 0, 255]) * (64 * 48))
+        enc.close()
+        self.assertGreater(path.stat().st_size, 1000)
+        if shutil.which("gst-discoverer-1.0"):
+            info = subprocess.run(["gst-discoverer-1.0", str(path)], capture_output=True, text=True, timeout=60).stdout
+            self.assertIn("H.264", info)
+            self.assertIn("Duration: 0:00:01.0", info)
+            if enc.audio_on:
+                self.assertIn("AAC", info)
+
+    @unittest.skipUnless(sys.platform.startswith("win"), "Media Foundation is the Windows encoder")
+    def test_media_foundation_makes_an_mp4(self):
+        from proxmox_controller.core.recorder import MfEncoder, RecordError
+        path = self.folder / "v.mp4"
+        try:
+            enc = MfEncoder(path, 64, 48, 30, True)
+        except RecordError as e:
+            self.skipTest(f"no Media Foundation H.264 here: {e}")  # (Windows Server, Windows N)
+        for i in range(30):
+            enc.audio(bytes(6400))
+            enc.video(bytes([i * 8 % 256, 0, 0, 255]) * (64 * 48))
+        enc.close()
+        self.assertGreater(path.stat().st_size, 1000)
+        self.assertEqual(path.read_bytes()[4:8], b"ftyp")

@@ -107,6 +107,9 @@ class MainWindow(QMainWindow):
         self.ping_timer.start(PING_EVERY_MS)
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.check_updates)
+        from .recording import RecordingIndicator
+        self.recording_mark = RecordingIndicator(self.runner, self.notify, self)  # a console being recorded
+        self.statusBar().addPermanentWidget(self.recording_mark)
         self._restart_timer()
         self.show_host(self.settings.get("selected_host", ""))
         geometry.restore(self, "main", self.settings)  # the size and screen it was closed on
@@ -403,6 +406,8 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         self.ping_timer.stop()
         self.update_timer.stop()
+        from ..core import recorder
+        recorder.stop_all()  # every recording finished properly, so that its video plays
         self.runner.close()
         self.connector.stop()
         if self.help_dialog is not None:

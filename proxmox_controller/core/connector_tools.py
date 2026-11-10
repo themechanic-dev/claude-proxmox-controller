@@ -18,10 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import (autoinstall, claude_policy, cloudseed, cloudvm, guestfiles, screen, setupdisc, ssh, startup, staticnet,
-               ubuntu_releases,
-               tasks, timezones, vmhw,
-               winsetup, wol)
+from . import (autoinstall, claude_policy, cloudseed, cloudvm, guestfiles, recorder, screen, setupdisc, spice, ssh,
+               startup, staticnet, ubuntu_releases, tasks, timezones, vmhw, winsetup, wol)
 from .cloudvm import CLOUD_URL, USERNAME
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
@@ -1326,6 +1324,64 @@ def _opener(ctx: Context, g: dict) -> Callable[[], tuple]:
     return lambda: ctx.pve.open_vnc(g["node"], g["type"], g["vmid"])
 
 
+def _record_words(ctx: Context, a: dict):
+    g = ctx.guest(a["vmid"])
+    action = a.get("action", "start")
+    if action == "stop":
+        return f"Stop recording the console of {what(g)}", ["The video is finished and saved."]
+    if action == "status":
+        return f"See whether the console of {what(g)} is being recorded", []
+    minutes = int(a.get("max_minutes") or recorder.DEFAULT_MAX_S // 60)
+    return f"Record the console of {what(g)} as a video", [
+        f"Into {recorder.videos_folder()}",
+        "With the VM's sound, when it has a SPICE sound card" if a.get("sound", True) else "Without sound",
+        f"Stops by itself after {minutes} minutes, or when stopped (here too)"]
+
+
+def _record(ctx: Context, a: dict):
+    g = ctx.guest(a["vmid"])
+    key = f"{ctx.host.id}/{g['vmid']}"
+    action = a.get("action", "start")
+    if action == "status":
+        rec = recorder.get(key)
+        if rec is not None:
+            return {"recording": True, **rec.status()}
+        last = recorder.finished(key)
+        return {"recording": False, **({"last": last} if last else {})}
+    if action == "stop":
+        try:
+            return {**recorder.stop(key), "guest": what(g)}
+        except recorder.RecordError as e:
+            raise ToolError(str(e)) from e
+    if action != "start":
+        raise ToolError("action is start, stop or status.")
+    if g.get("status") not in (None, "running"):
+        raise ToolError(f"{what(g)} is not running: start it first.")
+    minutes = int(a.get("max_minutes") or recorder.DEFAULT_MAX_S // 60)
+    if not 1 <= minutes <= recorder.MAX_MAX_S // 60:
+        raise ToolError(f"max_minutes is 1 to {recorder.MAX_MAX_S // 60}.")
+    sound, note = None, ""
+    if g["type"] != "qemu":
+        note = "a container has no sound: recording the picture only"
+    elif a.get("sound", True):
+        node, vmid = g["node"], g["vmid"]
+        if spice.viewer_open(key):
+            note = "remote-viewer (SPICE) is open on this VM and SPICE takes one viewer: recording without sound"
+        elif not ctx.pve.has_spice(node, vmid):
+            note = "this VM has no SPICE sound card: recording the picture only"
+        else:
+            sound = lambda: ctx.pve.spice_config(node, vmid)  # noqa: E731
+    rec = recorder.Recording(key, what(g), recorder.file_for(g.get("name") or "", g["vmid"]), _opener(ctx, g),
+                             sound, minutes * 60, by="Claude", sound_note=note)
+    try:
+        recorder.start(rec)
+    except recorder.RecordError as e:
+        raise ToolError(str(e)) from e
+    return {**rec.status(),
+            "next": "Work in the console now (console_send, console_click…): all of it goes into the video. Then "
+                    "console_record with action stop; it says where the video is."}
+
+
 def _region_of(a: dict) -> tuple[int, int, int, int] | None:
     """region as (x0, y0, x1, y1) of the whole picture, or None. ToolError for anything else."""
     r = a.get("region")
@@ -1400,6 +1456,7 @@ def _click(ctx: Context, a: dict):
                               a.get("scroll", 0))
     except ValueError as e:
         raise ToolError(str(e)) from e
+    recorder.pointer_moved(f"{ctx.host.id}/{g['vmid']}", sx, sy)  # (a recording draws the pointer there)
     out = {"guest": what(g), "done": "scrolled" if a.get("scroll") else "clicked", "at_screen_pixel": [sx, sy],
            "next": "console_screenshot shows what it did."}
     if note:
@@ -1912,6 +1969,17 @@ def _tools() -> list[Tool]:
                                "description": "[x0, y0, x1, y1] in the whole picture's numbers (as console_click's x, "
                                               "y): its top-left and bottom-right corners."}},
              ("host", "vmid"), _screenshot, _screenshot_words),
+        Tool("console_record", "console", "Record a running guest's console as a video (MP4, H.264), with the VM's "
+             "sound when it has a SPICE sound card, at the guest's own resolution, with nothing shown on the user's "
+             "screen. action start begins it — then work in the console as usual (console_send, console_click…): "
+             "typing, commands and builds all go into the video — and action stop finishes it and says where the "
+             "file is (the user's Videos folder, Proxmox Controller). status says whether one runs. It stops by "
+             "itself after max_minutes (60 unless given) or when the guest stops. Works on desktops, servers' text "
+             "screens and containers (containers without sound).",
+             {**vm, "action": {"type": "string", "enum": ["start", "stop", "status"]},
+              "sound": {"type": "boolean", "description": "Record the VM's sound too (default true)."},
+              "max_minutes": {"type": "integer", "minimum": 1, "maximum": recorder.MAX_MAX_S // 60}},
+             ("host", "vmid", "action"), _record, _record_words),
         Tool("console_send", "console", "Type text into a running guest's console and/or press keys: enter, tab, "
              "escape, backspace, delete, arrows (up, down, left, right), home, end, pageup, pagedown, f1–f12, and "
              "combinations such as ctrl+alt+delete or ctrl+c. Text is typed as on a US keyboard. With text and keys, "

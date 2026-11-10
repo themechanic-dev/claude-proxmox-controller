@@ -34,7 +34,7 @@ Claude reaches your hosts only through this app, and only as far as each host's 
 | Change | new guests, settings, snapshots, backups | Ask |
 | Destroy | deleting guests, snapshots, backups | Off |
 | Host | the host's own power | Off |
-| Console | the guest's screen: screenshots, keys, clicks | Off |
+| Console | the guest's screen: screenshots, keys, clicks, recordings | Off |
 | Commands | commands inside guests (QEMU guest agent) | Off |
 | Files | copying files to and from guests | Off |
 | Host commands | shell commands on the Proxmox host (SSH) | Off |
@@ -77,7 +77,8 @@ Everything works without Claude too:
 - **Guests** — start, shut down, stop, reboot, many at once; notes, tags, boot order; edit cores, memory, disks,
   display, sound and USB devices.
 - **Consoles** — a built-in one (with **Paste…**: text typed into the guest key by key, even in an installer), or
-  SPICE through virt-viewer for sound, clipboard and USB.
+  SPICE through virt-viewer for sound, clipboard and USB. **Record** any console as a video (MP4, with the VM's
+  sound when it has SPICE), for you or for Claude — a desktop, a server's text screen or a container.
 - **Files** — this computer on one side, a VM or container on the other: send, receive, drag, and a right-click menu
   with Rename, Delete, Properties, Permissions and **Edit** (open a guest's file in your own editor, save, send back).
 - **New VMs that set themselves up** — Windows 11 with no setup questions; ready-made Ubuntu Desktop (with Remote

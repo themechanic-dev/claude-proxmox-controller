@@ -20,7 +20,7 @@ CATEGORIES = (  # (each description fits one line beside its switch; Help has th
     ("change", "Change", "Edit, notes, snapshots, Back Up Now, new VMs and containers, copies, ISOs", ASK),
     ("destroy", "Destroy", "Delete guests, roll back or delete snapshots, delete backups, restore over", OFF),
     ("host", "Host", "Shut down or reboot the host itself", OFF),
-    ("console", "Console", "See a guest's screen, type into it and click on it", OFF),
+    ("console", "Console", "See a guest's screen, type and click in it, record it as a video", OFF),
     ("commands", "Commands", "Run commands inside VMs that have the QEMU guest agent", OFF),
     ("files", "Files", "Copy files between this computer and VMs or containers, and list their folders", OFF),
     ("host_commands", "Host commands", "Run commands on the host itself, as root, over the app's SSH key", OFF),

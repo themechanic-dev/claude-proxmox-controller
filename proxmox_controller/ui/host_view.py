@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
 from ..core import autoinstall, netinfo, setupdisc, spice, startup, tasks, wol  # noqa: F401 (netinfo: the tests replace its ARP table)
 from ..core.details import read_details
 from ..core.pve import Host, Pve, PveError, storage_order
-from . import theme
+from . import recording, theme
 from .tasks_panel import SHOWN as TASKS_SHOWN, TaskLogDialog, TasksPanel
 from .widgets import (ElidedLabel, FlowLayout, Pill, StatCard, button, card, confirm, dot_icon, error, gib, label,
                       mem_text, power_icon, uptime_text)
@@ -415,6 +415,10 @@ class HostView(QWidget):
                 menu = QMenu(b)
                 for how, title in CONSOLE_WAYS:
                     menu.addAction(title).triggered.connect(lambda _=False, h=how: self.open_selected_console(h))
+                menu.addSeparator()
+                self.record_action = menu.addAction("Record Console")
+                self.record_action.triggered.connect(self.record_selected)
+                menu.aboutToShow.connect(lambda: self._record_entry(self.record_action))
                 b.setMenu(menu)
             else:
                 b = button(text, "destructive" if key == "delete" else "")
@@ -851,9 +855,15 @@ class HostView(QWidget):
         for key, b in self.act.items():
             if key == "console":
                 sub = menu.addMenu("Console")
-                sub.setEnabled(b.isEnabled())
+                sub.setEnabled(b.isEnabled() or self._record_entry(None))
                 for how, title in CONSOLE_WAYS:
-                    sub.addAction(title).triggered.connect(lambda _=False, h=how: self.open_selected_console(h))
+                    a = sub.addAction(title)
+                    a.setEnabled(b.isEnabled())
+                    a.triggered.connect(lambda _=False, h=how: self.open_selected_console(h))
+                sub.addSeparator()
+                rec = sub.addAction("Record Console")
+                rec.triggered.connect(self.record_selected)
+                self._record_entry(rec)
                 continue
             if key == "agent" and not b.isEnabled():  # offered only where it is needed
                 continue
@@ -1030,6 +1040,21 @@ class HostView(QWidget):
 
     # -- consoles ----------------------------------------------------------------------------------
 
+    def _record_entry(self, action) -> bool:
+        """Record Console or Stop Recording, for the selected guest; whether it can be used now."""
+        g = self.selected()
+        on = g is not None and recording.recording(self.host.id, g["vmid"])
+        usable = on or (g is not None and g.get("status") == "running")
+        if action is not None:
+            action.setText("Stop Recording" if on else "Record Console")
+            action.setEnabled(usable)
+        return usable
+
+    def record_selected(self) -> None:
+        g = self.selected()
+        if g is not None and (g.get("status") == "running" or recording.recording(self.host.id, g["vmid"])):
+            recording.toggle(self, self.host, self.make_client, self.runner, g, self.notify)
+
     def open_selected_console(self, how: str) -> None:
         g = self.selected()
         if g is not None and g.get("status") == "running":
@@ -1048,6 +1073,14 @@ class HostView(QWidget):
             self.open_builtin_console(g)
             return
         pve, node, vmid = self.client(), g["node"], g["vmid"]
+        if how in ("auto", "spice") and recording.with_sound(self.host.id, vmid):
+            if how == "auto":  # (the built-in console leaves the recording's sound alone)
+                self.open_builtin_console(g)
+                return
+            if confirm(self, "Open SPICE during the recording?", f"{what} is being recorded with its sound, and "
+                       "SPICE takes one viewer at a time: remote-viewer would end the recording's sound (the "
+                       "picture goes on). The built-in console does not.", "Open SPICE") is not True:
+                return
 
         def job(checked: bool = False):
             if how == "auto" and not (spice.viewer() and pve.has_spice(node, vmid)):
@@ -1083,7 +1116,7 @@ class HostView(QWidget):
                     self.runner.run(lambda: job(True), done)
                 return
             try:
-                spice.launch(cfg)
+                spice.launch(cfg, key=recording.key_of(self.host.id, vmid))
             except OSError as e:
                 error(self, "SPICE console", str(e))
                 return
@@ -1097,7 +1130,8 @@ class HostView(QWidget):
         # the console's thread calls this: it must not hold this page (a widget) — only the host and the client type
         node, kind, vmid, make, host = g["node"], g["type"], g["vmid"], self.make_client, self.host
         console.show(f"{host.id}/{vmid}", f"{g.get('name', '')} ({vmid}) — {host.name}",
-                     lambda: make(host).open_vnc(node, kind, vmid))
+                     lambda: make(host).open_vnc(node, kind, vmid),
+                     record=lambda: recording.toggle(self, host, make, self.runner, g, self.notify))
 
     def new_vm(self) -> None:
         if not self.nodes:
