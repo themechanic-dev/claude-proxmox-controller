@@ -5,11 +5,15 @@
               "sat,sun 02:00"    weekends
               "sun 04:00"        one day a week
     prune-backups: "keep-last=3,keep-daily=7,keep-weekly=4,keep-monthly=6"   how many backups a job keeps
+
+A job Claude makes through the connector gets an ID of its own, "claude-…" (Proxmox keeps it with the job): Claude
+changes and deletes only those, the user all of them, and the Backup Jobs window shows which they are.
 """
 
 from __future__ import annotations
 
 import re
+import secrets
 
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 DAY_NAMES = {"mon": "Monday", "tue": "Tuesday", "wed": "Wednesday", "thu": "Thursday", "fri": "Friday",
@@ -18,6 +22,17 @@ PRESETS = (("daily", "Every day"), ("weekdays", "Monday to Friday"), ("weekend",
            ("weekly", "Once a week"), ("custom", "Custom (Proxmox calendar event)"))
 KEEP = (("keep-last", "Last"), ("keep-daily", "Daily"), ("keep-weekly", "Weekly"), ("keep-monthly", "Monthly"))
 _TIME = r"(\d{1,2}):(\d{2})"
+CLAUDE_ID = "claude-"
+
+
+def new_claude_id() -> str:
+    return CLAUDE_ID + secrets.token_hex(4)
+
+
+def by_claude(job: dict | str) -> bool:
+    """Whether Claude made the job (its ID says so)."""
+    job_id = job.get("id", "") if isinstance(job, dict) else job
+    return str(job_id or "").startswith(CLAUDE_ID)
 
 
 def schedule_value(preset: str, hour: int, minute: int, day: str = "sun", custom: str = "") -> str:

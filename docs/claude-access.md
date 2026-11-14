@@ -40,9 +40,9 @@ Start, shut down, stop, reboot; Bulk Start and Shut Down; wake the host.
 
 ## Change — default: Ask
 
-Edit, notes, snapshots, Back Up Now, new VMs and containers, copies, ISOs.
+Edit, notes, snapshots, backups and backup jobs, new VMs and containers, copies, ISOs.
 
-*This app and Proxmox: lent to Claude's token only for a request the app allows: VM.Config.CPU, VM.Config.Memory, VM.Config.Disk, VM.Config.Network, VM.Config.Options, VM.Config.HWType, VM.Config.CDROM, VM.Config.Cloudinit, VM.Snapshot, VM.Backup, VM.Clone, VM.Allocate, Datastore.AllocateSpace, Datastore.AllocateTemplate, SDN.Use, Sys.AccessNetwork*
+*This app and Proxmox: lent to Claude's token only for a request the app allows: VM.Config.CPU, VM.Config.Memory, VM.Config.Disk, VM.Config.Network, VM.Config.Options, VM.Config.HWType, VM.Config.CDROM, VM.Config.Cloudinit, VM.Snapshot, VM.Backup, VM.Clone, VM.Allocate, Datastore.AllocateSpace, Datastore.AllocateTemplate, SDN.Use, Sys.AccessNetwork; for a backup job also Sys.Modify, and Datastore.Allocate on that job's storage alone (a permission of its own, taken away with the rest)*
 
 | Tool | What it does |
 |---|---|
@@ -50,6 +50,9 @@ Edit, notes, snapshots, Back Up Now, new VMs and containers, copies, ISOs.
 | `grow_disk` | Make a guest's disk bigger (never smaller). |
 | `take_snapshot` | Take a snapshot of a guest. |
 | `backup_now` | Back a guest up now (it keeps running in snapshot mode). |
+| `create_backup_job` | Schedule backups: a backup job that Proxmox runs by itself at its time. *(Change or Destroy, by its arguments)* |
+| `edit_backup_job` | Change a backup job Claude made (ID claude-…): any of its settings, or enabled to turn it off and on. *(Change or Destroy, by its arguments)* |
+| `run_backup_job` | Run a backup job's backup now (its guests, storage and mode), as Run Now does — without its keep: Proxmox prunes at the job's next scheduled run. |
 | `create_vm` | Create a VM that boots an ISO image (see list_install_media). *(starting it also needs Power not Off)* |
 | `get_cloud_image` | Have the host download Ubuntu Server's official cloud image — an LTS release still supported (list_install_media: cloud_images_offered) — once, to make VMs from with create_cloud_vm. |
 | `create_cloud_vm` | Create an Ubuntu VM from a cloud image (see get_cloud_image) — no installer: a user, its password (the USER types it in Proxmox Controller's window; you never give or see a password), optionally an SSH public key, network by DHCP. *(starting it also needs Power not Off; asks you for a password)* |
@@ -60,16 +63,19 @@ Edit, notes, snapshots, Back Up Now, new VMs and containers, copies, ISOs.
 
 ## Destroy — default: Off
 
-Delete guests, roll back or delete snapshots, delete backups, restore over.
+Delete guests, snapshots, backups, backup jobs; roll back; restore over; prune.
 
-*This app and Proxmox: lent to Claude's token only for a request the app allows: VM.Allocate, VM.Snapshot, VM.Snapshot.Rollback, VM.Backup, Datastore.AllocateSpace, SDN.Use*
+*This app and Proxmox: lent to Claude's token only for a request the app allows: VM.Allocate, VM.Snapshot, VM.Snapshot.Rollback, VM.Backup, Datastore.AllocateSpace, SDN.Use; for a backup job also Sys.Modify, and Datastore.Allocate on that job's storage alone (a permission of its own, taken away with the rest)*
 
 | Tool | What it does |
 |---|---|
+| `create_backup_job` | Schedule backups: a backup job that Proxmox runs by itself at its time. *(Change or Destroy, by its arguments)* |
+| `edit_backup_job` | Change a backup job Claude made (ID claude-…): any of its settings, or enabled to turn it off and on. *(Change or Destroy, by its arguments)* |
 | `restore_backup` | Restore a guest's backup as a new guest — or over the guest itself (replace: true; it must be stopped, and that is a Destroy request). *(starting it also needs Power not Off; Change or Destroy, by its arguments)* |
 | `delete_guest` | Delete a stopped guest with all its disks and snapshots — and its backups, which Proxmox would keep (protected ones always stay), unless keep_backups is true. |
 | `rollback_snapshot` | Roll a guest back to a snapshot (what came after it is lost). |
 | `delete_snapshot` | Delete a snapshot. |
+| `delete_backup_job` | Delete a backup job Claude made (ID claude-…): its schedule goes, the backups it made stay. |
 | `delete_backup` | Delete a backup (not a protected one). |
 | `stop_task` | Stop a running task (one started through this connector). |
 

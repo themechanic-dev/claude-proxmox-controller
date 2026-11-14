@@ -18,8 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import (autoinstall, claude_policy, cloudseed, cloudvm, guestfiles, recorder, screen, setupdisc, spice, ssh,
-               startup, staticnet, ubuntu_releases, tasks, timezones, vmhw, winsetup, wol)
+from . import (autoinstall, claude_access, claude_policy, cloudseed, cloudvm, guestfiles, jobs, recorder, screen,
+               setupdisc, spice, ssh, startup, staticnet, ubuntu_releases, tasks, timezones, vmhw, winsetup, wol)
 from .cloudvm import CLOUD_URL, USERNAME
 from .details import read_details
 from .pve import Host, Pve, PveError, backup_kind, backup_name
@@ -55,6 +55,7 @@ class Tool:
     secret_min: int = 1                      # Proxmox's own minimum, where it has one (a container's root: 5)
     also: tuple | Callable[[dict], tuple] = ()  # other kinds a request may use in passing (a new VM's start: power)
     doc_kinds: tuple = ()                    # where a tool whose kind comes from its arguments is listed (Help, docs)
+    lends: Callable | None = None            # (ctx, args) → privileges lent besides the kind's ("priv@path": there only)
 
     def also_of(self, args: dict) -> tuple:
         return self.also(args) if callable(self.also) else self.also
@@ -272,9 +273,8 @@ def _backups(ctx: Context, a: dict):
 
 
 def _backup_jobs(ctx: Context, a: dict):
-    from . import jobs
     names = {g["vmid"]: g.get("name", "") for g in ctx.guests()}
-    out = [{"id": j.get("id"), "enabled": str(j.get("enabled", 1)) == "1",
+    out = [{"id": j.get("id"), "by_claude": jobs.by_claude(j), "enabled": str(j.get("enabled", 1)) == "1",
             "when": jobs.describe_schedule(j.get("schedule", "")), "schedule": j.get("schedule"),
             "guests": jobs.describe_guests(j, names), "storage": j.get("storage"), "mode": j.get("mode"),
             "keeps": jobs.describe_keep(j.get("prune-backups")), "comment": j.get("comment", "")}
@@ -555,6 +555,247 @@ def _backup(ctx: Context, a: dict):
     upid = ctx.pve.backup_now(g["node"], g["vmid"], storage, a.get("mode", "snapshot"), "zstd",
                               a.get("note", "{{guestname}}"), bool(a.get("protected")))
     return {"guest": what(g), "storage": storage, **finish(ctx, g["node"], upid)}
+
+
+# -- scheduled backups: Proxmox's backup jobs ---------------------------------------------------------------------
+# Measured on Proxmox VE 9.2 (14/11/2026, PVE/API2/Backup.pm and VZDump.pm): a job is made, changed or deleted with
+# Sys.Modify on /; making or changing one also needs Datastore.Allocate on its storage (the one it has and the one it
+# gets) — lent on that storage alone; a backup that prunes needs Datastore.Allocate there too. The job itself then
+# runs as root, at its time. Claude changes and deletes only the jobs it made (IDs "claude-…", jobs.by_claude).
+
+JOB_SYS = ("Sys.Modify",)
+KEEP_ARGS = (("last", "keep-last"), ("daily", "keep-daily"), ("weekly", "keep-weekly"), ("monthly", "keep-monthly"))
+COMPRESS = ("zstd", "lzo", "gzip", "0")
+
+
+def _on_storage(storage: str) -> str:
+    return claude_access.scoped("Datastore.Allocate", f"/storage/{storage}")
+
+
+def _keep_arg(a: dict) -> dict | None:
+    """keep as Proxmox writes it: {"keep-last": 3, …}; {} clears it (edit); None: not given."""
+    keep = a.get("keep")
+    if keep is None:
+        return None
+    if not isinstance(keep, dict):
+        raise ToolError("keep is an object: {last, daily, weekly, monthly}, each a number of backups.")
+    names = dict(KEEP_ARGS)
+    out = {}
+    for short, n in keep.items():
+        if short not in names:
+            raise ToolError(f"keep has last, daily, weekly and monthly — not '{short}'.")
+        if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 9999:
+            raise ToolError(f"keep.{short} is a whole number, 0 to 9999.")
+        if n:
+            out[names[short]] = n
+    return out
+
+
+def _job_kind(a: dict) -> str:
+    """Change — or Destroy when it sets how many backups to keep: after each run Proxmox deletes the older ones."""
+    keep = a.get("keep")
+    pruning = isinstance(keep, dict) and any(isinstance(n, int) and not isinstance(n, bool) and n > 0
+                                             for n in keep.values())
+    return "destroy" if pruning else "change"
+
+
+def _the_job(ctx: Context, job_id) -> dict:
+    job = next((j for j in (ctx.admin or ctx.pve).backup_jobs() if j.get("id") == job_id), None)
+    if job is None:
+        raise ToolError(f"No backup job '{job_id}' (list_backup_jobs shows them).")
+    return job
+
+
+def _claudes_job(ctx: Context, job_id) -> dict:
+    job = _the_job(ctx, job_id)
+    if not jobs.by_claude(job):
+        raise ToolError(f"Backup job '{job_id}' is the user's: Claude changes and deletes only the jobs it made "
+                        f"(their IDs begin with {jobs.CLAUDE_ID}). Ask the user to change it in Proxmox Controller "
+                        "→ Backup Jobs….")
+    return job
+
+
+def _all_guests(job: dict) -> bool:
+    return str(job.get("all", "0")) in ("1", "true", "True")
+
+
+def _job_params(ctx: Context, a: dict, current: dict | None = None) -> tuple[dict, dict]:
+    """(the job as it will be, Proxmox's parameters for it) from a request; current: the job as it is (an edit)."""
+    p, gone = {}, []
+    if "schedule" in a:
+        sched = " ".join(str(a["schedule"]).split())
+        if not sched:
+            raise ToolError("schedule is empty: for example 03:00, mon..fri 21:30, sat,sun 02:00 or sun 04:00.")
+        p["schedule"] = sched
+    elif current is None:
+        raise ToolError("schedule is needed: for example 03:00 (every day) or sun 04:00.")
+    if current is None or any(k in a for k in ("vmids", "all", "exclude")):
+        if "all" in a:
+            everyone = bool(a["all"])
+        else:  # a list given alone is the guests now; else as the job was
+            everyone = "vmids" not in a and bool(current and _all_guests(current))
+        for v in list(a.get("vmids") or []) + list(a.get("exclude") or []):
+            ctx.guest(v)  # (each one is a guest of this host)
+        if everyone:
+            p["all"] = 1
+            ex = a["exclude"] if "exclude" in a else jobs.job_vmids({"vmid": (current or {}).get("exclude", "")})
+            if ex:
+                p["exclude"] = ",".join(str(int(v)) for v in ex)
+            elif current and current.get("exclude"):
+                gone.append("exclude")
+            if current and current.get("vmid"):
+                gone.append("vmid")
+        else:
+            ids = a["vmids"] if "vmids" in a else jobs.job_vmids(current or {})
+            if not ids:
+                raise ToolError("Which guests: vmids (a list), or all: true.")
+            p["vmid"] = ",".join(str(int(v)) for v in ids)
+            gone += [k for k in ("all", "exclude") if current and current.get(k) not in (None, "", 0, "0")]
+    if "storage" in a or current is None:
+        storage = a.get("storage") or ""
+        known = [st["storage"] for st in (ctx.admin or ctx.pve).backup_storages(ctx.node())]
+        if storage not in known:
+            raise ToolError(f"storage is one that takes backups: {', '.join(known) or 'none on this host'}.")
+        p["storage"] = storage
+    if "mode" in a:
+        if a["mode"] not in ("snapshot", "suspend", "stop"):
+            raise ToolError("mode is snapshot, suspend or stop.")
+        p["mode"] = a["mode"]
+    elif current is None:
+        p["mode"] = "snapshot"
+    if "compress" in a:
+        if str(a["compress"]) not in COMPRESS:
+            raise ToolError(f"compress is {', '.join(COMPRESS)} (0: none).")
+        p["compress"] = str(a["compress"])
+    elif current is None:
+        p["compress"] = "zstd"
+    keep = _keep_arg(a)
+    if keep:
+        p["prune-backups"] = jobs.keep_value(keep)
+    elif keep == {} and current and current.get("prune-backups"):
+        gone.append("prune-backups")
+    for arg, key in (("notes", "notes-template"), ("comment", "comment")):
+        if arg in a:
+            text = str(a[arg]).strip()
+            if len(text) > 500:
+                raise ToolError(f"{arg} is at most 500 characters.")
+            if text:
+                p[key] = text
+            elif current and current.get(key):
+                gone.append(key)
+    if "enabled" in a:
+        p["enabled"] = 1 if a["enabled"] else 0
+    elif current is None:
+        p["enabled"] = 1
+    if "notes-template" in p and "storage" not in p:  # Proxmox wants the storage with a note (VZDump/Common.pm:
+        p["storage"] = (current or {}).get("storage") or "local"  # requires => 'storage'; the live test, 14/11/2026)
+    if gone:
+        p["delete"] = ",".join(gone)
+    job = {k: v for k, v in {**(current or {}), **p}.items() if k not in gone and k != "delete"}
+    return job, p
+
+
+def _job_lines(job: dict, names: dict) -> list[tuple[str, str]]:
+    """The job in plain words, as (what, how) pairs."""
+    keep = jobs.parse_keep(job.get("prune-backups"))
+    comp = {"0": "no compression"}.get(str(job.get("compress", "zstd")), str(job.get("compress", "zstd")).upper())
+    out = [("When", jobs.describe_schedule(job.get("schedule", ""))),
+           ("Guests", jobs.describe_guests(job, names)),
+           ("To", f"{job.get('storage', '')} · {job.get('mode', 'snapshot')} · {comp}"),
+           ("Keeps", jobs.describe_keep(keep) if keep else "as the storage's own rule says"),
+           ("On", "yes" if str(job.get("enabled", 1)) in ("1", "True", "true") else "no — it does not run until enabled")]
+    if job.get("notes-template"):
+        out.append(("Note", str(job["notes-template"])))
+    if job.get("comment"):
+        out.append(("Comment", str(job["comment"])))
+    return out
+
+
+def _prunes(job: dict, storage: str) -> str:
+    keep = jobs.parse_keep(job.get("prune-backups"))
+    if not keep:
+        return ""
+    return (f"⚠ Keeps {jobs.describe_keep(keep)}: after each run Proxmox deletes the older backups of these guests "
+            f"on {storage} (protected ones stay).")
+
+
+def _names(ctx: Context) -> dict:
+    return {g["vmid"]: g.get("name", "") for g in ctx.guests()}
+
+
+def _create_job_words(ctx: Context, a: dict):
+    job, _ = _job_params(ctx, a)
+    lines = [f"{k}: {v}" for k, v in _job_lines(job, _names(ctx))]
+    warn = _prunes(job, job.get("storage", ""))
+    return f"Create a backup job: {jobs.describe_schedule(job.get('schedule', ''))}", lines + ([warn] if warn else [])
+
+
+def _create_job(ctx: Context, a: dict):
+    job, p = _job_params(ctx, a)
+    job_id = jobs.new_claude_id()
+    ctx.pve.create_backup_job({"id": job_id, **p})
+    return {"created": job_id, **{k.lower(): v for k, v in _job_lines(job, _names(ctx))},
+            "next": "list_backup_jobs shows it. Claude may change or delete it (edit_backup_job, delete_backup_job); "
+                    "the user can too, in Proxmox Controller → Backup Jobs…."}
+
+
+def _create_job_lends(ctx: Context, a: dict) -> list[str]:
+    return [*JOB_SYS, _on_storage(a.get("storage") or "local")]
+
+
+def _edit_job_words(ctx: Context, a: dict):
+    cur = _claudes_job(ctx, a["id"])
+    job, _ = _job_params(ctx, a, cur)
+    names = _names(ctx)
+    before, after = dict(_job_lines(cur, names)), _job_lines(job, names)
+    lines = [f"{k}: {before.get(k, '—')} → {v}" for k, v in after if before.get(k) != v]
+    warn = _prunes(job, job.get("storage", "")) if a.get("keep") else ""
+    return (f"Change the backup job {a['id']} ({jobs.describe_schedule(cur.get('schedule', ''))})",
+            (lines or ["Nothing changes."]) + ([warn] if warn else []))
+
+
+def _edit_job(ctx: Context, a: dict):
+    cur = _claudes_job(ctx, a["id"])
+    job, p = _job_params(ctx, a, cur)
+    if p:
+        ctx.pve.update_backup_job(a["id"], p)
+    return {"changed": a["id"], **{k.lower(): v for k, v in _job_lines(job, _names(ctx))}}
+
+
+def _edit_job_lends(ctx: Context, a: dict) -> list[str]:
+    cur = _claudes_job(ctx, a["id"])
+    stores = {cur.get("storage") or "local"} | ({a["storage"]} if a.get("storage") else set())
+    return [*JOB_SYS] + [_on_storage(st) for st in sorted(stores)]
+
+
+def _delete_job_words(ctx: Context, a: dict):
+    job = _claudes_job(ctx, a["id"])
+    return (f"Delete the backup job {a['id']}: {jobs.describe_schedule(job.get('schedule', ''))}, "
+            f"{jobs.describe_guests(job, _names(ctx))} → {job.get('storage', '')}",
+            ["Only the schedule goes: the backups it made stay."])
+
+
+def _delete_job(ctx: Context, a: dict):
+    _claudes_job(ctx, a["id"])
+    ctx.pve.delete_backup_job(a["id"])
+    return {"deleted": a["id"], "backups": "kept"}
+
+
+def _run_job_words(ctx: Context, a: dict):
+    job = _the_job(ctx, a["id"])
+    whose = "Claude's" if jobs.by_claude(job) else "the user's"
+    lines = [f"{k}: {v}" for k, v in _job_lines(job, _names(ctx)) if k in ("Guests", "To")]
+    if jobs.parse_keep(job.get("prune-backups")):
+        lines.append("Its 'keeps' is not applied now: Proxmox applies it at the job's next scheduled run.")
+    return f"Run {whose} backup job {a['id']} now", lines
+
+
+def _run_job(ctx: Context, a: dict):
+    job = _the_job(ctx, a["id"])
+    node = ctx.node()
+    upid = ctx.pve.run_job_now(node, {k: v for k, v in job.items() if k != "prune-backups"})
+    return {"job": a["id"], "guests": jobs.describe_guests(job, _names(ctx)), "storage": job.get("storage"),
+            **finish(ctx, node, upid)}
 
 
 NOT_STARTED = "no — Power requests are Off for this host: the user can start it"
@@ -1791,6 +2032,23 @@ def _ct_password(ctx: Context, a: dict):
 
 # -- the registry ----------------------------------------------------------------------------------
 
+JOB_PARAMS = {
+    "schedule": {"type": "string", "description": "When: 03:00 · mon..fri 21:30 · sat,sun 02:00 · sun 04:00 · a "
+                                                  "Proxmox calendar event."},
+    "vmids": {"type": "array", "items": {"type": "integer"}, "description": "The guests it backs up."},
+    "all": {"type": "boolean", "description": "Every guest of the host (but those in exclude)."},
+    "exclude": {"type": "array", "items": {"type": "integer"}},
+    "storage": {"type": "string"},
+    "mode": {"type": "string", "enum": ["snapshot", "suspend", "stop"]},
+    "compress": {"type": "string", "enum": list(COMPRESS)},
+    "keep": {"type": "object", "description": "How many backups to keep (Destroy switch).",
+             "properties": {k: {"type": "integer", "minimum": 0} for k, _ in KEEP_ARGS}, "additionalProperties": False},
+    "notes": {"type": "string", "description": "Each backup's note: {{guestname}} and {{vmid}} are filled in."},
+    "comment": {"type": "string"},
+    "enabled": {"type": "boolean"},
+}
+
+
 def _tools() -> list[Tool]:
     vm, host = {"host": HOST, "vmid": VMID}, {"host": HOST}
     return [
@@ -1807,8 +2065,8 @@ def _tools() -> list[Tool]:
         Tool("list_backups", "read", "A guest's backups, newest first — also of a guest deleted since, by its old ID.",
              vm, ("host", "vmid"), _backups, reason=False),
         Tool("list_backup_jobs", "read", "The scheduled backups (Datacenter → Backup) and the guests no job covers. "
-             "Jobs are changed by the user in the app, not through this connector.", host, ("host",), _backup_jobs,
-             reason=False),
+             "by_claude: a job Claude made (its ID begins with claude-) — only those can Claude change or delete; "
+             "the user's jobs only the user changes, in the app.", host, ("host",), _backup_jobs, reason=False),
         Tool("list_tasks", "read", "The host's recent tasks, newest first, with how they ended.",
              {**host, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, ("host",), _list_tasks,
              reason=False),
@@ -1850,6 +2108,22 @@ def _tools() -> list[Tool]:
         Tool("backup_now", "change", "Back a guest up now (it keeps running in snapshot mode).",
              {**vm, "storage": {"type": "string"}, "mode": {"type": "string", "enum": ["snapshot", "suspend", "stop"]},
               "protected": {"type": "boolean"}, "note": {"type": "string"}}, ("host", "vmid"), _backup, _backup_words),
+        Tool("create_backup_job", _job_kind, "Schedule backups: a backup job that Proxmox runs by itself at its time. "
+             "schedule as Proxmox writes it — 03:00 (every day), mon..fri 21:30, sat,sun 02:00, sun 04:00, or any "
+             "Proxmox calendar event (*/6:00). Guests: vmids, or all (with exclude). storage: one that takes backups. "
+             "keep (how many backups to keep: last, daily, weekly, monthly) makes Proxmox delete the older backups "
+             "of these guests on that storage after each run: it needs the Destroy switch; without keep, the "
+             "storage's own rule applies. The job gets an ID beginning with claude-.",
+             {**host, **JOB_PARAMS}, ("host", "schedule", "storage"), _create_job, _create_job_words,
+             doc_kinds=("change", "destroy"), lends=_create_job_lends),
+        Tool("edit_backup_job", _job_kind, "Change a backup job Claude made (ID claude-…): any of its settings, or "
+             "enabled to turn it off and on. keep {} goes back to the storage's own rule; a keep with numbers needs "
+             "the Destroy switch (see create_backup_job). The user's own jobs cannot be changed here.",
+             {**host, "id": {"type": "string"}, **JOB_PARAMS}, ("host", "id"), _edit_job, _edit_job_words,
+             doc_kinds=("change", "destroy"), lends=_edit_job_lends),
+        Tool("run_backup_job", "change", "Run a backup job's backup now (its guests, storage and mode), as Run Now "
+             "does — without its keep: Proxmox prunes at the job's next scheduled run.",
+             {**host, "id": {"type": "string"}}, ("host", "id"), _run_job, _run_job_words),
         Tool("create_vm", "change", "Create a VM that boots an ISO image (see list_install_media). Profiles: linux, "
              "win11 (UEFI, Secure Boot, TPM 2.0), win10, other. It gets a SPICE display, sound and a USB tablet. "
              "Windows (win11/win10) installs itself with windows_user: the app puts an answer file on a disc of its "
@@ -1955,6 +2229,10 @@ def _tools() -> list[Tool]:
              {**vm, "snapshot": {"type": "string"}}, ("host", "vmid", "snapshot"), _rollback, _rollback_words),
         Tool("delete_snapshot", "destroy", "Delete a snapshot.", {**vm, "snapshot": {"type": "string"}},
              ("host", "vmid", "snapshot"), _delsnap, _delsnap_words),
+        Tool("delete_backup_job", "destroy", "Delete a backup job Claude made (ID claude-…): its schedule goes, "
+             "the backups it made stay. The user's own jobs cannot be deleted here.",
+             {**host, "id": {"type": "string"}}, ("host", "id"), _delete_job, _delete_job_words,
+             lends=lambda ctx, a: [*JOB_SYS]),
         Tool("delete_backup", "destroy", "Delete a backup (not a protected one).", {**host, "volid": {"type": "string"}},
              ("host", "volid"), _delbackup, _delbackup_words),
         Tool("stop_task", "destroy", "Stop a running task (one started through this connector).",
@@ -2112,6 +2390,9 @@ def access_table() -> list[dict]:
         else:
             enforced = ("This app and Proxmox: lent to Claude's token only for a request the app allows: " +
                         ", ".join(privs))
+            if key in ("change", "destroy"):
+                enforced += ("; for a backup job also Sys.Modify, and Datastore.Allocate on that job's storage alone "
+                             "(a permission of its own, taken away with the rest)")
         out.append({"key": key, "title": title, "covers": covers, "default": default, "enforced": enforced,
                     "tools": tools})
     return out

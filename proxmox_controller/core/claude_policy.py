@@ -17,8 +17,8 @@ STATES = (OFF, ASK, ON)
 CATEGORIES = (  # (each description fits one line beside its switch; Help has the whole list)
     ("read", "Read", "State, addresses, settings, notes, snapshots, backups, jobs, tasks, graphs", ON),
     ("power", "Power", "Start, shut down, stop, reboot; Bulk Start and Shut Down; wake the host", ASK),
-    ("change", "Change", "Edit, notes, snapshots, Back Up Now, new VMs and containers, copies, ISOs", ASK),
-    ("destroy", "Destroy", "Delete guests, roll back or delete snapshots, delete backups, restore over", OFF),
+    ("change", "Change", "Edit, notes, snapshots, backups and backup jobs, new VMs and containers, copies, ISOs", ASK),
+    ("destroy", "Destroy", "Delete guests, snapshots, backups, backup jobs; roll back; restore over; prune", OFF),
     ("host", "Host", "Shut down or reboot the host itself", OFF),
     ("console", "Console", "See a guest's screen, type and click in it, record it as a video", OFF),
     ("commands", "Commands", "Run commands inside VMs that have the QEMU guest agent", OFF),

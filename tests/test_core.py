@@ -967,6 +967,49 @@ class ClaudeAccessTest(unittest.TestCase):
         self.assertEqual((loans.lent("demo-pve"), self.cluster.roles[claude_access.ROLE]),
                          ([], list(claude_policy.PRIVILEGES["read"])))
 
+    def test_lent_on_one_storage_only(self):
+        """A backup job: Proxmox wants Sys.Modify on / and Datastore.Allocate on the job's storage (measured on the real
+        host, 14/11/2026) — that one lent on that storage's path alone, with a role of its own, and taken back."""
+        secret, _ = claude_access.setup(self.admin, self.switches)
+        c, loans, switches = self.claude(secret), claude_access.Loans(), lambda: self.switches
+        job = {"schedule": "sun 04:00", "vmid": "201", "storage": "local", "enabled": 0}
+        on_local = claude_access.scoped("Datastore.Allocate", "/storage/local")
+        scoped_acl = lambda: [e["path"] for e in self.cluster.acl if e["roleid"] == claude_access.ROLE_SCOPED]  # noqa
+        self.refused(lambda: c.create_backup_job(job))  # (Sys.Modify on /)
+        with loans.lend("demo-pve", self.admin, switches, ["Sys.Modify"]):
+            with self.assertRaises(PveError) as e:
+                c.create_backup_job(job)  # Sys.Modify alone is not enough
+            self.assertIn("/storage/local, Datastore.Allocate", str(e.exception))
+        with loans.lend("demo-pve", self.admin, switches, ["Sys.Modify", on_local]):
+            self.assertEqual(scoped_acl(), ["/storage/local"])
+            self.assertNotIn("Datastore.Allocate", self.cluster.roles[claude_access.ROLE])  # not everywhere
+            # a permission on /storage/local replaces what Claude inherits there: it must still see and use it
+            # (found on the real host, 14/11: during a job request the token no longer saw the NAS)
+            self.assertIn("local", [s["storage"] for s in c.backup_storages("pve")])
+            with loans.lend("demo-pve", self.admin, switches, claude_policy.PRIVILEGES["change"]):  # a backup, meanwhile
+                c.backup_now("pve", 201, "local")
+            self.refused(lambda: c.backup_now("pve", 201, "local"))  # …and given back there too
+            c.create_backup_job({**job, "id": "claude-0000beef"})
+            with self.assertRaises(PveError) as e:
+                c.create_backup_job({**job, "storage": "nas"})  # another storage: not lent there
+            self.assertIn("/storage/nas", str(e.exception))
+            with self.assertRaises(PveError):
+                c.run_job_now("pve", {**job, "prune-backups": "keep-last=2", "storage": "nas"})  # pruning there: no
+        self.assertIn("claude-0000beef", self.cluster.jobs)
+        self.assertEqual((scoped_acl(), self.cluster.roles[claude_access.ROLE], loans.lent("demo-pve")),
+                         ([], list(claude_policy.PRIVILEGES["read"]), []))  # all of it given back
+        self.assertNotIn(claude_access.ROLE_SCOPED, self.cluster.roles)  # and its role gone: nothing left lying there
+        self.refused(lambda: c.delete_backup_job("claude-0000beef"))
+        # a loan left behind (the app stopped mid-request): the app's next start takes it away
+        left = claude_access.Loans().lend("demo-pve", self.admin, switches, ["Sys.Modify", on_local])
+        left.__enter__()  # (kept: a loan whose request never ended)
+        self.assertEqual(scoped_acl(), ["/storage/local"])
+        claude_access.Loans().tidy("demo-pve", self.admin, self.switches)  # (a new app: it knows of no loan)
+        self.assertEqual((scoped_acl(), claude_access.ROLE_SCOPED in self.cluster.roles,
+                          self.cluster.roles[claude_access.ROLE]), ([], False, list(claude_policy.PRIVILEGES["read"])))
+        claude_access.remove(self.admin)
+        self.assertNotIn(claude_access.ROLE_SCOPED, self.cluster.roles)
+
     def test_loans_in_any_order(self):
         """Requests of every kind beginning and ending in a shuffled order: the role holds exactly reading plus what
         the requests running at that moment were lent — never less, never more — and reading alone at the end."""
@@ -1360,6 +1403,78 @@ class ConnectorToolsTest(unittest.TestCase):
         self.assertEqual(done.returncode, 3)
         self.assertIn("Container 100 is on node pve, but the app's SSH reaches node pve2.", done.stderr)
         self.assertFalse(os.path.exists(os.path.join(tmp, "args")))  # pct never ran
+
+    def test_backup_jobs_claude_makes_and_changes_only_its_own(self):
+        """create_backup_job gets an ID of Claude's; edit and delete only those; the user's job only the user changes;
+        keep makes it a Destroy request, said plainly in the window; Run Now does not prune."""
+        T, c = connector_tools, self.cluster
+        made = self.run_tool("create_backup_job", host="demo-pve", schedule="sun 04:00", vmids=[201], storage="local",
+                             reason="r")
+        jid = made["created"]
+        self.assertTrue(jid.startswith("claude-"))
+        self.assertEqual({k: c.jobs[jid].get(k) for k in ("schedule", "vmid", "storage", "mode", "compress", "enabled")},
+                         {"schedule": "sun 04:00", "vmid": "201", "storage": "local", "mode": "snapshot",
+                          "compress": "zstd", "enabled": 1})
+        self.assertEqual((made["when"], made["keeps"]), ("Sundays at 04:00", "as the storage's own rule says"))
+        listed = {j["id"]: j["by_claude"] for j in self.run_tool("list_backup_jobs", host="demo-pve")["jobs"]}
+        self.assertEqual(listed, {"backup-nightly": False, jid: True})
+        # the kind follows keep: numbers to keep → Destroy, and the window says what goes
+        tool = T.TOOLS["create_backup_job"]
+        self.assertEqual((tool.kind_of({}), tool.kind_of({"keep": {"last": 0}}), tool.kind_of({"keep": {"last": 2}})),
+                         ("change", "change", "destroy"))
+        what, lines = self.words("create_backup_job", host="demo-pve", schedule="03:30", all=True, exclude=[102],
+                                 storage="local", keep={"last": 3, "weekly": 2}, reason="r")
+        self.assertEqual(what, "Create a backup job: Every day at 03:30")
+        self.assertIn("Guests: All except test-box", lines)
+        self.assertTrue(any(ln.startswith("⚠ Keeps 3 last, 2 weekly: after each run Proxmox deletes the older") for ln in lines))
+        # edit: before → after; switching to all drops the list
+        what, lines = self.words("edit_backup_job", host="demo-pve", id=jid, schedule="mon..fri 21:30", enabled=False,
+                                 reason="r")
+        self.assertIn("When: Sundays at 04:00 → Monday to Friday at 21:30", lines)
+        self.assertIn("On: yes → no — it does not run until enabled", lines)
+        self.run_tool("edit_backup_job", host="demo-pve", id=jid, all=True, exclude=[200], keep={"daily": 5}, reason="r")
+        self.assertEqual({k: c.jobs[jid].get(k) for k in ("all", "exclude", "vmid", "prune-backups")},
+                         {"all": "1", "exclude": "200", "vmid": None, "prune-backups": "keep-daily=5"})
+        self.run_tool("edit_backup_job", host="demo-pve", id=jid, notes="{{guestname}} weekly", reason="r")
+        self.assertEqual((c.jobs[jid]["notes-template"], c.jobs[jid]["storage"]), ("{{guestname}} weekly", "local"))
+        self.run_tool("edit_backup_job", host="demo-pve", id=jid, keep={}, vmids=[100, 101], reason="r")
+        self.assertEqual({k: c.jobs[jid].get(k) for k in ("all", "exclude", "vmid", "prune-backups")},
+                         {"all": None, "exclude": None, "vmid": "100,101", "prune-backups": None})
+        # the user's job: seen, run, never changed or deleted by Claude
+        for name, more in (("edit_backup_job", {"enabled": False}), ("delete_backup_job", {})):
+            with self.assertRaises(T.ToolError) as e:
+                self.run_tool(name, host="demo-pve", id="backup-nightly", reason="r", **more)
+            self.assertIn("is the user's", str(e.exception))
+        self.assertEqual(c.jobs["backup-nightly"]["enabled"], 1)
+        before = len(c.backups)
+        with mock.patch.object(self.pve, "run_job_now", wraps=self.pve.run_job_now) as run:
+            out = self.run_tool("run_backup_job", host="demo-pve", id="backup-nightly", reason="r")
+        self.assertNotIn("prune-backups", run.call_args.args[1])  # (the user's job keeps 7 daily: pruned at its time)
+        self.assertEqual((out["status"], len(c.backups)), ("done", before + 2))
+        what, lines = self.words("run_backup_job", host="demo-pve", id="backup-nightly", reason="r")
+        self.assertEqual(what, "Run the user's backup job backup-nightly now")
+        self.assertIn("Its 'keeps' is not applied now: Proxmox applies it at the job's next scheduled run.", lines)
+        # checked before anything is asked
+        for args, problem in (({"schedule": "03:00", "vmids": [201], "storage": "local-lvm"}, "takes backups"),
+                              ({"schedule": "03:00", "storage": "local"}, "Which guests"),
+                              ({"schedule": " ", "vmids": [201], "storage": "local"}, "schedule is empty"),
+                              ({"schedule": "03:00", "vmids": [999], "storage": "local"}, "999"),
+                              ({"schedule": "03:00", "vmids": [201], "storage": "local", "keep": {"hourly": 2}},
+                               "not 'hourly'")):
+            with self.assertRaises(T.ToolError) as e:
+                self.words("create_backup_job", host="demo-pve", reason="r", **args)
+            self.assertIn(problem, str(e.exception))
+        self.assertEqual(self.run_tool("delete_backup_job", host="demo-pve", id=jid, reason="r"),
+                         {"deleted": jid, "backups": "kept"})
+        self.assertNotIn(jid, c.jobs)
+        # what each request borrows besides its kind: Sys.Modify, and Allocate on the job's storage (both, when moved)
+        on = lambda st: claude_access.scoped("Datastore.Allocate", f"/storage/{st}")  # noqa: E731
+        self.assertEqual(T.TOOLS["create_backup_job"].lends(self.ctx(), {"storage": "nas"}), ["Sys.Modify", on("nas")])
+        mine = self.run_tool("create_backup_job", host="demo-pve", schedule="03:00", vmids=[201], storage="local",
+                             reason="r")["created"]
+        self.assertEqual(T.TOOLS["edit_backup_job"].lends(self.ctx(), {"id": mine, "storage": "nas"}),
+                         ["Sys.Modify", on("local"), on("nas")])
+        self.assertEqual(T.TOOLS["delete_backup_job"].lends(self.ctx(), {"id": mine}), ["Sys.Modify"])
 
     def test_switch_table_is_the_code_and_the_docs_follow_it(self):
         """Which switch opens what, for anyone who downloads the app (the user's wish, 17/10): made from the tools

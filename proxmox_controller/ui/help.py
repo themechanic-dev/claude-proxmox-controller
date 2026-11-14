@@ -237,7 +237,9 @@ SECTIONS = [
      "(every day, Monday to Friday, weekends, one day a week, or a Proxmox calendar event such as "
      "<tt>mon,wed,fri 22:00</tt>), which guests (some, all, or all but some), where, and how many to keep — older ones "
      "beyond those numbers are removed after each run, protected ones stay. <b>Run Now</b> runs a job at once. The "
-     "window warns about guests no job covers, and each guest's Backups window says which job covers it."),
+     "window warns about guests no job covers, and each guest's Backups window says which job covers it. "
+     "<b>By: Claude</b> marks a job Claude made (its ID begins with <tt>claude-</tt>): you can change or delete "
+     "every job, Claude only its own."),
     ("Claude Access",
      "Claude — Claude Code (also the Code tab of the Claude desktop app), Claude Desktop and Cowork — can look after "
      "your hosts through this app, only as far as you let it. Open <b>☰ → Claude Access…</b>:<br>"
@@ -266,8 +268,11 @@ SECTIONS = [
      "kind's Off, Ask or On ends them all at once; so does quitting the app. Never for Host commands, nor where a "
      "password is asked.<br>"
      "• Between requests Claude's token can only read (with Read On); for each request the app allows, it lends the "
-     "token that kind's privileges for just that request. Changing backup jobs needs privileges too broad to lend, "
-     "so Claude can see the jobs but not change them.<br>"
+     "token that kind's privileges for just that request. A backup job takes more: Proxmox asks for Sys.Modify, and "
+     "for Datastore.Allocate on the job's storage — that one is lent on that storage alone, with a permission of its "
+     "own, and both are taken back as the request ends. Claude makes jobs (Change), changes and deletes only the "
+     "jobs it made, and a job that keeps a number of backups — older ones are deleted after each run — needs "
+     "<b>Destroy</b>.<br>"
      "• <b>Passwords never go through Claude.</b> Where one is needed — the user of a new VM, the root of a new "
      "container, a login or sudo prompt in a console — the app asks <i>you</i> for it in its window (always, even when "
      "that kind is On; for a console it shows the guest's screen, so you see where it goes) and passes it on itself: "

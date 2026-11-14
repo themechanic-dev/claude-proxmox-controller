@@ -432,13 +432,16 @@ class Connector(QObject):
             return self._done(entry, "error", error_result(f"Unexpected error: {type(e).__name__}: {e}"))
 
     def _run(self, tool, ctx: Context, args: dict, host: Host, kind: str, switches: dict):
-        """Lends this kind's privileges for the length of the request (reading is standing when Read is On)."""
+        """Lends this kind's privileges for the length of the request (reading is standing when Read is On), and what
+    the tool needs besides for this request (tool.lends)."""
         ctx.kinds = not_off(switches)
         lend = [] if not tool_uses_api(tool) or (kind == "read" and switches.get("read") == ON) \
             else list(claude_policy.PRIVILEGES[kind])
         for other in tool.also_of(args):  # used in passing (a new guest's start), lent only if its switch is not Off
             if other in ctx.kinds:
                 lend += [p for p in claude_policy.PRIVILEGES[other] if p not in lend]
+        if tool.lends is not None and kind != "read":  # what this request needs besides (a backup job: Sys.Modify,
+            lend += [p for p in tool.lends(ctx, args) if p not in lend]  # and its storage's Datastore.Allocate there)
         if not lend:
             return tool.run(ctx, args)
         current = lambda: self.on_gui(lambda: claude_policy.host_switches(self.win.settings, host.id))  # noqa: E731

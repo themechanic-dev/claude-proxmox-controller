@@ -220,7 +220,8 @@ class FakeCluster:
             out.insert(0, {"storage": "nas", "type": "cifs", "content": "iso,images,vztmpl,import,backup,snippets,rootdir",
                            "used": 415 << 30, "total": 7233 << 30, "active": 1, "enabled": 1, "shared": 1})
         content = p.get("content")
-        return [s for s in out if not content or content in s["content"].split(",")]
+        return [s for s in out if (not content or content in s["content"].split(",")) and  # (Status.pm: Audit or
+                self.allowed([("Datastore.Audit",), ("Datastore.AllocateSpace",)], f"/storage/{s['storage']}")]  # Space)
 
     def storage_content(self, p, node, storage):
         if storage == "local" and p.get("content") == "vztmpl":
@@ -733,6 +734,9 @@ class FakeCluster:
                 if b["storage"] == storage and (vmid is None or b["vmid"] == int(vmid))]
 
     def vzdump(self, p, node):
+        self._need_on_storage(p.get("storage") or "local", "Datastore.AllocateSpace")  # (VZDump.pm, on the storage)
+        if p.get("prune-backups"):  # (Proxmox: pruning deletes backups — Datastore.Allocate on the storage)
+            self._need_on_storage(p.get("storage") or "local")
         ids = [int(v) for v in p.get("vmid", "").split(",") if v.strip().isdigit()]
         if p.get("all") == "1":
             ex = {int(v) for v in p.get("exclude", "").split(",") if v.strip().isdigit()}
@@ -839,14 +843,25 @@ class FakeCluster:
     def list_jobs(self, p):
         return [self._job_out(j) for j in self.jobs.values()]
 
+    @staticmethod
+    def _job_requires(p) -> None:
+        """As Proxmox's schema: a note (or protected) only with the storage in the same request (VZDump/Common.pm)."""
+        for key in ("notes-template", "protected"):
+            if key in p and not p.get("storage"):
+                raise ValueError(f"storage: missing property required by '{key}'")
+
     def create_job(self, p):
+        self._job_requires(p)
         if not p.get("schedule"):
             raise ValueError("schedule: property is missing and it is not optional")
         if not p.get("vmid") and p.get("all") != "1":
             raise ValueError("vmid: either 'vmid' or 'all' is needed")
         if p.get("mode", "snapshot") not in ("snapshot", "suspend", "stop"):
             raise ValueError("mode: value not in enum")
+        self._need_on_storage(p.get("storage") or "local")  # (Proxmox, 14/11/2026: Backup.pm, assert_param_permission_create)
         job_id = p.get("id") or f"backup-{random.randint(0x10000000, 0xFFFFFFFF):08x}"
+        if job_id in self.jobs:
+            raise ValueError(f"Job '{job_id}' already exists")
         self.jobs[job_id] = {"id": job_id, "type": "vzdump", "enabled": int(p.get("enabled", "1")),
                              **{k: v for k, v in p.items() if k in self.JOB_KEYS and k != "enabled"}}
         return None
@@ -855,7 +870,14 @@ class FakeCluster:
         job = self.jobs.get(job_id)
         if job is None:
             raise ValueError(f"job '{job_id}' does not exist")
-        for key in filter(None, p.get("delete", "").split(",")):
+        self._job_requires(p)
+        deleting = set(filter(None, p.get("delete", "").split(",")))
+        if p.get("storage"):  # (Proxmox: assert_param_permission_update — the new storage, and the job's own)
+            self._need_on_storage(p["storage"])
+        elif "storage" in deleting:
+            self._need_on_storage("local")
+        self._need_on_storage(job.get("storage") or "local")
+        for key in deleting:
             job.pop(key, None)
         for k, v in p.items():
             if k in self.JOB_KEYS:
@@ -938,23 +960,39 @@ class FakeCluster:
     def is_root(self) -> bool:
         return self.principal.split("!")[0] == "root@pam"
 
-    def privileges(self) -> set[str]:
+    def privileges(self, path: str = "/") -> set[str]:
+        """What the caller holds on `path`, as Proxmox works it out: the permissions on the deepest path that has any
+        for the caller — that path itself, or one above it that propagates. Those on a deeper path REPLACE what is
+        inherited from above, they do not add to it (measured on the real host, 14/11/2026)."""
         if self.is_root():
             return set(PRIVS)
         user = self.principal.split("!")[0]
         info = self.api_tokens.get(self.principal, {})
+        mine = [e for e in self.acl if e["ugid"] == self.principal or (e["ugid"] == user and not info.get("privsep"))]
+        def reaches(e):
+            above = e["path"] == "/" or path.startswith(e["path"].rstrip("/") + "/")
+            return e["path"] == path or (above and path != e["path"] and e.get("propagate", 1))
+        hits = [e for e in mine if reaches(e)]
+        if not hits:
+            return set()
+        deepest = max(len(e["path"].rstrip("/")) for e in hits)
         out = set()
-        for e in self.acl:
-            if e["path"] == "/" and (e["ugid"] == self.principal or (e["ugid"] == user and not info.get("privsep"))):
+        for e in hits:
+            if len(e["path"].rstrip("/")) == deepest:
                 out |= set(self.roles.get(e["roleid"], []))
         return out
 
-    def allowed(self, need) -> bool:
+    def allowed(self, need, path: str = "/") -> bool:
         """need: alternatives, each a tuple of privileges all required ("root" for access management)."""
         if need == "root":
             return self.is_root()
-        have = self.privileges()
+        have = self.privileges(path)
         return any(all(x in have for x in alt) for alt in need)
+
+    def _need_on_storage(self, storage: str, priv: str = "Datastore.Allocate") -> None:
+        """As Proxmox checks a backup job's (or a pruning backup's) storage: on that storage's own path."""
+        if not self.allowed([(priv,)], f"/storage/{storage}"):
+            raise PermissionError(f"Permission check failed (/storage/{storage}, {priv})")
 
     def _known(self, privs) -> list[str]:
         items = [x for x in (privs.split(",") if isinstance(privs, str) else privs) if x]

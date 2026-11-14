@@ -7,7 +7,7 @@
 Proxmox Controller is a desktop app for Windows and Linux. On its own it is a fast home for your hosts: containers
 and virtual machines, consoles, files, snapshots, backups and graphs, without a browser or a web login. The magic is
 **Claude Access**: Claude (Anthropic's AI) can look after your hosts — start and stop guests, create VMs that set
-themselves up, read logs, run commands inside guests, copy files — through switches you set for each host and
+themselves up, schedule backups, read logs, run commands inside guests, copy files — through switches you set for each host and
 requests you approve in a window of the app. You stay in charge of every step.
 
 *by the mechanic — built together with Claude*
@@ -31,8 +31,8 @@ Claude reaches your hosts only through this app, and only as far as each host's 
 |---|---|---|
 | Read | state, addresses, settings, snapshots, backups, tasks, graphs | On |
 | Power | start, shut down, stop, reboot, wake | Ask |
-| Change | new guests, settings, snapshots, backups | Ask |
-| Destroy | deleting guests, snapshots, backups | Off |
+| Change | new guests, settings, snapshots, backups, backup jobs | Ask |
+| Destroy | deleting guests, snapshots, backups, Claude's backup jobs; jobs that prune old backups | Off |
 | Host | the host's own power | Off |
 | Console | the guest's screen: screenshots, keys, clicks, recordings | Off |
 | Commands | commands inside guests (QEMU guest agent) | Off |

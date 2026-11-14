@@ -3111,12 +3111,24 @@ class BackupJobsTest(UiCase):
 
     def test_list_and_uncovered(self):
         dlg = self.dialog()
-        on, when, who, storage, keep, nxt, comment = self.cells(dlg)
-        self.assertEqual((on, when, who, storage, keep, comment),
-                         ("Yes", "Every day at 03:00", "pihole, nextcloud", "local", "7 daily, 4 weekly", "the services"))
+        on, when, who, storage, keep, nxt, by, comment = self.cells(dlg)
+        self.assertEqual((on, when, who, storage, keep, by, comment),
+                         ("Yes", "Every day at 03:00", "pihole, nextcloud", "local", "7 daily, 4 weekly", "",
+                          "the services"))
         self.assertNotEqual(nxt, "—")
         self.assertIn("102 test-box", dlg.uncovered.text())
         self.assertIn("201 ubuntu-desktop", dlg.uncovered.text())
+
+    def test_claudes_jobs_are_marked(self):
+        """A job Claude made shows By: Claude; the user's own, nothing — and the user can change and delete both."""
+        self.client().create_backup_job({"id": "claude-1a2b3c4d", "schedule": "sun 04:00", "vmid": "201",
+                                         "storage": "local", "comment": "made by Claude"})
+        dlg = self.dialog()
+        self.assertTrue(wait_until(lambda: dlg.table.rowCount() == 2))
+        rows = {self.cells(dlg, r)[7]: self.cells(dlg, r)[6] for r in range(2)}
+        self.assertEqual(rows, {"the services": "", "made by Claude": "Claude"})
+        dlg.table.selectRow(next(r for r in range(2) if self.cells(dlg, r)[6] == "Claude"))
+        self.assertTrue(dlg.edit_btn.isEnabled() and dlg.delete_btn.isEnabled())
 
     def test_job_settings(self):
         job = self.client().backup_jobs()[0]
@@ -3989,6 +4001,31 @@ class ConnectorTest(UiCase):
             win._show_recording()
             self.assertEqual(win.record_btn.text(), "Record")
             console.close_all()
+
+    def test_backup_jobs_through_the_connector(self):
+        """Claude makes a backup job with Change On: lent Sys.Modify and Datastore.Allocate on that storage alone for
+        the request, reading only after it; keep needs Destroy; the user's job is never Claude's to change."""
+        claude_policy.set_switch(self.win.settings, "demo-pve", "change", "on")
+        cluster = self.admin.cluster
+        scoped_acl = lambda: [e["path"] for e in cluster.acl if e["roleid"] == claude_access.ROLE_SCOPED]  # noqa: E731
+        made = json.loads(self.text(self.request("create_backup_job", host="demo-pve", schedule="sun 04:00",
+                                                 vmids=[201], storage="local", reason="weekly backup of 201")))
+        jid = made["created"]
+        self.assertTrue(jid.startswith("claude-") and jid in cluster.jobs)
+        self.assertEqual((self.role(), scoped_acl()), (list(claude_policy.PRIVILEGES["read"]), []))
+        refused = self.request("create_backup_job", host="demo-pve", schedule="03:00", vmids=[201], storage="local",
+                               keep={"last": 2}, reason="keep two")
+        self.assertIn("Destroy requests are Off", self.text(refused))  # keeping a number deletes older backups
+        claude_policy.set_switch(self.win.settings, "demo-pve", "destroy", "on")
+        self.request("edit_backup_job", host="demo-pve", id=jid, keep={"last": 2}, reason="keep two")
+        self.assertEqual(cluster.jobs[jid]["prune-backups"], "keep-last=2")
+        theirs = self.request("delete_backup_job", host="demo-pve", id="backup-nightly", reason="tidy")
+        self.assertIn("is the user's", self.text(theirs))
+        self.request("delete_backup_job", host="demo-pve", id=jid, reason="tidy")
+        self.assertEqual((jid in cluster.jobs, "backup-nightly" in cluster.jobs), (False, True))
+        self.assertEqual((self.role(), scoped_acl()), (list(claude_policy.PRIVILEGES["read"]), []))
+        log = [e["what"] for e in connector_log.last() if e["tool"].endswith("backup_job")]
+        self.assertIn("Create a backup job: Sundays at 04:00", log)
 
     def test_approval_window_stands_out(self):
         """Hazard stripes along the top (the title on a plate in the middle) and all round, and the sound chosen in

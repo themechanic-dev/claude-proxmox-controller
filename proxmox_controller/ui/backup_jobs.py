@@ -196,8 +196,8 @@ class BackupJobsDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
         lay.addWidget(label("Scheduled backups that Proxmox runs by itself (Datacenter → Backup).", "dim", wrap=True))
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["On", "When", "Guests", "Storage", "Keep", "Next run", "Comment"])
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["On", "When", "Guests", "Storage", "Keep", "Next run", "By", "Comment"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -206,7 +206,7 @@ class BackupJobsDialog(QDialog):
         self.table.setMinimumHeight(180)
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(self._sel)
         self.table.doubleClicked.connect(lambda *_: self.edit())
         lay.addWidget(self.table, 1)
@@ -266,7 +266,7 @@ class BackupJobsDialog(QDialog):
             cells = ["Yes" if on else "No", jobs.describe_schedule(j.get("schedule", "")),
                      jobs.describe_guests(j, names), j.get("storage", ""), jobs.describe_keep(j.get("prune-backups")),
                      time.strftime("%a %d %b %H:%M", time.localtime(int(nxt))) if on and nxt else "—",
-                     j.get("comment", "")]
+                     "Claude" if jobs.by_claude(j) else "", j.get("comment", "")]  # (Claude's: its ID says so)
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setData(Qt.ItemDataRole.UserRole, j["id"])
