@@ -69,6 +69,8 @@ key among them, which are not encrypted, only readable by you alone.
 
 It works with Claude Desktop and Claude Code (the app connects them for you).
 
+Under the hood, Claude Access is a local [MCP](https://modelcontextprotocol.io) server: the app registers it with Claude Desktop and Claude Code for you, and every tool call passes through the switches above.
+
 ## Without AI
 
 Everything works without Claude too:
