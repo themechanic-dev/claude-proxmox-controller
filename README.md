@@ -1,6 +1,7 @@
 # Claude Proxmox Controller
 
 [![Tests](https://github.com/themechanic-dev/claude-proxmox-controller/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/themechanic-dev/claude-proxmox-controller/actions/workflows/tests.yml)
+[![themechanic-dev/claude-proxmox-controller MCP server](https://glama.ai/mcp/servers/themechanic-dev/claude-proxmox-controller/badges/score.svg)](https://glama.ai/mcp/servers/themechanic-dev/claude-proxmox-controller)
 
 **Your Proxmox VE hosts in one window — and Claude, working on them as far as you let it.**
 
