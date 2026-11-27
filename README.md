@@ -11,7 +11,7 @@ and virtual machines, consoles, files, snapshots, backups and graphs, without a 
 themselves up, schedule backups, read logs, run commands inside guests, copy files — through switches you set for each host and
 requests you approve in a window of the app. You stay in charge of every step.
 
-*by the mechanic — built together with Claude*
+*by the mechanic*
 
 <p align="center">
   <picture>
